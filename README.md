@@ -12,16 +12,25 @@ pip install git+https://github.com/gravityhub-org/cuhkvoting.git
 
 For read-only commands (`today`, `search`, `topvoted`) you do not need auth.
 
-For `vote`, authenticate once:
+No GitHub CLI is required.
+
+Auth behavior:
+
+- `today`, `search`, `topvoted`: works without auth
+- `vote`: needs write auth via either:
+  - token (`CUHKVOTING_TOKEN` or `GITHUB_TOKEN`), or
+  - git SSH key for `git@github.com`
+
+Set vote identity (optional if global git `user.name` is already set):
 
 ```bash
-gh auth login
+export CUHKVOTING_USER=your-github-username
 ```
 
-or export a token:
+Optional SSH check:
 
 ```bash
-export GITHUB_TOKEN=...
+ssh -T git@github.com
 ```
 
 If running outside a local git clone, set target repo:
@@ -40,6 +49,7 @@ export CUHKVOTING_BRANCH=main
 
 ```bash
 cuhkvoting today
+cuhkvoting lastweek
 cuhkvoting search "vision language model"
 cuhkvoting topvoted --N 10
 cuhkvoting vote 2504.12345

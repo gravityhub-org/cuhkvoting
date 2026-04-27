@@ -6,13 +6,16 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from pathlib import Path
 
 
 ARXIV_API = "https://export.arxiv.org/api/query"
@@ -24,13 +27,10 @@ class RepoConfig:
     owner: str
     repo: str
     branch: str
-    token: str | None
 
-
-def _http_json(url: str, headers: dict[str, str] | None = None) -> dict:
-    req = urllib.request.Request(url, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    @property
+    def ssh_clone_url(self) -> str:
+        return f"git@github.com:{self.owner}/{self.repo}.git"
 
 
 def _http_text(url: str, headers: dict[str, str] | None = None) -> str:
@@ -39,9 +39,19 @@ def _http_text(url: str, headers: dict[str, str] | None = None) -> str:
         return resp.read().decode("utf-8")
 
 
-def _http_put_json(url: str, payload: dict, headers: dict[str, str]) -> dict:
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="PUT", headers=headers)
+def _http_json(url: str, headers: dict[str, str] | None = None) -> dict:
+    req = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _http_put_json(url: str, payload: dict, headers: dict[str, str] | None = None) -> dict:
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers or {},
+        method="PUT",
+    )
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -57,7 +67,7 @@ def _parse_repo_url(url: str) -> tuple[str, str] | None:
     return None
 
 
-def _derive_repo_from_git() -> tuple[str, str] | None:
+def _derive_repo_from_git() -> tuple[str, str, str] | None:
     try:
         out = subprocess.check_output(
             ["git", "config", "--get", "remote.origin.url"],
@@ -65,41 +75,26 @@ def _derive_repo_from_git() -> tuple[str, str] | None:
             text=True,
         ).strip()
         if out:
-            return _parse_repo_url(out)
+            parsed = _parse_repo_url(out)
+            if parsed:
+                return parsed[0], parsed[1], out
     except Exception:
         return None
     return None
 
 
-def _get_github_username() -> str | None:
-    env_user = os.getenv("GITHUB_USER")
-    if env_user:
-        return env_user
-    try:
-        out = subprocess.check_output(
-            ["gh", "api", "user", "--jq", ".login"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        return out or None
-    except Exception:
-        return None
-
-
-def _get_github_token() -> str | None:
-    return os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN") or _gh_token()
-
-
-def _gh_token() -> str | None:
-    try:
-        out = subprocess.check_output(
-            ["gh", "auth", "token"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        return out or None
-    except Exception:
-        return None
+def _run_git(args: list[str], cwd: str | None = None) -> str:
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise SystemExit(proc.stderr.strip() or f"git {' '.join(args)} failed")
+    return proc.stdout
 
 
 def _resolve_repo_config(args: argparse.Namespace) -> RepoConfig:
@@ -113,12 +108,97 @@ def _resolve_repo_config(args: argparse.Namespace) -> RepoConfig:
     else:
         parsed = _derive_repo_from_git()
         if parsed:
-            owner, repo = parsed
+            owner, repo, _remote_url = parsed
     if not owner or not repo:
         raise SystemExit(
             "Could not determine GitHub repo. Set CUHKVOTING_REPO=owner/name or pass --repo owner/name."
         )
-    return RepoConfig(owner=owner, repo=repo, branch=args.branch, token=_get_github_token())
+    return RepoConfig(owner=owner, repo=repo, branch=args.branch)
+
+
+def _has_github_ssh_access() -> bool:
+    proc = subprocess.run(
+        ["ssh", "-T", "-o", "BatchMode=yes", "git@github.com"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    text = (proc.stdout or "") + (proc.stderr or "")
+    return "successfully authenticated" in text
+
+
+def _github_headers(token: str | None = None) -> dict[str, str]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "cuhkvoting/0.1",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _get_token() -> str | None:
+    return os.getenv("CUHKVOTING_TOKEN") or os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+
+
+def _get_user_from_token(token: str | None) -> str | None:
+    if not token:
+        return None
+    try:
+        data = _http_json("https://api.github.com/user", headers=_github_headers(token))
+        user = data.get("login")
+        return user if isinstance(user, str) else None
+    except Exception:
+        return None
+
+
+def _load_paper_via_api(cfg: RepoConfig, path: str, token: str | None) -> tuple[dict | None, str | None]:
+    url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/contents/{path}?ref={cfg.branch}"
+    try:
+        data = _http_json(url, headers=_github_headers(token))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None, None
+        raise
+    content = base64.b64decode(data["content"]).decode("utf-8")
+    return json.loads(content), data.get("sha")
+
+
+def _save_paper_via_api(
+    cfg: RepoConfig, path: str, paper: dict, sha: str | None, token: str, user: str, paper_vote_id: str
+) -> None:
+    url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/contents/{path}"
+    payload = {
+        "message": f"vote: {user} -> {paper_vote_id}",
+        "branch": cfg.branch,
+        "content": base64.b64encode((json.dumps(paper, indent=2, sort_keys=True) + "\n").encode("utf-8")).decode(
+            "ascii"
+        ),
+    }
+    if sha:
+        payload["sha"] = sha
+    _http_put_json(url, payload, headers=_github_headers(token))
+
+
+def _list_papers_via_api(cfg: RepoConfig, token: str | None) -> list[dict]:
+    url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/git/trees/{cfg.branch}?recursive=1"
+    try:
+        data = _http_json(url, headers=_github_headers(token))
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 409):
+            return []
+        raise
+    papers: list[dict] = []
+    for obj in data.get("tree", []):
+        path = obj.get("path", "")
+        if obj.get("type") != "blob" or not path.startswith("papers/") or not path.endswith(".json"):
+            continue
+        paper, _sha = _load_paper_via_api(cfg, path, token)
+        if paper:
+            papers.append(paper)
+    return papers
 
 
 def _arxiv_query(params: dict[str, str]) -> list[dict[str, str]]:
@@ -149,51 +229,32 @@ def _safe_filename(paper_id: str) -> str:
     return paper_id.replace("/", "__")
 
 
-def _github_headers(token: str | None = None) -> dict[str, str]:
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "cuhkvoting/0.1",
-    }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
-
-
-def _list_paper_paths(cfg: RepoConfig) -> list[str]:
-    url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/git/trees/{cfg.branch}?recursive=1"
+def _with_repo_checkout(cfg: RepoConfig) -> tuple[str, str]:
+    tmpdir = tempfile.mkdtemp(prefix="cuhkvoting-")
     try:
-        data = _http_json(url, headers=_github_headers(cfg.token))
-    except urllib.error.HTTPError as e:
-        if e.code in (404, 409):
-            return []
-        raise
-    tree = data.get("tree", [])
-    paths = [obj["path"] for obj in tree if obj.get("type") == "blob" and obj.get("path", "").startswith("papers/") and obj.get("path", "").endswith(".json")]
-    return sorted(paths)
+        _run_git(["clone", "--depth", "1", "--branch", cfg.branch, cfg.ssh_clone_url, tmpdir])
+        return tmpdir, tmpdir
+    except SystemExit:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        tmpdir = tempfile.mkdtemp(prefix="cuhkvoting-")
+        _run_git(["clone", "--depth", "1", cfg.ssh_clone_url, tmpdir])
+        try:
+            _run_git(["checkout", cfg.branch], cwd=tmpdir)
+        except SystemExit:
+            _run_git(["checkout", "-b", cfg.branch], cwd=tmpdir)
+    return tmpdir, tmpdir
 
 
-def _get_paper(cfg: RepoConfig, path: str) -> tuple[dict, str | None]:
-    url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/contents/{path}?ref={cfg.branch}"
-    data = _http_json(url, headers=_github_headers(cfg.token))
-    content = base64.b64decode(data["content"]).decode("utf-8")
-    return json.loads(content), data.get("sha")
-
-
-def _put_paper(cfg: RepoConfig, path: str, body: dict, message: str, sha: str | None) -> None:
-    if not cfg.token:
-        raise SystemExit(
-            "Voting requires GitHub auth. Set GITHUB_TOKEN/GH_TOKEN or run `gh auth login`."
-        )
-    url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/contents/{path}"
-    payload = {
-        "message": message,
-        "branch": cfg.branch,
-        "content": base64.b64encode((json.dumps(body, indent=2, sort_keys=True) + "\n").encode("utf-8")).decode("ascii"),
-    }
-    if sha:
-        payload["sha"] = sha
-    _http_put_json(url, payload, headers=_github_headers(cfg.token))
+def _ensure_commit_identity(repo_dir: str, user: str) -> None:
+    try:
+        email = _run_git(["config", "--global", "user.email"]).strip()
+    except SystemExit:
+        email = ""
+    if not email:
+        safe_user = re.sub(r"\s+", "-", user.strip().lower()) or "cuhkvoting-user"
+        email = f"{safe_user}@users.noreply.github.com"
+    _run_git(["config", "user.name", user], cwd=repo_dir)
+    _run_git(["config", "user.email", email], cwd=repo_dir)
 
 
 def cmd_today(args: argparse.Namespace) -> int:
@@ -232,25 +293,54 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_lastweek(args: argparse.Namespace) -> int:
+    end_day = dt.datetime.utcnow().date()
+    start_day = end_day - dt.timedelta(days=7)
+    start = start_day.strftime("%Y%m%d")
+    end = end_day.strftime("%Y%m%d")
+    params = {
+        "search_query": f"cat:gr-qc+OR+cat:astro-ph*+AND+submittedDate:[{start}0000+TO+{end}2359]",
+        "start": "0",
+        "max_results": str(args.limit),
+        "sortBy": "submittedDate",
+        "sortOrder": "descending",
+    }
+    entries = _arxiv_query(params)
+    if not entries:
+        print("No gr-qc / astro-ph entries in the last week (UTC).")
+        return 0
+    for idx, p in enumerate(entries, 1):
+        print(f"{idx:>2}. {p['id']}  {p['title']}")
+    return 0
+
+
 def cmd_topvoted(args: argparse.Namespace) -> int:
     cfg = _resolve_repo_config(args)
-    paths = _list_paper_paths(cfg)
-    papers: list[dict] = []
-    for path in paths:
+    token = _get_token()
+    papers = _list_papers_via_api(cfg, token)
+    if not papers and _has_github_ssh_access():
+        clone_dir, cleanup_dir = _with_repo_checkout(cfg)
         try:
-            paper, _ = _get_paper(cfg, path)
-            votes = paper.get("votes", [])
-            papers.append(
-                {
-                    "id": paper.get("id", path.rsplit("/", 1)[-1].replace(".json", "")),
-                    "title": paper.get("title", "(no title)"),
-                    "votes": len(votes),
-                }
-            )
-        except Exception:
-            continue
-    papers.sort(key=lambda p: (-p["votes"], p["id"]))
-    topn = papers[: args.N]
+            papers_dir = Path(clone_dir) / "papers"
+            for path in sorted(papers_dir.glob("*.json")) if papers_dir.exists() else []:
+                try:
+                    papers.append(json.loads(path.read_text(encoding="utf-8")))
+                except Exception:
+                    continue
+        finally:
+            shutil.rmtree(cleanup_dir, ignore_errors=True)
+
+    rows = []
+    for paper in papers:
+        rows.append(
+            {
+                "id": paper.get("id", "(unknown)"),
+                "title": paper.get("title", "(no title)"),
+                "votes": len(paper.get("votes", [])),
+            }
+        )
+    rows.sort(key=lambda p: (-p["votes"], p["id"]))
+    topn = rows[: args.N]
     if not topn:
         print("No voted papers yet.")
         return 0
@@ -261,19 +351,35 @@ def cmd_topvoted(args: argparse.Namespace) -> int:
 
 def cmd_vote(args: argparse.Namespace) -> int:
     cfg = _resolve_repo_config(args)
-    user = _get_github_username()
+    token = _get_token()
+    user = os.getenv("CUHKVOTING_USER")
     if not user:
-        raise SystemExit("Could not identify GitHub user. Set GITHUB_USER or run `gh auth login`.")
+        user = os.getenv("GITHUB_USER")
+    if not user:
+        user = _get_user_from_token(token)
+    if not user:
+        # Use git config user.name as default identity if explicit user is not set.
+        try:
+            user = _run_git(["config", "--global", "user.name"]).strip()
+        except SystemExit:
+            user = ""
+    if not user:
+        raise SystemExit("Could not identify user. Set CUHKVOTING_USER or configure git user.name.")
 
     paper_id = _normalize_paper_id(args.paper_id)
     path = f"papers/{_safe_filename(paper_id)}.json"
 
-    try:
-        paper, sha = _get_paper(cfg, path)
-    except urllib.error.HTTPError as e:
-        if e.code != 404:
-            raise
-        # Paper not tracked yet: fetch metadata from arXiv.
+    paper, sha = _load_paper_via_api(cfg, path, token)
+    if paper is None and _has_github_ssh_access():
+        clone_dir, cleanup_dir = _with_repo_checkout(cfg)
+        try:
+            paper_file = Path(clone_dir) / path
+            if paper_file.exists():
+                paper = json.loads(paper_file.read_text(encoding="utf-8"))
+        finally:
+            shutil.rmtree(cleanup_dir, ignore_errors=True)
+
+    if paper is None:
         entries = _arxiv_query(
             {
                 "search_query": f"id:{paper_id}",
@@ -296,17 +402,32 @@ def cmd_vote(args: argparse.Namespace) -> int:
     votes = paper.setdefault("votes", [])
     if any(v.get("user") == user for v in votes):
         raise SystemExit(f"User '{user}' already voted for {paper.get('id', paper_id)}.")
+    paper_vote_id = paper.get("id", paper_id)
     votes.append({"user": user, "voted_at": dt.datetime.utcnow().isoformat() + "Z"})
 
-    _put_paper(
-        cfg,
-        path,
-        paper,
-        message=f"vote: {user} -> {paper.get('id', paper_id)}",
-        sha=sha,
-    )
-    print(f"Vote recorded: {user} -> {paper.get('id', paper_id)}")
-    return 0
+    if token:
+        _save_paper_via_api(cfg, path, paper, sha, token, user, paper_vote_id)
+        print(f"Vote recorded: {user} -> {paper_vote_id}")
+        return 0
+
+    if not _has_github_ssh_access():
+        raise SystemExit(
+            "Voting needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure GitHub SSH key."
+        )
+
+    clone_dir, cleanup_dir = _with_repo_checkout(cfg)
+    try:
+        paper_file = Path(clone_dir) / path
+        paper_file.parent.mkdir(parents=True, exist_ok=True)
+        paper_file.write_text(json.dumps(paper, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        _ensure_commit_identity(clone_dir, user)
+        _run_git(["add", str(Path(path))], cwd=clone_dir)
+        _run_git(["commit", "-m", f"vote: {user} -> {paper_vote_id}"], cwd=clone_dir)
+        _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
+        print(f"Vote recorded: {user} -> {paper_vote_id}")
+        return 0
+    finally:
+        shutil.rmtree(cleanup_dir, ignore_errors=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -333,6 +454,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("query", help="Search terms.")
     p_search.add_argument("--limit", type=int, default=20)
     p_search.set_defaults(func=cmd_search)
+
+    p_lastweek = sub.add_parser(
+        "lastweek",
+        help="Show last-week arXiv submissions in gr-qc and astro-ph categories (UTC).",
+    )
+    p_lastweek.add_argument("--limit", type=int, default=100)
+    p_lastweek.set_defaults(func=cmd_lastweek)
 
     p_top = sub.add_parser("topvoted", help="List top voted tracked papers.")
     p_top.add_argument("--N", "--n", type=int, default=10, dest="N")
