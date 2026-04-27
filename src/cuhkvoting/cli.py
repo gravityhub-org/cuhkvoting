@@ -220,7 +220,7 @@ def _arxiv_query(params: dict[str, str]) -> list[dict[str, str]]:
             full_name = " ".join((author.findtext("atom:name", "", ns) or "").split())
             if full_name:
                 authors.append(full_name)
-        arxiv_id = entry_id.rsplit("/", 1)[-1]
+        arxiv_id = _strip_arxiv_version(entry_id.rsplit("/", 1)[-1])
         entries.append(
             {
                 "id": arxiv_id,
@@ -237,7 +237,7 @@ def _normalize_paper_id(raw_id: str) -> str:
     raw_id = raw_id.strip()
     if raw_id.startswith("http://") or raw_id.startswith("https://"):
         raw_id = raw_id.rstrip("/").rsplit("/", 1)[-1]
-    return raw_id.replace("arXiv:", "")
+    return _strip_arxiv_version(raw_id.replace("arXiv:", ""))
 
 
 def _safe_filename(paper_id: str) -> str:
@@ -245,9 +245,14 @@ def _safe_filename(paper_id: str) -> str:
 
 
 def _format_clickable_id(arxiv_id: str) -> str:
-    url = f"{ARXIV_ABS}{arxiv_id}"
+    clean_id = _strip_arxiv_version(arxiv_id)
+    url = f"{ARXIV_ABS}{clean_id}"
     # OSC 8 hyperlink: terminals without support still show raw id text.
-    return f"\033]8;;{url}\033\\{arxiv_id}\033]8;;\033\\"
+    return f"\033]8;;{url}\033\\{clean_id}\033]8;;\033\\"
+
+
+def _strip_arxiv_version(arxiv_id: str) -> str:
+    return re.sub(r"v\d+$", "", arxiv_id.strip())
 
 
 def _last_name(full_name: str) -> str:
@@ -281,6 +286,24 @@ def _filter_entries(entries: list[dict[str, str]], keyword: str | None) -> list[
         if key in hay:
             filtered.append(p)
     return filtered
+
+
+def _find_legacy_paper_via_api(cfg: RepoConfig, base_id: str, token: str | None) -> tuple[dict | None, str | None, str | None]:
+    url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/git/trees/{cfg.branch}?recursive=1"
+    try:
+        data = _http_json(url, headers=_github_headers(token))
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 409):
+            return None, None, None
+        raise
+    for obj in data.get("tree", []):
+        path = obj.get("path", "")
+        if obj.get("type") != "blob" or not path.startswith("papers/") or not path.endswith(".json"):
+            continue
+        paper, sha = _load_paper_via_api(cfg, path, token)
+        if paper and _strip_arxiv_version(str(paper.get("id", ""))) == base_id:
+            return paper, sha, path
+    return None, None, None
 
 
 def _with_repo_checkout(cfg: RepoConfig) -> tuple[str, str]:
@@ -412,7 +435,7 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
     for paper in papers:
         rows.append(
             {
-                "id": paper.get("id", "(unknown)"),
+                "id": _strip_arxiv_version(str(paper.get("id", "(unknown)"))),
                 "title": paper.get("title", "(no title)"),
                 "votes": len(paper.get("votes", [])),
             }
@@ -448,12 +471,29 @@ def cmd_vote(args: SimpleNamespace) -> int:
     path = f"papers/{_safe_filename(paper_id)}.json"
 
     paper, sha = _load_paper_via_api(cfg, path, token)
+    save_path = path
+    if paper is None:
+        legacy_paper, legacy_sha, legacy_path = _find_legacy_paper_via_api(cfg, paper_id, token)
+        if legacy_paper is not None and legacy_path is not None:
+            paper, sha, save_path = legacy_paper, legacy_sha, legacy_path
     if paper is None and _has_github_ssh_access():
         clone_dir, cleanup_dir = _with_repo_checkout(cfg)
         try:
             paper_file = Path(clone_dir) / path
             if paper_file.exists():
                 paper = json.loads(paper_file.read_text(encoding="utf-8"))
+            else:
+                papers_dir = Path(clone_dir) / "papers"
+                if papers_dir.exists():
+                    for cand in papers_dir.glob("*.json"):
+                        try:
+                            cand_paper = json.loads(cand.read_text(encoding="utf-8"))
+                        except Exception:
+                            continue
+                        if _strip_arxiv_version(str(cand_paper.get("id", ""))) == paper_id:
+                            paper = cand_paper
+                            save_path = str(cand.relative_to(clone_dir))
+                            break
         finally:
             shutil.rmtree(cleanup_dir, ignore_errors=True)
 
@@ -480,11 +520,12 @@ def cmd_vote(args: SimpleNamespace) -> int:
     votes = paper.setdefault("votes", [])
     if any(v.get("user") == user for v in votes):
         raise SystemExit(f"User '{user}' already voted for {paper.get('id', paper_id)}.")
-    paper_vote_id = paper.get("id", paper_id)
+    paper_vote_id = _strip_arxiv_version(str(paper.get("id", paper_id)))
+    paper["id"] = paper_vote_id
     votes.append({"user": user, "voted_at": dt.datetime.utcnow().isoformat() + "Z"})
 
     if token:
-        _save_paper_via_api(cfg, path, paper, sha, token, user, paper_vote_id)
+        _save_paper_via_api(cfg, save_path, paper, sha, token, user, paper_vote_id)
         print(f"Vote recorded: {user} -> {paper_vote_id}")
         return 0
 
@@ -495,11 +536,11 @@ def cmd_vote(args: SimpleNamespace) -> int:
 
     clone_dir, cleanup_dir = _with_repo_checkout(cfg)
     try:
-        paper_file = Path(clone_dir) / path
+        paper_file = Path(clone_dir) / save_path
         paper_file.parent.mkdir(parents=True, exist_ok=True)
         paper_file.write_text(json.dumps(paper, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         _ensure_commit_identity(clone_dir, user)
-        _run_git(["add", str(Path(path))], cwd=clone_dir)
+        _run_git(["add", str(Path(save_path))], cwd=clone_dir)
         _run_git(["commit", "-m", f"vote: {user} -> {paper_vote_id}"], cwd=clone_dir)
         _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
         print(f"Vote recorded: {user} -> {paper_vote_id}")
