@@ -212,9 +212,20 @@ def _arxiv_query(params: dict[str, str]) -> list[dict[str, str]]:
         entry_id = (ent.findtext("atom:id", "", ns) or "").strip()
         title = " ".join((ent.findtext("atom:title", "", ns) or "").split())
         summary = " ".join((ent.findtext("atom:summary", "", ns) or "").split())
+        authors: list[str] = []
+        for author in ent.findall("atom:author", ns):
+            full_name = " ".join((author.findtext("atom:name", "", ns) or "").split())
+            if full_name:
+                authors.append(full_name)
         arxiv_id = entry_id.rsplit("/", 1)[-1]
         entries.append(
-            {"id": arxiv_id, "title": title, "abstract": summary, "url": f"{ARXIV_ABS}{arxiv_id}"}
+            {
+                "id": arxiv_id,
+                "title": title,
+                "abstract": summary,
+                "url": f"{ARXIV_ABS}{arxiv_id}",
+                "authors": authors,
+            }
         )
     return entries
 
@@ -234,6 +245,39 @@ def _format_clickable_id(arxiv_id: str) -> str:
     url = f"{ARXIV_ABS}{arxiv_id}"
     # OSC 8 hyperlink: terminals without support still show raw id text.
     return f"\033]8;;{url}\033\\{arxiv_id}\033]8;;\033\\"
+
+
+def _last_name(full_name: str) -> str:
+    # Keep suffix/punctuation simple; last token works well for arXiv names.
+    parts = full_name.strip().split()
+    return parts[-1] if parts else full_name.strip()
+
+
+def _format_author_lastnames(authors: list[str], max_authors: int = 3) -> str:
+    if not authors:
+        return "unknown"
+    chosen = [_last_name(a) for a in authors[:max_authors]]
+    return ", ".join(chosen)
+
+
+def _filter_entries(entries: list[dict[str, str]], keyword: str | None) -> list[dict[str, str]]:
+    if not keyword:
+        return entries
+    key = keyword.strip().lower()
+    if not key:
+        return entries
+    filtered: list[dict[str, str]] = []
+    for p in entries:
+        hay = " ".join(
+            [
+                str(p.get("title", "")),
+                str(p.get("abstract", "")),
+                " ".join(p.get("authors", [])),
+            ]
+        ).lower()
+        if key in hay:
+            filtered.append(p)
+    return filtered
 
 
 def _with_repo_checkout(cfg: RepoConfig) -> tuple[str, str]:
@@ -269,10 +313,11 @@ def cmd_today(args: SimpleNamespace) -> int:
     start_dt = now - dt.timedelta(days=1)
     start = start_dt.strftime("%Y%m%d%H%M")
     end = now.strftime("%Y%m%d%H%M")
+    fetch_limit = max(int(args.limit), 200) if getattr(args, "keyword", None) else int(args.limit)
     params = {
         "search_query": f"submittedDate:[{start} TO {end}]",
         "start": "0",
-        "max_results": str(args.limit),
+        "max_results": str(fetch_limit),
         "sortBy": "submittedDate",
         "sortOrder": "descending",
     }
@@ -283,7 +328,7 @@ def cmd_today(args: SimpleNamespace) -> int:
             {
                 "search_query": "all:the",
                 "start": "0",
-                "max_results": str(args.limit),
+                "max_results": str(fetch_limit),
                 "sortBy": "submittedDate",
                 "sortOrder": "descending",
             }
@@ -292,8 +337,13 @@ def cmd_today(args: SimpleNamespace) -> int:
             print("No papers found for today (UTC).")
             return 0
         print("No new UTC-day submissions. Showing most recent arXiv entries:")
-    for idx, p in enumerate(entries, 1):
-        print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {p['title']}")
+    entries = _filter_entries(entries, getattr(args, "keyword", None))
+    if not entries:
+        print("No papers matched keyword filter.")
+        return 0
+    for idx, p in enumerate(entries[: int(args.limit)], 1):
+        lastnames = _format_author_lastnames(p.get("authors", []), max_authors=3)
+        print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {p['title']}  [{lastnames}]")
     return 0
 
 
@@ -320,19 +370,22 @@ def cmd_lastweek(args: SimpleNamespace) -> int:
     start_day = end_day - dt.timedelta(days=7)
     start = start_day.strftime("%Y%m%d")
     end = end_day.strftime("%Y%m%d")
+    fetch_limit = max(int(args.limit), 300) if getattr(args, "keyword", None) else int(args.limit)
     params = {
         "search_query": f"(cat:gr-qc OR cat:astro-ph.*) AND submittedDate:[{start}0000 TO {end}2359]",
         "start": "0",
-        "max_results": str(args.limit),
+        "max_results": str(fetch_limit),
         "sortBy": "submittedDate",
         "sortOrder": "descending",
     }
     entries = _arxiv_query(params)
+    entries = _filter_entries(entries, getattr(args, "keyword", None))
     if not entries:
-        print("No gr-qc / astro-ph entries in the last week (UTC).")
+        print("No gr-qc / astro-ph entries matched in last week (UTC).")
         return 0
-    for idx, p in enumerate(entries, 1):
-        print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {p['title']}")
+    for idx, p in enumerate(entries[: int(args.limit)], 1):
+        lastnames = _format_author_lastnames(p.get("authors", []), max_authors=3)
+        print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {p['title']}  [{lastnames}]")
     return 0
 
 
@@ -478,9 +531,13 @@ def _run_cmd(func, **kwargs: object) -> None:
 
 @app.command("today")
 def today(
+    keyword: str | None = typer.Argument(
+        None,
+        help="Optional keyword filter (title/abstract/authors).",
+    ),
     limit: int = typer.Option(20, "--limit", help="Max number of entries."),
 ) -> None:
-    _run_cmd(cmd_today, limit=limit)
+    _run_cmd(cmd_today, limit=limit, keyword=keyword)
 
 
 @app.command("search")
@@ -493,9 +550,13 @@ def search(
 
 @app.command("lastweek")
 def lastweek(
+    keyword: str | None = typer.Argument(
+        None,
+        help="Optional keyword filter (title/abstract/authors).",
+    ),
     limit: int = typer.Option(100, "--limit", help="Max number of entries."),
 ) -> None:
-    _run_cmd(cmd_lastweek, limit=limit)
+    _run_cmd(cmd_lastweek, limit=limit, keyword=keyword)
 
 
 @app.command("topvoted")

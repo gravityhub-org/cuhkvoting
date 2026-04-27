@@ -49,7 +49,9 @@ export CUHKVOTING_BRANCH=main
 
 ```bash
 cuhkvoting today
+cuhkvoting today "black hole"
 cuhkvoting lastweek
+cuhkvoting lastweek "black hole"
 cuhkvoting search "vision language model"
 cuhkvoting topvoted --N 10
 cuhkvoting vote 2504.12345
