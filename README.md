@@ -64,6 +64,7 @@ cuhkvoting lastweek
 cuhkvoting lastweek "black hole"
 cuhkvoting lastweek lensing gravitational waves
 cuhkvoting search "vision language model"
+cuhkvoting search gravitational wave hubble constant --limit 10
 cuhkvoting topvoted --N 10
 cuhkvoting record
 cuhkvoting vote 2504.12345

@@ -627,7 +627,10 @@ def cmd_today(args: SimpleNamespace) -> int:
 
 
 def cmd_search(args: SimpleNamespace) -> int:
-    query = args.query.strip()
+    query_parts = [str(q).strip() for q in (args.query or []) if str(q).strip()]
+    if not query_parts:
+        raise SystemExit("Search query cannot be empty.")
+    query = " ".join(query_parts)
     params = {
         "search_query": f"all:{query}",
         "start": "0",
@@ -879,7 +882,7 @@ def today(
 
 @app.command("search")
 def search(
-    query: str = typer.Argument(..., help="Search terms."),
+    query: list[str] | None = typer.Argument(None, help="Search terms."),
     limit: int = typer.Option(20, "--limit", help="Max number of entries."),
 ) -> None:
     _run_cmd(cmd_search, query=query, limit=limit)
