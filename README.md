@@ -65,7 +65,7 @@ cuhkvoting lastweek "black hole"
 cuhkvoting lastweek lensing gravitational waves
 cuhkvoting search "vision language model"
 cuhkvoting search gravitational wave hubble constant --limit 10
-# search uses Inspire HEP API, with all-keyword matching (AND semantics)
+# search uses Inspire HEP API ranking but outputs arXiv entries only (AND semantics)
 cuhkvoting topvoted --N 10
 cuhkvoting record
 cuhkvoting vote 2504.12345

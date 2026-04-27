@@ -396,13 +396,11 @@ def _inspire_query(query: str, limit: int) -> list[dict[str, str]]:
                 if isinstance(ep, dict) and isinstance(ep.get("value"), str) and ep.get("value", "").strip():
                     arxiv_id = _strip_arxiv_version(ep["value"])
                     break
-        control_number = str(metadata.get("control_number", "")).strip()
-        if arxiv_id:
-            paper_id = arxiv_id
-            paper_url = f"{ARXIV_ABS}{arxiv_id}"
-        else:
-            paper_id = f"inspire:{control_number}" if control_number else "inspire:unknown"
-            paper_url = f"https://inspirehep.net/literature/{control_number}" if control_number else "https://inspirehep.net"
+        if not arxiv_id:
+            # Search output should stay arXiv-only.
+            continue
+        paper_id = arxiv_id
+        paper_url = f"{ARXIV_ABS}{arxiv_id}"
         entries.append(
             {
                 "id": paper_id,
@@ -716,8 +714,7 @@ def cmd_search(args: SimpleNamespace) -> int:
         return 0
     for idx, p in enumerate(entries[:requested_limit], 1):
         pid = str(p.get("id", ""))
-        shown_id = _format_clickable_id(pid) if pid and not pid.startswith("inspire:") else pid
-        print(f"{idx:>2}. {shown_id}  {p['title']}")
+        print(f"{idx:>2}. {_format_clickable_id(pid)}  {p['title']}")
     return 0
 
 
