@@ -1,0 +1,12 @@
+{
+  "abstract": "Gravitational-wave parameter estimation for binary neutron star (BNS) systems poses severe computational challenges due to the extended signal duration, which can reach several minutes in current detectors. Neural posterior estimation (NPE), a simulation-based inference approach, offers dramatic speedups but requires effective dimensionality reduction of the high-dimensional input data. We present a novel compression strategy based on likelihood-oriented summary statistics derived from the relative binning formalism of Zackay et al. (2018), which compresses raw frequency-domain data into the summary data. The summary data is based on a polynomial approximation of the waveform ratio using frequency banding grounded in post-Newtonian approximation, and directly evaluated with only $O(1000)$ sample points of the waveform. As a result, both the training and storage cost become more efficient than previously reported networks for BNS inference. We train a set of NPE networks on these summary statistics and validate a network against traditional nested sampling over 1024 BNS injections. The network produces well-calibrated posteriors across all source parameters we consider, with Jensen-Shannon divergences (JSD) consistent with numerical noise for most parameters. Although we find that the median JSD for the most inconsistent parameter exceeds $10^{-2}$ bits with current configurations, our results show potential for rapid parameter estimation of the BNS signal.",
+  "id": "2604.22380v1",
+  "title": "Simulation-based Inference for Gravitational Waves from Binary Neutron Stars: Application of Summary Data from Heterodyning",
+  "url": "https://arxiv.org/abs/2604.22380v1",
+  "votes": [
+    {
+      "user": "ohannuks",
+      "voted_at": "2026-04-27T02:24:48.957054Z"
+    }
+  ]
+}
