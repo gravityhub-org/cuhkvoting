@@ -52,8 +52,10 @@ export CUHKVOTING_BRANCH=main
 ```bash
 cuhkvoting today
 cuhkvoting today "black hole"
+cuhkvoting today lensing gravitational waves
 cuhkvoting lastweek
 cuhkvoting lastweek "black hole"
+cuhkvoting lastweek lensing gravitational waves
 cuhkvoting search "vision language model"
 cuhkvoting topvoted --N 10
 cuhkvoting record

@@ -359,11 +359,11 @@ def _format_author_lastnames(authors: list[str], max_authors: int = 3) -> str:
     return ", ".join(chosen)
 
 
-def _filter_entries(entries: list[dict[str, str]], keyword: str | None) -> list[dict[str, str]]:
-    if not keyword:
+def _filter_entries(entries: list[dict[str, str]], keywords: list[str] | None) -> list[dict[str, str]]:
+    if not keywords:
         return entries
-    key = keyword.strip().lower()
-    if not key:
+    tokens = [k.strip().lower() for k in keywords if k.strip()]
+    if not tokens:
         return entries
     filtered: list[dict[str, str]] = []
     for p in entries:
@@ -374,7 +374,7 @@ def _filter_entries(entries: list[dict[str, str]], keyword: str | None) -> list[
                 " ".join(p.get("authors", [])),
             ]
         ).lower()
-        if key in hay:
+        if all(t in hay for t in tokens):
             filtered.append(p)
     return filtered
 
@@ -559,7 +559,7 @@ def cmd_today(args: SimpleNamespace) -> int:
     start_dt = now - dt.timedelta(days=1)
     start = start_dt.strftime("%Y%m%d%H%M")
     end = now.strftime("%Y%m%d%H%M")
-    fetch_limit = max(int(args.limit), 200) if getattr(args, "keyword", None) else int(args.limit)
+    fetch_limit = max(int(args.limit), 200) if getattr(args, "keywords", None) else int(args.limit)
     params = {
         "search_query": f"submittedDate:[{start} TO {end}]",
         "start": "0",
@@ -583,7 +583,7 @@ def cmd_today(args: SimpleNamespace) -> int:
             print("No papers found for today (UTC).")
             return 0
         print("No new UTC-day submissions. Showing most recent arXiv entries:")
-    entries = _filter_entries(entries, getattr(args, "keyword", None))
+    entries = _filter_entries(entries, getattr(args, "keywords", None))
     if not entries:
         print("No papers matched keyword filter.")
         return 0
@@ -616,7 +616,7 @@ def cmd_lastweek(args: SimpleNamespace) -> int:
     start_day = end_day - dt.timedelta(days=7)
     start = start_day.strftime("%Y%m%d")
     end = end_day.strftime("%Y%m%d")
-    fetch_limit = max(int(args.limit), 300) if getattr(args, "keyword", None) else int(args.limit)
+    fetch_limit = max(int(args.limit), 300) if getattr(args, "keywords", None) else int(args.limit)
     params = {
         "search_query": f"(cat:gr-qc OR cat:astro-ph.*) AND submittedDate:[{start}0000 TO {end}2359]",
         "start": "0",
@@ -625,7 +625,7 @@ def cmd_lastweek(args: SimpleNamespace) -> int:
         "sortOrder": "descending",
     }
     entries = _arxiv_query(params)
-    entries = _filter_entries(entries, getattr(args, "keyword", None))
+    entries = _filter_entries(entries, getattr(args, "keywords", None))
     if not entries:
         print("No gr-qc / astro-ph entries matched in last week (UTC).")
         return 0
@@ -833,13 +833,13 @@ def _run_cmd(func, **kwargs: object) -> None:
 
 @app.command("today")
 def today(
-    keyword: str | None = typer.Argument(
+    keywords: list[str] | None = typer.Argument(
         None,
-        help="Optional keyword filter (title/abstract/authors).",
+        help="Optional keyword filters. All keywords must match title/abstract/authors.",
     ),
     limit: int = typer.Option(20, "--limit", help="Max number of entries."),
 ) -> None:
-    _run_cmd(cmd_today, limit=limit, keyword=keyword)
+    _run_cmd(cmd_today, limit=limit, keywords=keywords)
 
 
 @app.command("search")
@@ -852,13 +852,13 @@ def search(
 
 @app.command("lastweek")
 def lastweek(
-    keyword: str | None = typer.Argument(
+    keywords: list[str] | None = typer.Argument(
         None,
-        help="Optional keyword filter (title/abstract/authors).",
+        help="Optional keyword filters. All keywords must match title/abstract/authors.",
     ),
     limit: int = typer.Option(100, "--limit", help="Max number of entries."),
 ) -> None:
-    _run_cmd(cmd_lastweek, limit=limit, keyword=keyword)
+    _run_cmd(cmd_lastweek, limit=limit, keywords=keywords)
 
 
 @app.command("topvoted")
