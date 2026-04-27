@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "Otto Akseli Hannuksela", email = "otto.akseli.hannuksela@gmail.com" }
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
     "typer-slim",
 ]
