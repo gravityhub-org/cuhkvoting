@@ -109,6 +109,8 @@ def _run_git(args: list[str], cwd: str | None = None) -> str:
     )
     if proc.returncode != 0:
         err = proc.stderr.strip() or f"git {' '.join(args)} failed"
+        if _looks_like_default_repo_write_access_error(args, err):
+            err = f"{err}\n\n{_org_join_instructions()}"
         if _looks_like_github_auth_error(err):
             err = f"{err}\n\n{_ssh_setup_instructions()}"
         raise SystemExit(err)
@@ -128,6 +130,29 @@ def _looks_like_github_auth_error(text: str) -> bool:
     )
 
 
+def _looks_like_default_repo_write_access_error(args: list[str], text: str) -> bool:
+    if not args or args[0] != "push":
+        return False
+    low = text.lower()
+    default_repo_low = DEFAULT_REPO.lower()
+    return (
+        ("permission to" in low and "denied" in low and default_repo_low in low)
+        or ("write access to repository not granted" in low and default_repo_low in low)
+        or ("remote: permission to" in low and "denied" in low and default_repo_low in low)
+    )
+
+
+def _org_join_instructions() -> str:
+    return (
+        "Looks like SSH key works, but you do not have write access to gravityhub-org/cuhkvoting-records.\n"
+        "Please join GitHub organization 'gravityhub-org' to get repo write permission.\n"
+        "Contact one of these maintainers to be added:\n"
+        "- Samson Leong <samson32081@gmail.com>\n"
+        "- Brian Hiu Yeung Cheng <1155175825@link.cuhk.edu.hk>\n"
+        "- Hannuksela Otto Akseli <otto.akseli.hannuksela@gmail.com>"
+    )
+
+
 def _ssh_setup_instructions() -> str:
     return (
         "GitHub auth failed. Set up SSH key:\n"
@@ -139,23 +164,23 @@ def _ssh_setup_instructions() -> str:
 
 
 def _resolve_repo_config(args: SimpleNamespace) -> RepoConfig:
+    owner, repo = DEFAULT_REPO.split("/", 1)
     repo_arg = args.repo or os.getenv("CUHKVOTING_REPO")
-    owner: str | None = None
-    repo: str | None = None
     if repo_arg:
         if "/" not in repo_arg:
-            raise SystemExit("Repo must look like owner/name, e.g. gravityhub-org/cuhkvoting")
-        owner, repo = repo_arg.split("/", 1)
+            raise SystemExit(f"Repo must look like owner/name, and must be {DEFAULT_REPO}.")
+        provided_owner, provided_repo = repo_arg.split("/", 1)
+        if (provided_owner, provided_repo) != (owner, repo):
+            raise SystemExit(f"Only {DEFAULT_REPO} is supported.")
     else:
         parsed = _derive_repo_from_git()
         if parsed:
-            owner, repo, _remote_url = parsed
-        else:
-            owner, repo = DEFAULT_REPO.split("/", 1)
-    if not owner or not repo:
-        raise SystemExit(
-            "Could not determine GitHub repo. Set CUHKVOTING_REPO=owner/name or pass --repo owner/name."
-        )
+            detected_owner, detected_repo, _remote_url = parsed
+            if (detected_owner, detected_repo) != (owner, repo):
+                raise SystemExit(
+                    f"Current git remote points to {detected_owner}/{detected_repo}. "
+                    f"Only {DEFAULT_REPO} is supported. Pass --repo {DEFAULT_REPO} or set CUHKVOTING_REPO."
+                )
     return RepoConfig(owner=owner, repo=repo, branch=args.branch)
 
 
@@ -867,7 +892,7 @@ def topvoted(
     repo: str | None = typer.Option(
         None,
         "--repo",
-        help="GitHub repo owner/name. Defaults to CUHKVOTING_REPO or current git remote.",
+        help=f"GitHub repo owner/name. Only {DEFAULT_REPO} is accepted.",
     ),
     branch: str = typer.Option(
         os.getenv("CUHKVOTING_BRANCH", "main"),
@@ -883,7 +908,7 @@ def record(
     repo: str | None = typer.Option(
         None,
         "--repo",
-        help="GitHub repo owner/name. Defaults to CUHKVOTING_REPO or current git remote.",
+        help=f"GitHub repo owner/name. Only {DEFAULT_REPO} is accepted.",
     ),
     branch: str = typer.Option(
         os.getenv("CUHKVOTING_BRANCH", "main"),
@@ -900,7 +925,7 @@ def select(
     repo: str | None = typer.Option(
         None,
         "--repo",
-        help="GitHub repo owner/name. Defaults to CUHKVOTING_REPO or current git remote.",
+        help=f"GitHub repo owner/name. Only {DEFAULT_REPO} is accepted.",
     ),
     branch: str = typer.Option(
         os.getenv("CUHKVOTING_BRANCH", "main"),
@@ -924,7 +949,7 @@ def vote_command(
     repo: str | None = typer.Option(
         None,
         "--repo",
-        help="GitHub repo owner/name. Defaults to CUHKVOTING_REPO or current git remote.",
+        help=f"GitHub repo owner/name. Only {DEFAULT_REPO} is accepted.",
     ),
     branch: str = typer.Option(
         os.getenv("CUHKVOTING_BRANCH", "main"),
@@ -964,7 +989,7 @@ def admin_trash(
     repo: str | None = typer.Option(
         None,
         "--repo",
-        help="GitHub repo owner/name. Defaults to CUHKVOTING_REPO or current git remote.",
+        help=f"GitHub repo owner/name. Only {DEFAULT_REPO} is accepted.",
     ),
     branch: str = typer.Option(
         os.getenv("CUHKVOTING_BRANCH", "main"),
