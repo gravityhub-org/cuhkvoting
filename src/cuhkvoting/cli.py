@@ -772,7 +772,7 @@ def cmd_select(args: SimpleNamespace) -> int:
         # If loaded via git fallback without sha, still delete through git path.
         _delete_vote_paper(cfg, None, user, save_path, None, f"select-delete-vote: {user} -> {canonical_id}")
 
-    print(f"Selected for presentation: {user} -> {canonical_id} ({week_tag})")
+    print(f"Selected for presentation: {canonical_id} ({week_tag}) by {user}")
     return 0
 
 
@@ -803,7 +803,10 @@ def cmd_record(args: SimpleNamespace) -> int:
         title = str(r.get("title", "(no title)"))
         hist = int(r.get("historical_vote", 0))
         selected_at = str(r.get("selected_at", "?"))
-        print(f"{i:>2}. {week}  {_format_clickable_id(arxiv_id)}  votes:{hist}  selected:{selected_at}  {title}")
+        selected_by = str(r.get("selected_by", "?"))
+        print(
+            f"{i:>2}. {week}  {_format_clickable_id(arxiv_id)}  votes:{hist}  by:{selected_by}  selected:{selected_at}  {title}"
+        )
     return 0
 
 
