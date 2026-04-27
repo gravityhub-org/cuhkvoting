@@ -414,13 +414,13 @@ def _inspire_query(query: str, limit: int) -> list[dict[str, str]]:
 
 
 def _build_inspire_title_query(keywords: list[str]) -> str:
-    # Inspire free-text query can miss title matches; force title-field AND terms.
+    # Inspire free-text query can miss relevant hits; force per-token field query.
     stop = {"a", "an", "the", "of", "for", "to", "and", "or", "in", "on", "at", "by", "with"}
     tokens = [k.strip() for k in keywords if k.strip()]
     title_tokens = [t for t in tokens if t.lower() not in stop and len(t) > 1]
     if not title_tokens:
         title_tokens = tokens
-    return " and ".join(f'title:"{t}"' for t in title_tokens)
+    return " and ".join(f'(title:"{t}" or author:"{t}")' for t in title_tokens)
 
 
 def _normalize_paper_id(raw_id: str) -> str:
