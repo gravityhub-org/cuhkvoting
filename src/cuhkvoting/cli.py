@@ -661,6 +661,24 @@ def cmd_vote_select(args: SimpleNamespace) -> int:
     return 0
 
 
+def cmd_admin_trash(args: SimpleNamespace) -> int:
+    cfg = _resolve_repo_config(args)
+    token = _get_token()
+    user = _resolve_user(token)
+    paper_id = _normalize_paper_id(args.vote_id)
+    paper, sha, save_path = _load_vote_paper(cfg, token, paper_id)
+    if paper is None:
+        raise SystemExit(f"No vote record found for '{paper_id}'.")
+    now = dt.datetime.utcnow().isoformat() + "Z"
+    trashed_votes = paper.setdefault("trashed_votes", [])
+    trashed_votes.extend(paper.get("votes", []))
+    paper["votes"] = []
+    paper["trashed"] = {"by": user, "trashed_at": now, "reason": "admin trash"}
+    _save_vote_paper(cfg, token, user, paper, sha, save_path, f"admin-trash: {user} -> {paper_id}")
+    print(f"Trashed vote record: {paper_id}")
+    return 0
+
+
 app = typer.Typer(
     name="cuhkvoting",
     help="Minimal arXiv voting CLI backed by GitHub.",
@@ -761,6 +779,29 @@ def vote_command(
     if paper_id is not None:
         raise typer.BadParameter("Usage: cuhkvoting vote <id> OR cuhkvoting vote remove|select <id>")
     _run_cmd(cmd_vote, paper_id=action_or_paper, repo=repo, branch=branch)
+
+
+admin_app = typer.Typer(name="admin", help="Admin-like maintenance commands (no admin auth required).")
+
+
+@admin_app.command("trash")
+def admin_trash(
+    vote_id: str = typer.Argument(..., help="Vote record id (use arXiv id/url)."),
+    repo: str | None = typer.Option(
+        None,
+        "--repo",
+        help="GitHub repo owner/name. Defaults to CUHKVOTING_REPO or current git remote.",
+    ),
+    branch: str = typer.Option(
+        os.getenv("CUHKVOTING_BRANCH", "main"),
+        "--branch",
+        help="Git branch to read/write.",
+    ),
+) -> None:
+    _run_cmd(cmd_admin_trash, vote_id=vote_id, repo=repo, branch=branch)
+
+
+app.add_typer(admin_app, name="admin")
 
 
 def main() -> None:

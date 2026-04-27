@@ -59,6 +59,7 @@ cuhkvoting topvoted --N 10
 cuhkvoting vote 2504.12345
 cuhkvoting vote remove 2504.12345
 cuhkvoting vote select 2504.12345
+cuhkvoting admin trash 2504.12345
 ```
 
 ### Bash autocomplete
