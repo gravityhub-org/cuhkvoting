@@ -59,6 +59,17 @@ def _http_put_json(url: str, payload: dict, headers: dict[str, str] | None = Non
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _http_delete_json(url: str, payload: dict, headers: dict[str, str] | None = None) -> dict:
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers or {},
+        method="DELETE",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
 def _parse_repo_url(url: str) -> tuple[str, str] | None:
     url = url.strip()
     ssh = re.match(r"git@github\.com:([^/]+)/(.+?)(?:\.git)?$", url)
@@ -211,6 +222,12 @@ def _save_paper_via_api(
     if sha:
         payload["sha"] = sha
     _http_put_json(url, payload, headers=_github_headers(token))
+
+
+def _delete_paper_via_api(cfg: RepoConfig, path: str, sha: str, token: str, message: str) -> None:
+    url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/contents/{path}"
+    payload = {"message": message, "branch": cfg.branch, "sha": sha}
+    _http_delete_json(url, payload, headers=_github_headers(token))
 
 
 def _list_papers_via_api(cfg: RepoConfig, token: str | None) -> list[dict]:
@@ -427,6 +444,34 @@ def _save_vote_paper(
         shutil.rmtree(cleanup_dir, ignore_errors=True)
 
 
+def _delete_vote_paper(
+    cfg: RepoConfig,
+    token: str | None,
+    user: str,
+    save_path: str,
+    sha: str | None,
+    message: str,
+) -> None:
+    if token:
+        if not sha:
+            raise SystemExit("Cannot delete vote file via API: missing file SHA.")
+        _delete_paper_via_api(cfg, save_path, sha, token, message)
+        return
+    if not _has_github_ssh_access():
+        raise SystemExit(f"Voting needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure SSH key.\n\n{_ssh_setup_instructions()}")
+    clone_dir, cleanup_dir = _with_repo_checkout(cfg)
+    try:
+        paper_file = Path(clone_dir) / save_path
+        if not paper_file.exists():
+            raise SystemExit(f"Vote file not found for deletion: {save_path}")
+        _ensure_commit_identity(clone_dir, user)
+        _run_git(["rm", str(Path(save_path))], cwd=clone_dir)
+        _run_git(["commit", "-m", message], cwd=clone_dir)
+        _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
+    finally:
+        shutil.rmtree(cleanup_dir, ignore_errors=True)
+
+
 def _validate_arxiv_entry(paper_id: str) -> dict:
     entries = _arxiv_query({"search_query": f"id:{paper_id}", "start": "0", "max_results": "1"})
     if not entries:
@@ -564,11 +609,14 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
         _prune_expired_votes(paper)
         if paper.get("selected"):
             continue
+        vote_count = len(paper.get("votes", []))
+        if vote_count <= 0:
+            continue
         rows.append(
             {
                 "id": _strip_arxiv_version(str(paper.get("id", "(unknown)"))),
                 "title": paper.get("title", "(no title)"),
-                "votes": len(paper.get("votes", [])),
+                "votes": vote_count,
             }
         )
     rows.sort(key=lambda p: (-p["votes"], p["id"]))
@@ -626,6 +674,10 @@ def cmd_vote_remove(args: SimpleNamespace) -> int:
     if len(kept) == len(votes):
         raise SystemExit(f"User '{user}' has no active vote for {paper_id}.")
     paper["votes"] = kept
+    if not paper["votes"] and not paper.get("selected"):
+        _delete_vote_paper(cfg, token, user, save_path, sha, f"vote-remove: delete empty {paper_id}")
+        print(f"Vote removed and record deleted: {user} -> {paper_id}")
+        return 0
     _save_vote_paper(cfg, token, user, paper, sha, save_path, f"vote-remove: {user} -> {paper_id}")
     print(f"Vote removed: {user} -> {paper_id}")
     return 0
@@ -669,13 +721,8 @@ def cmd_admin_trash(args: SimpleNamespace) -> int:
     paper, sha, save_path = _load_vote_paper(cfg, token, paper_id)
     if paper is None:
         raise SystemExit(f"No vote record found for '{paper_id}'.")
-    now = dt.datetime.utcnow().isoformat() + "Z"
-    trashed_votes = paper.setdefault("trashed_votes", [])
-    trashed_votes.extend(paper.get("votes", []))
-    paper["votes"] = []
-    paper["trashed"] = {"by": user, "trashed_at": now, "reason": "admin trash"}
-    _save_vote_paper(cfg, token, user, paper, sha, save_path, f"admin-trash: {user} -> {paper_id}")
-    print(f"Trashed vote record: {paper_id}")
+    _delete_vote_paper(cfg, token, user, save_path, sha, f"admin-trash: {user} -> {paper_id}")
+    print(f"Trashed and deleted vote record: {paper_id}")
     return 0
 
 
