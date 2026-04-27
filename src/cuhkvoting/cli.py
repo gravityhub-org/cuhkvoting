@@ -802,11 +802,8 @@ def cmd_record(args: SimpleNamespace) -> int:
         arxiv_id = str(r.get("arxiv_id", "?"))
         title = str(r.get("title", "(no title)"))
         hist = int(r.get("historical_vote", 0))
-        selected_at = str(r.get("selected_at", "?"))
         selected_by = str(r.get("selected_by", "?"))
-        print(
-            f"{i:>2}. {week}  {_format_clickable_id(arxiv_id)}  votes:{hist}  by:{selected_by}  selected:{selected_at}  {title}"
-        )
+        print(f"{i:>2}. {week}  {_format_clickable_id(arxiv_id)}  votes:{hist}  by:{selected_by}  {title}")
     return 0
 
 
