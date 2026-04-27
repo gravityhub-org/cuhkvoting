@@ -384,6 +384,14 @@ def _format_author_lastnames(authors: list[str], max_authors: int = 3) -> str:
     return ", ".join(chosen)
 
 
+def _format_voters(votes: list[dict]) -> str:
+    voters = [str(v.get("user", "")).strip() for v in votes]
+    voters = [v for v in voters if v]
+    if not voters:
+        return "-"
+    return ", ".join(sorted(set(voters), key=str.lower))
+
+
 def _filter_entries(entries: list[dict[str, str]], keywords: list[str] | None) -> list[dict[str, str]]:
     if not keywords:
         return entries
@@ -681,7 +689,8 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
         _prune_expired_votes(paper)
         if paper.get("selected"):
             continue
-        vote_count = len(paper.get("votes", []))
+        votes = paper.get("votes", [])
+        vote_count = len(votes)
         if vote_count <= 0:
             continue
         rows.append(
@@ -689,6 +698,7 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
                 "id": _strip_arxiv_version(str(paper.get("id", "(unknown)"))),
                 "title": paper.get("title", "(no title)"),
                 "votes": vote_count,
+                "voters": _format_voters(votes),
             }
         )
     rows.sort(key=lambda p: (-p["votes"], p["id"]))
@@ -697,7 +707,7 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
         print("No voted papers yet.")
         return 0
     for idx, p in enumerate(topn, 1):
-        print(f"{idx:>2}. [{p['votes']:>3} votes] {_format_clickable_id(p['id'])}  {p['title']}")
+        print(f"{idx:>2}. [voters: {p['voters']}] {_format_clickable_id(p['id'])}  {p['title']}")
     return 0
 
 
