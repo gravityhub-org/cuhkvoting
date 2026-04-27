@@ -1022,13 +1022,9 @@ def select(
 
 @app.command("vote")
 def vote_command(
-    action_or_paper: str | None = typer.Argument(
+    action_or_paper: list[str] | None = typer.Argument(
         None,
-        help="arXiv id/url OR action `remove` (use top-level `select <id>`).",
-    ),
-    paper_id: str | None = typer.Argument(
-        None,
-        help="arXiv id/url for remove/select.",
+        help="One or more arXiv ids/urls OR action `remove <id>` (use top-level `select <id>`).",
     ),
     repo: str | None = typer.Option(
         None,
@@ -1044,21 +1040,24 @@ def vote_command(
     if not action_or_paper:
         _run_cmd(cmd_topvoted, N=10, repo=repo, branch=branch)
         return
-    action = action_or_paper.strip().lower()
+    action = action_or_paper[0].strip().lower()
     if action == "remove":
-        if not paper_id:
+        if len(action_or_paper) < 2:
             _run_cmd(cmd_topvoted, N=10, repo=repo, branch=branch)
             return
-        _run_cmd(cmd_vote_remove, paper_id=paper_id, repo=repo, branch=branch)
+        if len(action_or_paper) > 2:
+            raise typer.BadParameter("Usage: cuhkvoting vote remove <id>")
+        _run_cmd(cmd_vote_remove, paper_id=action_or_paper[1], repo=repo, branch=branch)
         return
     if action == "select":
-        if not paper_id:
+        if len(action_or_paper) < 2:
             raise typer.BadParameter("Usage: cuhkvoting select <id>")
-        _run_cmd(cmd_select, paper_id=paper_id, repo=repo, branch=branch)
+        if len(action_or_paper) > 2:
+            raise typer.BadParameter("Usage: cuhkvoting select <id>")
+        _run_cmd(cmd_select, paper_id=action_or_paper[1], repo=repo, branch=branch)
         return
-    if paper_id is not None:
-        raise typer.BadParameter("Usage: cuhkvoting vote <id> OR cuhkvoting vote remove <id>")
-    _run_cmd(cmd_vote, paper_id=action_or_paper, repo=repo, branch=branch)
+    for one_paper_id in action_or_paper:
+        _run_cmd(cmd_vote, paper_id=one_paper_id, repo=repo, branch=branch)
 
 
 admin_app = typer.Typer(name="admin", help="Admin-like maintenance commands (no admin auth required).")
