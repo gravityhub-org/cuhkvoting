@@ -707,7 +707,7 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
         print("No voted papers yet.")
         return 0
     for idx, p in enumerate(topn, 1):
-        print(f"{idx:>2}.{_format_clickable_id(p['id'])}  {p['title']} [{p['voters']}]")
+        print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {p['title']} [{p['voters']}]")
     return 0
 
 
@@ -891,7 +891,7 @@ def lastweek(
         None,
         help="Optional keyword filters. All keywords must match title/abstract/authors.",
     ),
-    limit: int = typer.Option(100, "--limit", help="Max number of entries."),
+    limit: int = typer.Option(1000, "--limit", help="Max number of entries."),
 ) -> None:
     _run_cmd(cmd_lastweek, limit=limit, keywords=keywords)
 
