@@ -1,0 +1,12 @@
+{
+  "abstract": "SDSSJ110546.07+145202.4 stands out as a unique radio changing-look Narrow-line Seyfert 1 (NLS1) galaxy that has brightened dramatically and shows an exceptionally long duration of its \"on\" phase. We present the first high-frequency radio observations, the first simultaneous radio spectral energy distributions (SEDs), the first optical--UV--X-ray SEDs, and the first X-ray monitoring and spectroscopy of this recently discovered event. Importantly for understanding the nature of the outburst, we show that the X-ray spectrum is soft with a photon index Gamma_X=2.5; line-of-sight absorption and extinction are low or absent; the radio SED is peaked at low frequencies ~2 GHz; and the radio outburst emission is very long-lived (t > 8 yr) and roughly constant. The softness of the X-ray spectrum, low supermassive black hole (SMBH) mass, and high Eddington ratio all corroborate the optical NLS1 classification. We discuss multiple outburst scenarios, including lensing, absorption, a binary SMBH merger, a long-duration giant-star tidal disruption, a newly ignited active galactic nucleus (AGN), and an accretion-rate change. While most of them can be either excluded or are deemed too rare and lack positive evidence so far, most or all types of these transients are expected to be detected in ongoing VLA and upcoming SKA surveys. SDSSJ110546.07+145202.4 itself is well explained by an accretion rate change that triggered the powerful radio jet emission. The low redshift and SMBH mass of this system offer a unique perspective of the physical processes of radio-jet ignition that are expected to operate in the early Universe around growing SMBHs.",
+  "id": "2604.19435",
+  "title": "SDSSJ110546.07+145202.4: The first long-duration radio changing-look NLS1 galaxy",
+  "url": "https://arxiv.org/abs/2604.19435",
+  "votes": [
+    {
+      "user": "Juno Chan",
+      "voted_at": "2026-04-27T03:46:55.589613Z"
+    }
+  ]
+}
