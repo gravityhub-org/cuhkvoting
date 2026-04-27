@@ -22,6 +22,7 @@ import typer
 ARXIV_API = "https://export.arxiv.org/api/query"
 ARXIV_ABS = "https://arxiv.org/abs/"
 DEFAULT_REPO = "gravityhub-org/cuhkvoting"
+VOTE_EXPIRY_DAYS = 183
 
 
 @dataclass
@@ -95,8 +96,34 @@ def _run_git(args: list[str], cwd: str | None = None) -> str:
         check=False,
     )
     if proc.returncode != 0:
-        raise SystemExit(proc.stderr.strip() or f"git {' '.join(args)} failed")
+        err = proc.stderr.strip() or f"git {' '.join(args)} failed"
+        if _looks_like_github_auth_error(err):
+            err = f"{err}\n\n{_ssh_setup_instructions()}"
+        raise SystemExit(err)
     return proc.stdout
+
+
+def _looks_like_github_auth_error(text: str) -> bool:
+    low = text.lower()
+    return (
+        "github.com" in low
+        and (
+            "permission denied (publickey)" in low
+            or "authentication failed" in low
+            or "could not read from remote repository" in low
+            or "could not read username for 'https://github.com'" in low
+        )
+    )
+
+
+def _ssh_setup_instructions() -> str:
+    return (
+        "GitHub auth failed. Set up SSH key:\n"
+        "1) ssh-keygen -t ed25519 -C \"you@example.com\"\n"
+        "2) eval \"$(ssh-agent -s)\" && ssh-add ~/.ssh/id_ed25519\n"
+        "3) Add ~/.ssh/id_ed25519.pub to GitHub SSH keys\n"
+        "4) Test: ssh -T git@github.com"
+    )
 
 
 def _resolve_repo_config(args: SimpleNamespace) -> RepoConfig:
@@ -171,11 +198,11 @@ def _load_paper_via_api(cfg: RepoConfig, path: str, token: str | None) -> tuple[
 
 
 def _save_paper_via_api(
-    cfg: RepoConfig, path: str, paper: dict, sha: str | None, token: str, user: str, paper_vote_id: str
+    cfg: RepoConfig, path: str, paper: dict, sha: str | None, token: str, message: str
 ) -> None:
     url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/contents/{path}"
     payload = {
-        "message": f"vote: {user} -> {paper_vote_id}",
+        "message": message,
         "branch": cfg.branch,
         "content": base64.b64encode((json.dumps(paper, indent=2, sort_keys=True) + "\n").encode("utf-8")).decode(
             "ascii"
@@ -306,6 +333,107 @@ def _find_legacy_paper_via_api(cfg: RepoConfig, base_id: str, token: str | None)
     return None, None, None
 
 
+def _parse_utc(ts: str) -> dt.datetime | None:
+    try:
+        return dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _prune_expired_votes(paper: dict) -> int:
+    cutoff = dt.datetime.utcnow() - dt.timedelta(days=VOTE_EXPIRY_DAYS)
+    votes = paper.get("votes", [])
+    kept = []
+    for v in votes:
+        voted_at = _parse_utc(str(v.get("voted_at", "")))
+        if voted_at and voted_at >= cutoff:
+            kept.append(v)
+    removed = len(votes) - len(kept)
+    paper["votes"] = kept
+    return removed
+
+
+def _resolve_user(token: str | None) -> str:
+    user = os.getenv("CUHKVOTING_USER")
+    if not user:
+        user = os.getenv("GITHUB_USER")
+    if not user:
+        user = _get_user_from_token(token)
+    if not user:
+        try:
+            user = _run_git(["config", "--global", "user.name"]).strip()
+        except SystemExit:
+            user = ""
+    if not user:
+        raise SystemExit("Could not identify user. Set CUHKVOTING_USER or configure git user.name.")
+    return user
+
+
+def _load_vote_paper(cfg: RepoConfig, token: str | None, paper_id: str) -> tuple[dict | None, str | None, str]:
+    path = f"papers/{_safe_filename(paper_id)}.json"
+    paper, sha = _load_paper_via_api(cfg, path, token)
+    save_path = path
+    if paper is None:
+        legacy_paper, legacy_sha, legacy_path = _find_legacy_paper_via_api(cfg, paper_id, token)
+        if legacy_paper is not None and legacy_path is not None:
+            paper, sha, save_path = legacy_paper, legacy_sha, legacy_path
+    if paper is None and _has_github_ssh_access():
+        clone_dir, cleanup_dir = _with_repo_checkout(cfg)
+        try:
+            paper_file = Path(clone_dir) / path
+            if paper_file.exists():
+                paper = json.loads(paper_file.read_text(encoding="utf-8"))
+            else:
+                papers_dir = Path(clone_dir) / "papers"
+                if papers_dir.exists():
+                    for cand in papers_dir.glob("*.json"):
+                        try:
+                            cand_paper = json.loads(cand.read_text(encoding="utf-8"))
+                        except Exception:
+                            continue
+                        if _strip_arxiv_version(str(cand_paper.get("id", ""))) == paper_id:
+                            paper = cand_paper
+                            save_path = str(cand.relative_to(clone_dir))
+                            break
+        finally:
+            shutil.rmtree(cleanup_dir, ignore_errors=True)
+    return paper, sha, save_path
+
+
+def _save_vote_paper(
+    cfg: RepoConfig,
+    token: str | None,
+    user: str,
+    paper: dict,
+    sha: str | None,
+    save_path: str,
+    message: str,
+) -> None:
+    if token:
+        _save_paper_via_api(cfg, save_path, paper, sha, token, message)
+        return
+    if not _has_github_ssh_access():
+        raise SystemExit(f"Voting needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure SSH key.\n\n{_ssh_setup_instructions()}")
+    clone_dir, cleanup_dir = _with_repo_checkout(cfg)
+    try:
+        paper_file = Path(clone_dir) / save_path
+        paper_file.parent.mkdir(parents=True, exist_ok=True)
+        paper_file.write_text(json.dumps(paper, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        _ensure_commit_identity(clone_dir, user)
+        _run_git(["add", str(Path(save_path))], cwd=clone_dir)
+        _run_git(["commit", "-m", message], cwd=clone_dir)
+        _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
+    finally:
+        shutil.rmtree(cleanup_dir, ignore_errors=True)
+
+
+def _validate_arxiv_entry(paper_id: str) -> dict:
+    entries = _arxiv_query({"search_query": f"id:{paper_id}", "start": "0", "max_results": "1"})
+    if not entries:
+        raise SystemExit(f"Could not find arXiv entry for id '{paper_id}'.")
+    return entries[0]
+
+
 def _with_repo_checkout(cfg: RepoConfig) -> tuple[str, str]:
     tmpdir = tempfile.mkdtemp(prefix="cuhkvoting-")
     try:
@@ -433,6 +561,9 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
 
     rows = []
     for paper in papers:
+        _prune_expired_votes(paper)
+        if paper.get("selected"):
+            continue
         rows.append(
             {
                 "id": _strip_arxiv_version(str(paper.get("id", "(unknown)"))),
@@ -453,63 +584,13 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
 def cmd_vote(args: SimpleNamespace) -> int:
     cfg = _resolve_repo_config(args)
     token = _get_token()
-    user = os.getenv("CUHKVOTING_USER")
-    if not user:
-        user = os.getenv("GITHUB_USER")
-    if not user:
-        user = _get_user_from_token(token)
-    if not user:
-        # Use git config user.name as default identity if explicit user is not set.
-        try:
-            user = _run_git(["config", "--global", "user.name"]).strip()
-        except SystemExit:
-            user = ""
-    if not user:
-        raise SystemExit("Could not identify user. Set CUHKVOTING_USER or configure git user.name.")
-
+    user = _resolve_user(token)
     paper_id = _normalize_paper_id(args.paper_id)
-    # Enforce valid arXiv target before reading/writing vote records.
-    validate_entries = _arxiv_query(
-        {
-            "search_query": f"id:{paper_id}",
-            "start": "0",
-            "max_results": "1",
-        }
-    )
-    if not validate_entries:
-        raise SystemExit(f"Could not find arXiv entry for id '{paper_id}'.")
-
-    path = f"papers/{_safe_filename(paper_id)}.json"
-
-    paper, sha = _load_paper_via_api(cfg, path, token)
-    save_path = path
-    if paper is None:
-        legacy_paper, legacy_sha, legacy_path = _find_legacy_paper_via_api(cfg, paper_id, token)
-        if legacy_paper is not None and legacy_path is not None:
-            paper, sha, save_path = legacy_paper, legacy_sha, legacy_path
-    if paper is None and _has_github_ssh_access():
-        clone_dir, cleanup_dir = _with_repo_checkout(cfg)
-        try:
-            paper_file = Path(clone_dir) / path
-            if paper_file.exists():
-                paper = json.loads(paper_file.read_text(encoding="utf-8"))
-            else:
-                papers_dir = Path(clone_dir) / "papers"
-                if papers_dir.exists():
-                    for cand in papers_dir.glob("*.json"):
-                        try:
-                            cand_paper = json.loads(cand.read_text(encoding="utf-8"))
-                        except Exception:
-                            continue
-                        if _strip_arxiv_version(str(cand_paper.get("id", ""))) == paper_id:
-                            paper = cand_paper
-                            save_path = str(cand.relative_to(clone_dir))
-                            break
-        finally:
-            shutil.rmtree(cleanup_dir, ignore_errors=True)
+    validate_entry = _validate_arxiv_entry(paper_id)
+    paper, sha, save_path = _load_vote_paper(cfg, token, paper_id)
 
     if paper is None:
-        entry = validate_entries[0]
+        entry = validate_entry
         paper = {
             "id": entry["id"],
             "title": entry["title"],
@@ -517,38 +598,67 @@ def cmd_vote(args: SimpleNamespace) -> int:
             "url": entry["url"],
             "votes": [],
         }
-        sha = None
 
+    _prune_expired_votes(paper)
     votes = paper.setdefault("votes", [])
     if any(v.get("user") == user for v in votes):
         raise SystemExit(f"User '{user}' already voted for {paper.get('id', paper_id)}.")
     paper_vote_id = _strip_arxiv_version(str(paper.get("id", paper_id)))
     paper["id"] = paper_vote_id
     votes.append({"user": user, "voted_at": dt.datetime.utcnow().isoformat() + "Z"})
+    _save_vote_paper(cfg, token, user, paper, sha, save_path, f"vote: {user} -> {paper_vote_id}")
+    print(f"Vote recorded: {user} -> {paper_vote_id}")
+    return 0
 
-    if token:
-        _save_paper_via_api(cfg, save_path, paper, sha, token, user, paper_vote_id)
-        print(f"Vote recorded: {user} -> {paper_vote_id}")
-        return 0
 
-    if not _has_github_ssh_access():
-        raise SystemExit(
-            "Voting needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure GitHub SSH key."
-        )
+def cmd_vote_remove(args: SimpleNamespace) -> int:
+    cfg = _resolve_repo_config(args)
+    token = _get_token()
+    user = _resolve_user(token)
+    paper_id = _normalize_paper_id(args.paper_id)
+    _validate_arxiv_entry(paper_id)
+    paper, sha, save_path = _load_vote_paper(cfg, token, paper_id)
+    if paper is None:
+        raise SystemExit(f"No vote record found for '{paper_id}'.")
+    _prune_expired_votes(paper)
+    votes = paper.setdefault("votes", [])
+    kept = [v for v in votes if v.get("user") != user]
+    if len(kept) == len(votes):
+        raise SystemExit(f"User '{user}' has no active vote for {paper_id}.")
+    paper["votes"] = kept
+    _save_vote_paper(cfg, token, user, paper, sha, save_path, f"vote-remove: {user} -> {paper_id}")
+    print(f"Vote removed: {user} -> {paper_id}")
+    return 0
 
-    clone_dir, cleanup_dir = _with_repo_checkout(cfg)
-    try:
-        paper_file = Path(clone_dir) / save_path
-        paper_file.parent.mkdir(parents=True, exist_ok=True)
-        paper_file.write_text(json.dumps(paper, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        _ensure_commit_identity(clone_dir, user)
-        _run_git(["add", str(Path(save_path))], cwd=clone_dir)
-        _run_git(["commit", "-m", f"vote: {user} -> {paper_vote_id}"], cwd=clone_dir)
-        _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
-        print(f"Vote recorded: {user} -> {paper_vote_id}")
-        return 0
-    finally:
-        shutil.rmtree(cleanup_dir, ignore_errors=True)
+
+def cmd_vote_select(args: SimpleNamespace) -> int:
+    cfg = _resolve_repo_config(args)
+    token = _get_token()
+    user = _resolve_user(token)
+    paper_id = _normalize_paper_id(args.paper_id)
+    entry = _validate_arxiv_entry(paper_id)
+    paper, sha, save_path = _load_vote_paper(cfg, token, paper_id)
+    if paper is None:
+        paper = {
+            "id": entry["id"],
+            "title": entry["title"],
+            "abstract": entry["abstract"],
+            "url": entry["url"],
+            "votes": [],
+        }
+    _prune_expired_votes(paper)
+    paper["votes"] = [v for v in paper.get("votes", []) if v.get("user") != user]
+    now = dt.datetime.utcnow()
+    year, week, _ = now.isocalendar()
+    week_tag = f"{year}-W{week:02d}"
+    selection = {"user": user, "selected_at": now.isoformat() + "Z", "week": week_tag}
+    history = paper.setdefault("selections", [])
+    history.append(selection)
+    paper["selected"] = selection
+    paper["id"] = _strip_arxiv_version(str(paper.get("id", paper_id)))
+    _save_vote_paper(cfg, token, user, paper, sha, save_path, f"vote-select: {user} -> {paper['id']} ({week_tag})")
+    print(f"Selected for presentation: {user} -> {paper['id']} ({week_tag})")
+    return 0
 
 
 app = typer.Typer(
@@ -623,8 +733,9 @@ def topvoted(
 
 
 @app.command("vote")
-def vote(
-    paper_id: str = typer.Argument(..., help="arXiv id/url."),
+def vote_command(
+    action_or_paper: str = typer.Argument(..., help="arXiv id/url OR action `remove|select`."),
+    paper_id: str | None = typer.Argument(None, help="arXiv id/url for remove/select."),
     repo: str | None = typer.Option(
         None,
         "--repo",
@@ -636,7 +747,20 @@ def vote(
         help="Git branch to read/write.",
     ),
 ) -> None:
-    _run_cmd(cmd_vote, paper_id=paper_id, repo=repo, branch=branch)
+    action = action_or_paper.strip().lower()
+    if action == "remove":
+        if not paper_id:
+            raise typer.BadParameter("Usage: cuhkvoting vote remove <id>")
+        _run_cmd(cmd_vote_remove, paper_id=paper_id, repo=repo, branch=branch)
+        return
+    if action == "select":
+        if not paper_id:
+            raise typer.BadParameter("Usage: cuhkvoting vote select <id>")
+        _run_cmd(cmd_vote_select, paper_id=paper_id, repo=repo, branch=branch)
+        return
+    if paper_id is not None:
+        raise typer.BadParameter("Usage: cuhkvoting vote <id> OR cuhkvoting vote remove|select <id>")
+    _run_cmd(cmd_vote, paper_id=action_or_paper, repo=repo, branch=branch)
 
 
 def main() -> None:

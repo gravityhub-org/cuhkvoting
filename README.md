@@ -57,6 +57,8 @@ cuhkvoting lastweek "black hole"
 cuhkvoting search "vision language model"
 cuhkvoting topvoted --N 10
 cuhkvoting vote 2504.12345
+cuhkvoting vote remove 2504.12345
+cuhkvoting vote select 2504.12345
 ```
 
 ### Bash autocomplete
@@ -78,3 +80,4 @@ Votes and metadata are stored as JSON files:
 - `papers/<arxiv_id>.json`
 - one file per paper
 - one vote per GitHub username enforced by CLI
+- votes expire after 6 months
