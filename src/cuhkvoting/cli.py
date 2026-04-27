@@ -707,7 +707,7 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
         print("No voted papers yet.")
         return 0
     for idx, p in enumerate(topn, 1):
-        print(f"{idx:>2}. [{p['voters']}] {_format_clickable_id(p['id'])}  {p['title']}")
+        print(f"{idx:>2}.{_format_clickable_id(p['id'])}  {p['title']} [{p['voters']}]")
     return 0
 
 
