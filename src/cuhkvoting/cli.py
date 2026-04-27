@@ -21,6 +21,7 @@ import typer
 
 ARXIV_API = "https://export.arxiv.org/api/query"
 ARXIV_ABS = "https://arxiv.org/abs/"
+DEFAULT_REPO = "gravityhub-org/cuhkvoting"
 
 
 @dataclass
@@ -110,6 +111,8 @@ def _resolve_repo_config(args: SimpleNamespace) -> RepoConfig:
         parsed = _derive_repo_from_git()
         if parsed:
             owner, repo, _remote_url = parsed
+        else:
+            owner, repo = DEFAULT_REPO.split("/", 1)
     if not owner or not repo:
         raise SystemExit(
             "Could not determine GitHub repo. Set CUHKVOTING_REPO=owner/name or pass --repo owner/name."

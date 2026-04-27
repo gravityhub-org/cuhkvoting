@@ -33,7 +33,9 @@ Optional SSH check:
 ssh -T git@github.com
 ```
 
-If running outside a local git clone, set target repo:
+Default repo is `gravityhub-org/cuhkvoting`.
+
+If you want override default (or run against another repo):
 
 ```bash
 export CUHKVOTING_REPO=gravityhub-org/cuhkvoting
