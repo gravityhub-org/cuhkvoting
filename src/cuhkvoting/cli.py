@@ -259,9 +259,12 @@ def _ensure_commit_identity(repo_dir: str, user: str) -> None:
 
 
 def cmd_today(args: SimpleNamespace) -> int:
-    today = dt.datetime.utcnow().strftime("%Y%m%d")
+    now = dt.datetime.utcnow()
+    start_dt = now - dt.timedelta(days=1)
+    start = start_dt.strftime("%Y%m%d%H%M")
+    end = now.strftime("%Y%m%d%H%M")
     params = {
-        "search_query": f"submittedDate:[{today}0000 TO {today}2359]",
+        "search_query": f"submittedDate:[{start} TO {end}]",
         "start": "0",
         "max_results": str(args.limit),
         "sortBy": "submittedDate",
@@ -269,8 +272,20 @@ def cmd_today(args: SimpleNamespace) -> int:
     }
     entries = _arxiv_query(params)
     if not entries:
-        print("No papers found for today (UTC).")
-        return 0
+        # arXiv may have no new submissions in current UTC window.
+        entries = _arxiv_query(
+            {
+                "search_query": "all:the",
+                "start": "0",
+                "max_results": str(args.limit),
+                "sortBy": "submittedDate",
+                "sortOrder": "descending",
+            }
+        )
+        if not entries:
+            print("No papers found for today (UTC).")
+            return 0
+        print("No new UTC-day submissions. Showing most recent arXiv entries:")
     for idx, p in enumerate(entries, 1):
         print(f"{idx:>2}. {p['id']}  {p['title']}")
     return 0
