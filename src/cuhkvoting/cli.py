@@ -434,6 +434,27 @@ def _validate_arxiv_entry(paper_id: str) -> dict:
     return entries[0]
 
 
+def _known_vote_ids() -> list[str]:
+    try:
+        cfg = _resolve_repo_config(SimpleNamespace(repo=None, branch=os.getenv("CUHKVOTING_BRANCH", "main")))
+        papers = _list_papers_via_api(cfg, _get_token())
+    except Exception:
+        return []
+    ids = {_strip_arxiv_version(str(p.get("id", ""))) for p in papers if p.get("id")}
+    return sorted(i for i in ids if i)
+
+
+def _complete_vote_action_or_id(incomplete: str) -> list[str]:
+    pool = ["remove", "select", *_known_vote_ids()]
+    low = incomplete.lower()
+    return [x for x in pool if x.lower().startswith(low)]
+
+
+def _complete_vote_id(incomplete: str) -> list[str]:
+    low = incomplete.lower()
+    return [x for x in _known_vote_ids() if x.lower().startswith(low)]
+
+
 def _with_repo_checkout(cfg: RepoConfig) -> tuple[str, str]:
     tmpdir = tempfile.mkdtemp(prefix="cuhkvoting-")
     try:
@@ -752,8 +773,16 @@ def topvoted(
 
 @app.command("vote")
 def vote_command(
-    action_or_paper: str = typer.Argument(..., help="arXiv id/url OR action `remove|select`."),
-    paper_id: str | None = typer.Argument(None, help="arXiv id/url for remove/select."),
+    action_or_paper: str = typer.Argument(
+        ...,
+        help="arXiv id/url OR action `remove|select`.",
+        autocompletion=_complete_vote_action_or_id,
+    ),
+    paper_id: str | None = typer.Argument(
+        None,
+        help="arXiv id/url for remove/select.",
+        autocompletion=_complete_vote_id,
+    ),
     repo: str | None = typer.Option(
         None,
         "--repo",
@@ -786,7 +815,11 @@ admin_app = typer.Typer(name="admin", help="Admin-like maintenance commands (no 
 
 @admin_app.command("trash")
 def admin_trash(
-    vote_id: str = typer.Argument(..., help="Vote record id (use arXiv id/url)."),
+    vote_id: str = typer.Argument(
+        ...,
+        help="Vote record id (use arXiv id/url).",
+        autocompletion=_complete_vote_id,
+    ),
     repo: str | None = typer.Option(
         None,
         "--repo",
