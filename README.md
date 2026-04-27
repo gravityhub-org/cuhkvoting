@@ -5,8 +5,15 @@ Minimal CLI to browse arXiv and vote on papers, with paper data and votes stored
 ### Install
 
 ```bash
-pip install --upgrade git+https://github.com/gravityhub-org/cuhkvoting.git
+pip install --upgrade git+https://github.com/gravityhub-org/cuhkvoting.git && cuhkvoting --install-completion
 ```
+
+Or:
+
+```bash
+uv tool install --upgrade git+https://github.com/gravityhub-org/cuhkvoting.git && cuhkvoting --install-completion
+```
+
 
 ### Quick setup
 
