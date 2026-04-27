@@ -21,8 +21,9 @@ import typer
 
 ARXIV_API = "https://export.arxiv.org/api/query"
 ARXIV_ABS = "https://arxiv.org/abs/"
-DEFAULT_REPO = "gravityhub-org/cuhkvoting"
+DEFAULT_REPO = "gravityhub-org/cuhkvoting-records"
 VOTE_EXPIRY_DAYS = 183
+JC_RECORD_PATH = "papers/journal_club_records.json"
 
 
 @dataclass
@@ -208,6 +209,10 @@ def _load_paper_via_api(cfg: RepoConfig, path: str, token: str | None) -> tuple[
     return json.loads(content), data.get("sha")
 
 
+def _load_json_via_api(cfg: RepoConfig, path: str, token: str | None) -> tuple[dict | None, str | None]:
+    return _load_paper_via_api(cfg, path, token)
+
+
 def _save_paper_via_api(
     cfg: RepoConfig, path: str, paper: dict, sha: str | None, token: str, message: str
 ) -> None:
@@ -224,10 +229,52 @@ def _save_paper_via_api(
     _http_put_json(url, payload, headers=_github_headers(token))
 
 
+def _save_json_via_api(cfg: RepoConfig, path: str, body: dict, sha: str | None, token: str, message: str) -> None:
+    _save_paper_via_api(cfg, path, body, sha, token, message)
+
+
 def _delete_paper_via_api(cfg: RepoConfig, path: str, sha: str, token: str, message: str) -> None:
     url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/contents/{path}"
     payload = {"message": message, "branch": cfg.branch, "sha": sha}
     _http_delete_json(url, payload, headers=_github_headers(token))
+
+
+def _load_jc_records(cfg: RepoConfig, token: str | None) -> tuple[list[dict], str | None]:
+    data, sha = _load_json_via_api(cfg, JC_RECORD_PATH, token)
+    if data is not None:
+        records = data.get("records", [])
+        return (records if isinstance(records, list) else []), sha
+    if _has_github_ssh_access():
+        clone_dir, cleanup_dir = _with_repo_checkout(cfg)
+        try:
+            p = Path(clone_dir) / JC_RECORD_PATH
+            if p.exists():
+                body = json.loads(p.read_text(encoding="utf-8"))
+                records = body.get("records", [])
+                return (records if isinstance(records, list) else []), None
+        finally:
+            shutil.rmtree(cleanup_dir, ignore_errors=True)
+    return [], None
+
+
+def _save_jc_records(cfg: RepoConfig, token: str | None, user: str, records: list[dict], sha: str | None, message: str) -> None:
+    body = {"records": records}
+    if token:
+        _save_json_via_api(cfg, JC_RECORD_PATH, body, sha, token, message)
+        return
+    if not _has_github_ssh_access():
+        raise SystemExit(f"Writing records needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure SSH key.\n\n{_ssh_setup_instructions()}")
+    clone_dir, cleanup_dir = _with_repo_checkout(cfg)
+    try:
+        p = Path(clone_dir) / JC_RECORD_PATH
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        _ensure_commit_identity(clone_dir, user)
+        _run_git(["add", JC_RECORD_PATH], cwd=clone_dir)
+        _run_git(["commit", "-m", message], cwd=clone_dir)
+        _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
+    finally:
+        shutil.rmtree(cleanup_dir, ignore_errors=True)
 
 
 def _list_papers_via_api(cfg: RepoConfig, token: str | None) -> list[dict]:
@@ -683,7 +730,7 @@ def cmd_vote_remove(args: SimpleNamespace) -> int:
     return 0
 
 
-def cmd_vote_select(args: SimpleNamespace) -> int:
+def cmd_select(args: SimpleNamespace) -> int:
     cfg = _resolve_repo_config(args)
     token = _get_token()
     user = _resolve_user(token)
@@ -699,17 +746,33 @@ def cmd_vote_select(args: SimpleNamespace) -> int:
             "votes": [],
         }
     _prune_expired_votes(paper)
-    paper["votes"] = [v for v in paper.get("votes", []) if v.get("user") != user]
+    vote_count = len(paper.get("votes", []))
     now = dt.datetime.utcnow()
     year, week, _ = now.isocalendar()
     week_tag = f"{year}-W{week:02d}"
-    selection = {"user": user, "selected_at": now.isoformat() + "Z", "week": week_tag}
-    history = paper.setdefault("selections", [])
-    history.append(selection)
-    paper["selected"] = selection
-    paper["id"] = _strip_arxiv_version(str(paper.get("id", paper_id)))
-    _save_vote_paper(cfg, token, user, paper, sha, save_path, f"vote-select: {user} -> {paper['id']} ({week_tag})")
-    print(f"Selected for presentation: {user} -> {paper['id']} ({week_tag})")
+    selected_at = now.isoformat() + "Z"
+    canonical_id = _strip_arxiv_version(str(paper.get("id", paper_id)))
+
+    records, record_sha = _load_jc_records(cfg, token)
+    records.append(
+        {
+            "week": week_tag,
+            "arxiv_id": canonical_id,
+            "title": paper.get("title", entry["title"]),
+            "historical_vote": vote_count,
+            "selected_at": selected_at,
+            "selected_by": user,
+        }
+    )
+    _save_jc_records(cfg, token, user, records, record_sha, f"record-select: {user} -> {canonical_id} ({week_tag})")
+
+    if paper is not None and sha is not None:
+        _delete_vote_paper(cfg, token, user, save_path, sha, f"select-delete-vote: {user} -> {canonical_id}")
+    elif paper is not None and _has_github_ssh_access():
+        # If loaded via git fallback without sha, still delete through git path.
+        _delete_vote_paper(cfg, None, user, save_path, None, f"select-delete-vote: {user} -> {canonical_id}")
+
+    print(f"Selected for presentation: {user} -> {canonical_id} ({week_tag})")
     return 0
 
 
@@ -723,6 +786,24 @@ def cmd_admin_trash(args: SimpleNamespace) -> int:
         raise SystemExit(f"No vote record found for '{paper_id}'.")
     _delete_vote_paper(cfg, token, user, save_path, sha, f"admin-trash: {user} -> {paper_id}")
     print(f"Trashed and deleted vote record: {paper_id}")
+    return 0
+
+
+def cmd_record(args: SimpleNamespace) -> int:
+    cfg = _resolve_repo_config(args)
+    token = _get_token()
+    records, _sha = _load_jc_records(cfg, token)
+    if not records:
+        print("No journal club records yet.")
+        return 0
+    rows = sorted(records, key=lambda r: str(r.get("selected_at", "")), reverse=True)
+    for i, r in enumerate(rows, 1):
+        week = str(r.get("week", "?"))
+        arxiv_id = str(r.get("arxiv_id", "?"))
+        title = str(r.get("title", "(no title)"))
+        hist = int(r.get("historical_vote", 0))
+        selected_at = str(r.get("selected_at", "?"))
+        print(f"{i:>2}. {week}  {_format_clickable_id(arxiv_id)}  votes:{hist}  selected:{selected_at}  {title}")
     return 0
 
 
@@ -797,11 +878,44 @@ def topvoted(
     _run_cmd(cmd_topvoted, N=n, repo=repo, branch=branch)
 
 
+@app.command("record")
+def record(
+    repo: str | None = typer.Option(
+        None,
+        "--repo",
+        help="GitHub repo owner/name. Defaults to CUHKVOTING_REPO or current git remote.",
+    ),
+    branch: str = typer.Option(
+        os.getenv("CUHKVOTING_BRANCH", "main"),
+        "--branch",
+        help="Git branch to read/write.",
+    ),
+) -> None:
+    _run_cmd(cmd_record, repo=repo, branch=branch)
+
+
+@app.command("select")
+def select(
+    paper_id: str = typer.Argument(..., help="arXiv id/url."),
+    repo: str | None = typer.Option(
+        None,
+        "--repo",
+        help="GitHub repo owner/name. Defaults to CUHKVOTING_REPO or current git remote.",
+    ),
+    branch: str = typer.Option(
+        os.getenv("CUHKVOTING_BRANCH", "main"),
+        "--branch",
+        help="Git branch to read/write.",
+    ),
+) -> None:
+    _run_cmd(cmd_select, paper_id=paper_id, repo=repo, branch=branch)
+
+
 @app.command("vote")
 def vote_command(
     action_or_paper: str | None = typer.Argument(
         None,
-        help="arXiv id/url OR action `remove|select`.",
+        help="arXiv id/url OR action `remove` (use top-level `select <id>`).",
     ),
     paper_id: str | None = typer.Argument(
         None,
@@ -830,11 +944,11 @@ def vote_command(
         return
     if action == "select":
         if not paper_id:
-            raise typer.BadParameter("Usage: cuhkvoting vote select <id>")
-        _run_cmd(cmd_vote_select, paper_id=paper_id, repo=repo, branch=branch)
+            raise typer.BadParameter("Usage: cuhkvoting select <id>")
+        _run_cmd(cmd_select, paper_id=paper_id, repo=repo, branch=branch)
         return
     if paper_id is not None:
-        raise typer.BadParameter("Usage: cuhkvoting vote <id> OR cuhkvoting vote remove|select <id>")
+        raise typer.BadParameter("Usage: cuhkvoting vote <id> OR cuhkvoting vote remove <id>")
     _run_cmd(cmd_vote, paper_id=action_or_paper, repo=repo, branch=branch)
 
 

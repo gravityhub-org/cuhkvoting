@@ -33,12 +33,12 @@ Optional SSH check:
 ssh -T git@github.com
 ```
 
-Default repo is `gravityhub-org/cuhkvoting`.
+Default repo is `gravityhub-org/cuhkvoting-records`.
 
 If you want override default (or run against another repo):
 
 ```bash
-export CUHKVOTING_REPO=gravityhub-org/cuhkvoting
+export CUHKVOTING_REPO=gravityhub-org/cuhkvoting-records
 ```
 
 Optional branch override:
@@ -56,9 +56,10 @@ cuhkvoting lastweek
 cuhkvoting lastweek "black hole"
 cuhkvoting search "vision language model"
 cuhkvoting topvoted --N 10
+cuhkvoting record
 cuhkvoting vote 2504.12345
 cuhkvoting vote remove 2504.12345
-cuhkvoting vote select 2504.12345
+cuhkvoting select 2504.12345
 cuhkvoting admin trash 2504.12345
 ```
 
