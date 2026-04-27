@@ -55,6 +55,18 @@ cuhkvoting topvoted --N 10
 cuhkvoting vote 2504.12345
 ```
 
+### Bash autocomplete
+
+```bash
+cuhkvoting --install-completion
+```
+
+If you prefer manual setup:
+
+```bash
+eval "$(_CUHKVOTING_COMPLETE=bash_source cuhkvoting)"
+```
+
 ### Data format
 
 Votes and metadata are stored as JSON files:

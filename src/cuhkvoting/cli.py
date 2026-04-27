@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import base64
 import datetime as dt
 import json
@@ -8,7 +7,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import urllib.error
 import urllib.parse
@@ -16,6 +14,9 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
+
+import typer
 
 
 ARXIV_API = "https://export.arxiv.org/api/query"
@@ -97,7 +98,7 @@ def _run_git(args: list[str], cwd: str | None = None) -> str:
     return proc.stdout
 
 
-def _resolve_repo_config(args: argparse.Namespace) -> RepoConfig:
+def _resolve_repo_config(args: SimpleNamespace) -> RepoConfig:
     repo_arg = args.repo or os.getenv("CUHKVOTING_REPO")
     owner: str | None = None
     repo: str | None = None
@@ -257,7 +258,7 @@ def _ensure_commit_identity(repo_dir: str, user: str) -> None:
     _run_git(["config", "user.email", email], cwd=repo_dir)
 
 
-def cmd_today(args: argparse.Namespace) -> int:
+def cmd_today(args: SimpleNamespace) -> int:
     today = dt.datetime.utcnow().strftime("%Y%m%d")
     params = {
         "search_query": f"submittedDate:[{today}0000 TO {today}2359]",
@@ -275,7 +276,7 @@ def cmd_today(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_search(args: argparse.Namespace) -> int:
+def cmd_search(args: SimpleNamespace) -> int:
     query = args.query.strip()
     params = {
         "search_query": f"all:{query}",
@@ -293,13 +294,13 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_lastweek(args: argparse.Namespace) -> int:
+def cmd_lastweek(args: SimpleNamespace) -> int:
     end_day = dt.datetime.utcnow().date()
     start_day = end_day - dt.timedelta(days=7)
     start = start_day.strftime("%Y%m%d")
     end = end_day.strftime("%Y%m%d")
     params = {
-        "search_query": f"cat:gr-qc+OR+cat:astro-ph*+AND+submittedDate:[{start}0000+TO+{end}2359]",
+        "search_query": f"(cat:gr-qc OR cat:astro-ph.*) AND submittedDate:[{start}0000 TO {end}2359]",
         "start": "0",
         "max_results": str(args.limit),
         "sortBy": "submittedDate",
@@ -314,7 +315,7 @@ def cmd_lastweek(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_topvoted(args: argparse.Namespace) -> int:
+def cmd_topvoted(args: SimpleNamespace) -> int:
     cfg = _resolve_repo_config(args)
     token = _get_token()
     papers = _list_papers_via_api(cfg, token)
@@ -349,7 +350,7 @@ def cmd_topvoted(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_vote(args: argparse.Namespace) -> int:
+def cmd_vote(args: SimpleNamespace) -> int:
     cfg = _resolve_repo_config(args)
     token = _get_token()
     user = os.getenv("CUHKVOTING_USER")
@@ -430,56 +431,85 @@ def cmd_vote(args: argparse.Namespace) -> int:
         shutil.rmtree(cleanup_dir, ignore_errors=True)
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="cuhkvoting",
-        description="Minimal arXiv voting CLI backed by GitHub.",
-    )
-    parser.add_argument(
+app = typer.Typer(
+    name="cuhkvoting",
+    help="Minimal arXiv voting CLI backed by GitHub.",
+    add_completion=True,
+)
+
+
+def _run_cmd(func, **kwargs: object) -> None:
+    args = SimpleNamespace(**kwargs)
+    try:
+        code = func(args)
+    except urllib.error.HTTPError as e:
+        msg = e.read().decode("utf-8", errors="ignore")
+        typer.echo(f"HTTP {e.code}: {msg[:300]}", err=True)
+        raise typer.Exit(code=1) from e
+    except urllib.error.URLError as e:
+        typer.echo(f"Network error: {e.reason}", err=True)
+        raise typer.Exit(code=1) from e
+    except SystemExit as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=1) from e
+    raise typer.Exit(code=code)
+
+
+@app.command("today")
+def today(
+    limit: int = typer.Option(20, "--limit", help="Max number of entries."),
+) -> None:
+    _run_cmd(cmd_today, limit=limit)
+
+
+@app.command("search")
+def search(
+    query: str = typer.Argument(..., help="Search terms."),
+    limit: int = typer.Option(20, "--limit", help="Max number of entries."),
+) -> None:
+    _run_cmd(cmd_search, query=query, limit=limit)
+
+
+@app.command("lastweek")
+def lastweek(
+    limit: int = typer.Option(100, "--limit", help="Max number of entries."),
+) -> None:
+    _run_cmd(cmd_lastweek, limit=limit)
+
+
+@app.command("topvoted")
+def topvoted(
+    n: int = typer.Option(10, "--N", "--n", help="Number of entries to show."),
+    repo: str | None = typer.Option(
+        None,
         "--repo",
-        help="GitHub repo in owner/name format. Defaults to CUHKVOTING_REPO or current git remote.",
-    )
-    parser.add_argument(
+        help="GitHub repo owner/name. Defaults to CUHKVOTING_REPO or current git remote.",
+    ),
+    branch: str = typer.Option(
+        os.getenv("CUHKVOTING_BRANCH", "main"),
         "--branch",
-        default=os.getenv("CUHKVOTING_BRANCH", "main"),
-        help="Git branch to read/write (default: main or CUHKVOTING_BRANCH).",
-    )
-    sub = parser.add_subparsers(dest="command", required=True)
+        help="Git branch to read/write.",
+    ),
+) -> None:
+    _run_cmd(cmd_topvoted, N=n, repo=repo, branch=branch)
 
-    p_today = sub.add_parser("today", help="Show today's arXiv submissions (UTC).")
-    p_today.add_argument("--limit", type=int, default=20)
-    p_today.set_defaults(func=cmd_today)
 
-    p_search = sub.add_parser("search", help="Search arXiv by keyword.")
-    p_search.add_argument("query", help="Search terms.")
-    p_search.add_argument("--limit", type=int, default=20)
-    p_search.set_defaults(func=cmd_search)
-
-    p_lastweek = sub.add_parser(
-        "lastweek",
-        help="Show last-week arXiv submissions in gr-qc and astro-ph categories (UTC).",
-    )
-    p_lastweek.add_argument("--limit", type=int, default=100)
-    p_lastweek.set_defaults(func=cmd_lastweek)
-
-    p_top = sub.add_parser("topvoted", help="List top voted tracked papers.")
-    p_top.add_argument("--N", "--n", type=int, default=10, dest="N")
-    p_top.set_defaults(func=cmd_topvoted)
-
-    p_vote = sub.add_parser("vote", help="Vote once per GitHub user for one paper.")
-    p_vote.add_argument("paper_id", help="arXiv id/url.")
-    p_vote.set_defaults(func=cmd_vote)
-    return parser
+@app.command("vote")
+def vote(
+    paper_id: str = typer.Argument(..., help="arXiv id/url."),
+    repo: str | None = typer.Option(
+        None,
+        "--repo",
+        help="GitHub repo owner/name. Defaults to CUHKVOTING_REPO or current git remote.",
+    ),
+    branch: str = typer.Option(
+        os.getenv("CUHKVOTING_BRANCH", "main"),
+        "--branch",
+        help="Git branch to read/write.",
+    ),
+) -> None:
+    _run_cmd(cmd_vote, paper_id=paper_id, repo=repo, branch=branch)
 
 
 def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
-    try:
-        code = args.func(args)
-    except urllib.error.HTTPError as e:
-        msg = e.read().decode("utf-8", errors="ignore")
-        raise SystemExit(f"HTTP {e.code}: {msg[:300]}")
-    except urllib.error.URLError as e:
-        raise SystemExit(f"Network error: {e.reason}")
-    sys.exit(code)
+    app()

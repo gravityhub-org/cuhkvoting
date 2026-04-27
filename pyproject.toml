@@ -7,7 +7,9 @@ authors = [
     { name = "Otto Akseli Hannuksela", email = "otto.akseli.hannuksela@gmail.com" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "typer-slim",
+]
 
 [project.scripts]
 cuhkvoting = "cuhkvoting:main"
