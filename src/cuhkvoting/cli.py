@@ -21,6 +21,7 @@ import typer
 
 ARXIV_API = "https://export.arxiv.org/api/query"
 ARXIV_ABS = "https://arxiv.org/abs/"
+INSPIRE_API = "https://inspirehep.net/api/literature"
 DEFAULT_REPO = "gravityhub-org/cuhkvoting-records"
 VOTE_EXPIRY_DAYS = 183
 JC_RECORD_PATH = "papers/journal_club_records.json"
@@ -349,6 +350,81 @@ def _arxiv_query(params: dict[str, str]) -> list[dict[str, str]]:
     return entries
 
 
+def _inspire_query(query: str, limit: int) -> list[dict[str, str]]:
+    params = {
+        "q": query,
+        "size": str(limit),
+        "sort": "mostrecent",
+        "fields": "titles,abstracts,authors,arxiv_eprints,control_number",
+    }
+    url = f"{INSPIRE_API}?{urllib.parse.urlencode(params)}"
+    data = _http_json(url, headers={"User-Agent": "cuhkvoting/0.1"})
+    hits = data.get("hits", {}).get("hits", [])
+    entries: list[dict[str, str]] = []
+    for hit in hits if isinstance(hits, list) else []:
+        metadata = hit.get("metadata", {}) if isinstance(hit, dict) else {}
+        if not isinstance(metadata, dict):
+            continue
+        titles = metadata.get("titles", [])
+        title = ""
+        if isinstance(titles, list):
+            for t in titles:
+                if isinstance(t, dict) and isinstance(t.get("title"), str) and t.get("title", "").strip():
+                    title = " ".join(t["title"].split())
+                    break
+        if not title:
+            continue
+        abstracts = metadata.get("abstracts", [])
+        abstract = ""
+        if isinstance(abstracts, list):
+            for a in abstracts:
+                if isinstance(a, dict) and isinstance(a.get("value"), str) and a.get("value", "").strip():
+                    abstract = " ".join(a["value"].split())
+                    break
+        authors_raw = metadata.get("authors", [])
+        authors: list[str] = []
+        if isinstance(authors_raw, list):
+            for author in authors_raw:
+                if isinstance(author, dict):
+                    name = author.get("full_name")
+                    if isinstance(name, str) and name.strip():
+                        authors.append(" ".join(name.split()))
+        arxiv_id = ""
+        arxiv_eprints = metadata.get("arxiv_eprints", [])
+        if isinstance(arxiv_eprints, list):
+            for ep in arxiv_eprints:
+                if isinstance(ep, dict) and isinstance(ep.get("value"), str) and ep.get("value", "").strip():
+                    arxiv_id = _strip_arxiv_version(ep["value"])
+                    break
+        control_number = str(metadata.get("control_number", "")).strip()
+        if arxiv_id:
+            paper_id = arxiv_id
+            paper_url = f"{ARXIV_ABS}{arxiv_id}"
+        else:
+            paper_id = f"inspire:{control_number}" if control_number else "inspire:unknown"
+            paper_url = f"https://inspirehep.net/literature/{control_number}" if control_number else "https://inspirehep.net"
+        entries.append(
+            {
+                "id": paper_id,
+                "title": title,
+                "abstract": abstract,
+                "url": paper_url,
+                "authors": authors,
+            }
+        )
+    return entries
+
+
+def _build_inspire_title_query(keywords: list[str]) -> str:
+    # Inspire free-text query can miss title matches; force title-field AND terms.
+    stop = {"a", "an", "the", "of", "for", "to", "and", "or", "in", "on", "at", "by", "with"}
+    tokens = [k.strip() for k in keywords if k.strip()]
+    title_tokens = [t for t in tokens if t.lower() not in stop and len(t) > 1]
+    if not title_tokens:
+        title_tokens = tokens
+    return " and ".join(f'title:"{t}"' for t in title_tokens)
+
+
 def _normalize_paper_id(raw_id: str) -> str:
     raw_id = raw_id.strip()
     if raw_id.startswith("http://") or raw_id.startswith("https://"):
@@ -630,21 +706,18 @@ def cmd_search(args: SimpleNamespace) -> int:
     query_parts = [str(q).strip() for q in (args.query or []) if str(q).strip()]
     if not query_parts:
         raise SystemExit("Search query cannot be empty.")
-    query = " ".join(query_parts)
-    params = {
-        "search_query": f"all:{query}",
-        "start": "0",
-        "max_results": str(args.limit),
-        "sortBy": "relevance",
-        "sortOrder": "descending",
-    }
-    entries = _arxiv_query(params)
+    query = _build_inspire_title_query(query_parts)
+    requested_limit = int(args.limit)
+    fetch_limit = min(max(requested_limit * 5, 100), 500)
+    entries = _inspire_query(query, fetch_limit)
     entries = _filter_entries(entries, query_parts)
     if not entries:
         print("No matches.")
         return 0
-    for idx, p in enumerate(entries, 1):
-        print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {p['title']}")
+    for idx, p in enumerate(entries[:requested_limit], 1):
+        pid = str(p.get("id", ""))
+        shown_id = _format_clickable_id(pid) if pid and not pid.startswith("inspire:") else pid
+        print(f"{idx:>2}. {shown_id}  {p['title']}")
     return 0
 
 
