@@ -230,6 +230,12 @@ def _safe_filename(paper_id: str) -> str:
     return paper_id.replace("/", "__")
 
 
+def _format_clickable_id(arxiv_id: str) -> str:
+    url = f"{ARXIV_ABS}{arxiv_id}"
+    # OSC 8 hyperlink: terminals without support still show raw id text.
+    return f"\033]8;;{url}\033\\{arxiv_id}\033]8;;\033\\"
+
+
 def _with_repo_checkout(cfg: RepoConfig) -> tuple[str, str]:
     tmpdir = tempfile.mkdtemp(prefix="cuhkvoting-")
     try:
@@ -287,7 +293,7 @@ def cmd_today(args: SimpleNamespace) -> int:
             return 0
         print("No new UTC-day submissions. Showing most recent arXiv entries:")
     for idx, p in enumerate(entries, 1):
-        print(f"{idx:>2}. {p['id']}  {p['title']}")
+        print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {p['title']}")
     return 0
 
 
@@ -305,7 +311,7 @@ def cmd_search(args: SimpleNamespace) -> int:
         print("No matches.")
         return 0
     for idx, p in enumerate(entries, 1):
-        print(f"{idx:>2}. {p['id']}  {p['title']}")
+        print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {p['title']}")
     return 0
 
 
@@ -326,7 +332,7 @@ def cmd_lastweek(args: SimpleNamespace) -> int:
         print("No gr-qc / astro-ph entries in the last week (UTC).")
         return 0
     for idx, p in enumerate(entries, 1):
-        print(f"{idx:>2}. {p['id']}  {p['title']}")
+        print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {p['title']}")
     return 0
 
 
@@ -361,7 +367,7 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
         print("No voted papers yet.")
         return 0
     for idx, p in enumerate(topn, 1):
-        print(f"{idx:>2}. [{p['votes']:>3} votes] {p['id']}  {p['title']}")
+        print(f"{idx:>2}. [{p['votes']:>3} votes] {_format_clickable_id(p['id'])}  {p['title']}")
     return 0
 
 
