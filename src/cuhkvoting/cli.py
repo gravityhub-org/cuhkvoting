@@ -468,6 +468,17 @@ def cmd_vote(args: SimpleNamespace) -> int:
         raise SystemExit("Could not identify user. Set CUHKVOTING_USER or configure git user.name.")
 
     paper_id = _normalize_paper_id(args.paper_id)
+    # Enforce valid arXiv target before reading/writing vote records.
+    validate_entries = _arxiv_query(
+        {
+            "search_query": f"id:{paper_id}",
+            "start": "0",
+            "max_results": "1",
+        }
+    )
+    if not validate_entries:
+        raise SystemExit(f"Could not find arXiv entry for id '{paper_id}'.")
+
     path = f"papers/{_safe_filename(paper_id)}.json"
 
     paper, sha = _load_paper_via_api(cfg, path, token)
@@ -498,16 +509,7 @@ def cmd_vote(args: SimpleNamespace) -> int:
             shutil.rmtree(cleanup_dir, ignore_errors=True)
 
     if paper is None:
-        entries = _arxiv_query(
-            {
-                "search_query": f"id:{paper_id}",
-                "start": "0",
-                "max_results": "1",
-            }
-        )
-        if not entries:
-            raise SystemExit(f"Could not find arXiv entry for id '{paper_id}'.")
-        entry = entries[0]
+        entry = validate_entries[0]
         paper = {
             "id": entry["id"],
             "title": entry["title"],
