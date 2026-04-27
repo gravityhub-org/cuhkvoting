@@ -639,6 +639,7 @@ def cmd_search(args: SimpleNamespace) -> int:
         "sortOrder": "descending",
     }
     entries = _arxiv_query(params)
+    entries = _filter_entries(entries, query_parts)
     if not entries:
         print("No matches.")
         return 0
