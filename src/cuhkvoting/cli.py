@@ -923,21 +923,26 @@ app = typer.Typer(
 )
 
 
-def _run_cmd(func, **kwargs: object) -> None:
+def _invoke_cmd(func, **kwargs: object) -> int:
+    """Run CLI command-like func; return exit code (does not terminate process)."""
     args = SimpleNamespace(**kwargs)
     try:
         code = func(args)
+        return int(code)
     except urllib.error.HTTPError as e:
         msg = e.read().decode("utf-8", errors="ignore")
         typer.echo(f"HTTP {e.code}: {msg[:300]}", err=True)
-        raise typer.Exit(code=1) from e
+        return 1
     except urllib.error.URLError as e:
         typer.echo(f"Network error: {e.reason}", err=True)
-        raise typer.Exit(code=1) from e
+        return 1
     except SystemExit as e:
         typer.echo(str(e), err=True)
-        raise typer.Exit(code=1) from e
-    raise typer.Exit(code=code)
+        return 1
+
+
+def _run_cmd(func, **kwargs: object) -> None:
+    raise typer.Exit(code=_invoke_cmd(func, **kwargs))
 
 
 @app.command("today")
@@ -1056,8 +1061,12 @@ def vote_command(
             raise typer.BadParameter("Usage: cuhkvoting select <id>")
         _run_cmd(cmd_select, paper_id=action_or_paper[1], repo=repo, branch=branch)
         return
+    last_code = 0
     for one_paper_id in action_or_paper:
-        _run_cmd(cmd_vote, paper_id=one_paper_id, repo=repo, branch=branch)
+        last_code = _invoke_cmd(cmd_vote, paper_id=one_paper_id, repo=repo, branch=branch)
+        if last_code != 0:
+            raise typer.Exit(code=last_code)
+    raise typer.Exit(code=last_code)
 
 
 admin_app = typer.Typer(name="admin", help="Admin-like maintenance commands (no admin auth required).")
