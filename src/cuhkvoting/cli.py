@@ -25,6 +25,8 @@ INSPIRE_API = "https://inspirehep.net/api/literature"
 DEFAULT_REPO = "gravityhub-org/cuhkvoting-records"
 VOTE_EXPIRY_DAYS = 183
 JC_RECORD_PATH = "papers/journal_club_records.json"
+PAPERS_LIST_DIR = "papers-list"
+PAPERS_LIST_INDEX_PATH = f"{PAPERS_LIST_DIR}/README.md"
 
 
 @dataclass
@@ -230,6 +232,10 @@ def _load_paper_via_api(cfg: RepoConfig, path: str, token: str | None) -> tuple[
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None, None
+        if e.code == 403:
+            msg = e.read().decode("utf-8", errors="ignore").lower()
+            if "rate limit exceeded" in msg or "resource not accessible by personal access token" in msg:
+                return None, None
         raise
     content = base64.b64decode(data["content"]).decode("utf-8")
     return json.loads(content), data.get("sha")
@@ -257,6 +263,18 @@ def _save_paper_via_api(
 
 def _save_json_via_api(cfg: RepoConfig, path: str, body: dict, sha: str | None, token: str, message: str) -> None:
     _save_paper_via_api(cfg, path, body, sha, token, message)
+
+
+def _save_text_via_api(cfg: RepoConfig, path: str, text: str, sha: str | None, token: str, message: str) -> None:
+    url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/contents/{path}"
+    payload = {
+        "message": message,
+        "branch": cfg.branch,
+        "content": base64.b64encode(text.encode("utf-8")).decode("ascii"),
+    }
+    if sha:
+        payload["sha"] = sha
+    _http_put_json(url, payload, headers=_github_headers(token))
 
 
 def _delete_paper_via_api(cfg: RepoConfig, path: str, sha: str, token: str, message: str) -> None:
@@ -303,6 +321,365 @@ def _save_jc_records(cfg: RepoConfig, token: str | None, user: str, records: lis
         shutil.rmtree(cleanup_dir, ignore_errors=True)
 
 
+def _week_sort_key(week: str) -> tuple[int, int]:
+    m = re.match(r"^(\d{4})-W(\d{2})$", week)
+    if not m:
+        return 0, 0
+    return int(m.group(1)), int(m.group(2))
+
+
+def _week_label_from_records(week: str, records: list[dict]) -> str:
+    candidates: list[dt.datetime] = []
+    for rec in records:
+        if str(rec.get("week", "")) != week:
+            continue
+        selected_at = _parse_utc(str(rec.get("selected_at", "")))
+        if selected_at is not None:
+            candidates.append(selected_at)
+    if candidates:
+        week_start = min(candidates).date()
+    else:
+        y, w = _week_sort_key(week)
+        if y and w:
+            week_start = dt.date.fromisocalendar(y, w, 1)
+        else:
+            return week
+    # Use Mon-Sat range label requested by users, e.g. Apr27-May2.
+    week_end = week_start + dt.timedelta(days=5)
+    return f"{week_start.strftime('%b')}{week_start.day}-{week_end.strftime('%b')}{week_end.day}"
+
+
+def _safe_anchor(text: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", text.strip().lower()).strip("-")
+    return slug or "item"
+
+
+def _records_by_week(records: list[dict]) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = {}
+    for rec in records:
+        week = str(rec.get("week", "")).strip()
+        if not week:
+            continue
+        grouped.setdefault(week, []).append(rec)
+    return grouped
+
+
+def _render_papers_index(records: list[dict]) -> str:
+    grouped = _records_by_week(records)
+    weeks = sorted(grouped.keys(), key=_week_sort_key, reverse=True)
+    now = dt.datetime.utcnow()
+    current_year, current_week, _ = now.isocalendar()
+    current_week_tag = f"{current_year}-W{current_week:02d}"
+    lines = ["# Papers", ""]
+    for week in weeks:
+        label = _week_label_from_records(week, grouped[week])
+        if week == current_week_tag:
+            label = f"{label} (this week)"
+        lines.append(f"- [{label}]({week}.md)")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _render_weekly_page(week: str, week_records: list[dict]) -> str:
+    normalized_rows: list[dict] = []
+    for rec in week_records:
+        row = dict(rec)
+        arxiv_id = str(row.get("arxiv_id", "?"))
+        # Backfill metadata for older records that did not snapshot these fields.
+        missing_authors = not isinstance(row.get("authors"), list) or not row.get("authors")
+        missing_url = not str(row.get("url", "")).strip()
+        if missing_authors or missing_url:
+            try:
+                entry = _validate_arxiv_entry(arxiv_id)
+                if missing_authors:
+                    row["authors"] = entry.get("authors", [])
+                if missing_url:
+                    row["url"] = entry.get("url", f"{ARXIV_ABS}{arxiv_id}")
+            except Exception:
+                pass
+        voters = row.get("voters", [])
+        if not isinstance(voters, list):
+            voters = []
+        # If historical data lacks voter snapshot, at least expose selector as known voter.
+        if not voters and int(row.get("historical_vote", 0)) > 0 and row.get("selected_by"):
+            voters = [str(row.get("selected_by"))]
+        row["voters"] = sorted(str(v) for v in voters if str(v).strip())
+        normalized_rows.append(row)
+    deduped: dict[str, dict] = {}
+    for row in normalized_rows:
+        arxiv_id = str(row.get("arxiv_id", "")).strip()
+        if not arxiv_id:
+            continue
+        existing = deduped.get(arxiv_id)
+        if existing is None:
+            deduped[arxiv_id] = row
+            continue
+        existing_votes = int(existing.get("historical_vote", 0))
+        row_votes = int(row.get("historical_vote", 0))
+        if row_votes > existing_votes:
+            deduped[arxiv_id] = row
+            continue
+        if row_votes == existing_votes:
+            prev_ts = _parse_utc(str(existing.get("selected_at", ""))) or dt.datetime.min
+            curr_ts = _parse_utc(str(row.get("selected_at", ""))) or dt.datetime.min
+            if curr_ts >= prev_ts:
+                deduped[arxiv_id] = row
+    sorted_rows = sorted(
+        deduped.values(),
+        key=lambda r: (
+            -int(r.get("historical_vote", 0)),
+            str(r.get("arxiv_id", "")),
+        ),
+    )
+    title = _week_label_from_records(week, week_records)
+    lines = [f"# {title}", "", f"Week: `{week}`", "", "## Papers", ""]
+    for idx, rec in enumerate(sorted_rows, 1):
+        arxiv_id = str(rec.get("arxiv_id", "?"))
+        paper_title = str(rec.get("title", "(no title)"))
+        presenter = str(rec.get("selected_by", "")).strip()
+        if presenter:
+            paper_title = f"{paper_title} (presenter) {presenter}"
+        authors = rec.get("authors", [])
+        author_text = ", ".join(str(a) for a in authors) if isinstance(authors, list) and authors else "Unknown authors"
+        url = str(rec.get("url", "")).strip() or f"{ARXIV_ABS}{arxiv_id}"
+        voters = rec.get("voters", [])
+        if not isinstance(voters, list):
+            voters = []
+        if not voters and rec.get("selected_by"):
+            voters = [str(rec.get("selected_by"))]
+        vote_count = len(voters) if voters else int(rec.get("historical_vote", 0))
+        vote_label = str(vote_count)
+        row_text = f'{paper_title} - {author_text} - <a href="{url}">{arxiv_id}</a> ({vote_label})'
+        if voters:
+            lines.append("<details>")
+            lines.append(f"<summary>{idx}. {row_text}</summary>")
+            lines.append("")
+            for user in [str(v) for v in voters]:
+                lines.append(f"- {user}")
+            lines.append("")
+            lines.append("</details>")
+        else:
+            lines.append(f"{idx}. {row_text}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _save_markdown_files(
+    cfg: RepoConfig,
+    token: str | None,
+    user: str,
+    files: dict[str, str],
+    message: str,
+) -> None:
+    if token:
+        for path, text in files.items():
+            _existing, sha = _load_paper_via_api(cfg, path, token)
+            _save_text_via_api(cfg, path, text, sha, token, message)
+        return
+    if not _has_github_ssh_access():
+        raise SystemExit(
+            f"Writing records needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure SSH key.\n\n{_ssh_setup_instructions()}"
+        )
+    clone_dir, cleanup_dir = _with_repo_checkout(cfg)
+    try:
+        for path, text in files.items():
+            p = Path(clone_dir) / path
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text, encoding="utf-8")
+        _ensure_commit_identity(clone_dir, user)
+        _run_git(["add", PAPERS_LIST_DIR], cwd=clone_dir)
+        status = _run_git(["status", "--porcelain"], cwd=clone_dir).strip()
+        if not status:
+            return
+        _run_git(["commit", "-m", message], cwd=clone_dir)
+        _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
+    finally:
+        shutil.rmtree(cleanup_dir, ignore_errors=True)
+
+
+def _regenerate_papers_pages(cfg: RepoConfig, token: str | None, user: str, records: list[dict]) -> None:
+    grouped = _records_by_week(records)
+    weeks = sorted(grouped.keys(), key=_week_sort_key, reverse=True)
+    files: dict[str, str] = {PAPERS_LIST_INDEX_PATH: _render_papers_index(records)}
+    for week in weeks:
+        files[f"{PAPERS_LIST_DIR}/{week}.md"] = _render_weekly_page(week, grouped[week])
+    _save_markdown_files(cfg, token, user, files, "papers: regenerate weekly summaries")
+
+
+def _render_wiki_home(records: list[dict]) -> str:
+    grouped = _records_by_week(records)
+    weeks = sorted(grouped.keys(), key=_week_sort_key, reverse=True)
+    now = dt.datetime.utcnow()
+    current_year, current_week, _ = now.isocalendar()
+    current_week_tag = f"{current_year}-W{current_week:02d}"
+    lines = ["# Past papers", ""]
+    for week in weeks:
+        label = _week_label_from_records(week, grouped[week])
+        if week == current_week_tag:
+            label = f"{label} (this week)"
+        lines.append(f"- [{label}]({week})")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _render_wiki_week_page(week: str, week_records: list[dict]) -> str:
+    deduped: dict[str, dict] = {}
+    for rec in week_records:
+        arxiv_id = str(rec.get("arxiv_id", "")).strip()
+        if not arxiv_id:
+            continue
+        existing = deduped.get(arxiv_id)
+        if existing is None:
+            deduped[arxiv_id] = dict(rec)
+            continue
+        existing_votes = int(existing.get("historical_vote", 0))
+        rec_votes = int(rec.get("historical_vote", 0))
+        if rec_votes > existing_votes:
+            deduped[arxiv_id] = dict(rec)
+            continue
+        if rec_votes == existing_votes:
+            prev_ts = _parse_utc(str(existing.get("selected_at", ""))) or dt.datetime.min
+            curr_ts = _parse_utc(str(rec.get("selected_at", ""))) or dt.datetime.min
+            if curr_ts >= prev_ts:
+                deduped[arxiv_id] = dict(rec)
+    sorted_rows = sorted(
+        deduped.values(),
+        key=lambda r: (
+            -int(r.get("historical_vote", 0)),
+            str(r.get("arxiv_id", "")),
+        ),
+    )
+    title = _week_label_from_records(week, week_records)
+    lines = [f"# {title}", "", f"Week: `{week}`", "", "## Papers", ""]
+    for idx, rec in enumerate(sorted_rows, 1):
+        arxiv_id = str(rec.get("arxiv_id", "?"))
+        paper_title = str(rec.get("title", "(no title)"))
+        presenter = str(rec.get("selected_by", "")).strip()
+        if presenter:
+            paper_title = f"{paper_title} (presenter) {presenter}"
+        authors = rec.get("authors", [])
+        if not isinstance(authors, list) or not authors:
+            try:
+                entry = _validate_arxiv_entry(arxiv_id)
+                authors = entry.get("authors", []) if isinstance(entry.get("authors", []), list) else []
+                rec["url"] = rec.get("url") or entry.get("url", f"{ARXIV_ABS}{arxiv_id}")
+            except Exception:
+                authors = []
+        author_text = ", ".join(str(a) for a in authors) if authors else "Unknown authors"
+        url = str(rec.get("url", "")).strip() or f"{ARXIV_ABS}{arxiv_id}"
+        voters = rec.get("voters", [])
+        if not isinstance(voters, list):
+            voters = []
+        vote_count = len(voters) if voters else int(rec.get("historical_vote", 0))
+        vote_label = str(vote_count)
+        row_text = f'{paper_title} - {author_text} - <a href="{url}">{arxiv_id}</a> ({vote_label})'
+        if voters:
+            lines.append("<details>")
+            lines.append(f"<summary>{idx}. {row_text}</summary>")
+            lines.append("")
+            for user in [str(v) for v in voters]:
+                lines.append(f"- {user}")
+            lines.append("")
+            lines.append("</details>")
+        else:
+            lines.append(f"{idx}. {row_text}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _sync_wiki_pages(cfg: RepoConfig, user: str, records: list[dict]) -> None:
+    wiki_url = f"git@github.com:{cfg.owner}/{cfg.repo}.wiki.git"
+    grouped = _records_by_week(records)
+    weeks = sorted(grouped.keys(), key=_week_sort_key, reverse=True)
+    files: dict[str, str] = {"Home.md": _render_wiki_home(records)}
+    for week in weeks:
+        files[f"{week}.md"] = _render_wiki_week_page(week, grouped[week])
+
+    clone_dir = tempfile.mkdtemp(prefix="cuhkvoting-wiki-")
+    try:
+        _run_git(["clone", wiki_url, clone_dir])
+        for path, text in files.items():
+            p = Path(clone_dir) / path
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text, encoding="utf-8")
+        _ensure_commit_identity(clone_dir, user)
+        _run_git(["add", "."], cwd=clone_dir)
+        status = _run_git(["status", "--porcelain"], cwd=clone_dir).strip()
+        if not status:
+            return
+        _run_git(["commit", "-m", "wiki: update weekly paper pages"], cwd=clone_dir)
+        _run_git(["push", "origin", "HEAD"], cwd=clone_dir)
+    finally:
+        shutil.rmtree(clone_dir, ignore_errors=True)
+
+
+def _current_week_tag() -> str:
+    now = dt.datetime.utcnow()
+    year, week, _ = now.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def _refresh_records_from_paper(
+    records: list[dict],
+    paper: dict,
+    week_tag: str | None = None,
+    presenter: str | None = None,
+) -> bool:
+    canonical_id = _strip_arxiv_version(str(paper.get("id", "")))
+    if not canonical_id:
+        return False
+    active_week = week_tag or _current_week_tag()
+    votes = paper.get("votes", [])
+    if not isinstance(votes, list):
+        votes = []
+    voters = _ordered_voter_users(votes)
+    historical_vote = len(voters)
+    changed = False
+    matched_week_record = False
+    for rec in records:
+        if _strip_arxiv_version(str(rec.get("arxiv_id", ""))) != canonical_id:
+            continue
+        if str(rec.get("week", "")) == active_week:
+            matched_week_record = True
+        if int(rec.get("historical_vote", 0)) != historical_vote:
+            rec["historical_vote"] = historical_vote
+            changed = True
+        if rec.get("voters") != voters:
+            rec["voters"] = voters
+            changed = True
+        title = str(paper.get("title", "")).strip()
+        if title and str(rec.get("title", "")).strip() != title:
+            rec["title"] = title
+            changed = True
+        authors = paper.get("authors", [])
+        if isinstance(authors, list) and authors and rec.get("authors") != authors:
+            rec["authors"] = authors
+            changed = True
+        url = str(paper.get("url", "")).strip()
+        if url and str(rec.get("url", "")).strip() != url:
+            rec["url"] = url
+            changed = True
+        if presenter and str(rec.get("selected_by", "")).strip() != presenter:
+            rec["selected_by"] = presenter
+            changed = True
+    if not matched_week_record:
+        records.append(
+            {
+                "week": active_week,
+                "arxiv_id": canonical_id,
+                "title": str(paper.get("title", "(no title)")),
+                "historical_vote": historical_vote,
+                "selected_at": dt.datetime.utcnow().isoformat() + "Z",
+                "selected_by": presenter or "",
+                "authors": paper.get("authors", []) if isinstance(paper.get("authors"), list) else [],
+                "url": str(paper.get("url", "")).strip() or f"{ARXIV_ABS}{canonical_id}",
+                "voters": voters,
+            }
+        )
+        changed = True
+    return changed
+
+
 def _list_papers_via_api(cfg: RepoConfig, token: str | None) -> list[dict]:
     url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/git/trees/{cfg.branch}?recursive=1"
     try:
@@ -310,6 +687,10 @@ def _list_papers_via_api(cfg: RepoConfig, token: str | None) -> list[dict]:
     except urllib.error.HTTPError as e:
         if e.code in (404, 409):
             return []
+        if e.code == 403:
+            msg = e.read().decode("utf-8", errors="ignore").lower()
+            if "rate limit exceeded" in msg or "resource not accessible by personal access token" in msg:
+                return []
         raise
     papers: list[dict] = []
     for obj in data.get("tree", []):
@@ -466,6 +847,22 @@ def _format_voters(votes: list[dict]) -> str:
     return ", ".join(sorted(set(voters), key=str.lower))
 
 
+def _ordered_voter_users(votes: list[dict]) -> list[str]:
+    rows: list[tuple[dt.datetime, str]] = []
+    seen: set[str] = set()
+    for v in votes:
+        if not isinstance(v, dict):
+            continue
+        user = str(v.get("user", "")).strip()
+        if not user or user in seen:
+            continue
+        ts = _parse_utc(str(v.get("voted_at", ""))) or dt.datetime.max
+        rows.append((ts, user))
+        seen.add(user)
+    rows.sort(key=lambda x: x[0])
+    return [user for _ts, user in rows]
+
+
 def _filter_entries(entries: list[dict[str, str]], keywords: list[str] | None) -> list[dict[str, str]]:
     if not keywords:
         return entries
@@ -493,6 +890,10 @@ def _find_legacy_paper_via_api(cfg: RepoConfig, base_id: str, token: str | None)
     except urllib.error.HTTPError as e:
         if e.code in (404, 409):
             return None, None, None
+        if e.code == 403:
+            msg = e.read().decode("utf-8", errors="ignore").lower()
+            if "rate limit exceeded" in msg or "resource not accessible by personal access token" in msg:
+                return None, None, None
         raise
     for obj in data.get("tree", []):
         path = obj.get("path", "")
@@ -805,12 +1206,37 @@ def cmd_vote(args: SimpleNamespace) -> int:
 
     _prune_expired_votes(paper)
     votes = paper.setdefault("votes", [])
+    vote_week_tag = _current_week_tag()
     if any(v.get("user") == user for v in votes):
-        raise SystemExit(f"User '{user}' already voted for {paper.get('id', paper_id)}.")
+        try:
+            records, record_sha = _load_jc_records(cfg, token)
+            if _refresh_records_from_paper(records, paper, week_tag=vote_week_tag):
+                paper_vote_id = _strip_arxiv_version(str(paper.get("id", paper_id)))
+                _save_jc_records(cfg, token, user, records, record_sha, f"record-sync-vote: {user} -> {paper_vote_id}")
+                _regenerate_papers_pages(cfg, token, user, records)
+                try:
+                    _sync_wiki_pages(cfg, user, records)
+                except Exception as e:
+                    typer.echo(f"Warning: could not update repo wiki automatically: {e}", err=True)
+        except Exception as e:
+            typer.echo(f"Warning: could not refresh derived pages after vote: {e}", err=True)
+        print(f"User '{user}' already voted for {paper.get('id', paper_id)}.")
+        return 0
     paper_vote_id = _strip_arxiv_version(str(paper.get("id", paper_id)))
     paper["id"] = paper_vote_id
     votes.append({"user": user, "voted_at": dt.datetime.utcnow().isoformat() + "Z"})
     _save_vote_paper(cfg, token, user, paper, sha, save_path, f"vote: {user} -> {paper_vote_id}")
+    try:
+        records, record_sha = _load_jc_records(cfg, token)
+        if _refresh_records_from_paper(records, paper, week_tag=vote_week_tag):
+            _save_jc_records(cfg, token, user, records, record_sha, f"record-sync-vote: {user} -> {paper_vote_id}")
+            _regenerate_papers_pages(cfg, token, user, records)
+            try:
+                _sync_wiki_pages(cfg, user, records)
+            except Exception as e:
+                typer.echo(f"Warning: could not update repo wiki automatically: {e}", err=True)
+    except Exception as e:
+        typer.echo(f"Warning: could not refresh derived pages after vote: {e}", err=True)
     print(f"Vote recorded: {user} -> {paper_vote_id}")
     return 0
 
@@ -846,6 +1272,7 @@ def cmd_select(args: SimpleNamespace) -> int:
     paper_id = _normalize_paper_id(args.paper_id)
     entry = _validate_arxiv_entry(paper_id)
     paper, sha, save_path = _load_vote_paper(cfg, token, paper_id)
+    had_existing_vote_file = paper is not None
     if paper is None:
         paper = {
             "id": entry["id"],
@@ -863,25 +1290,51 @@ def cmd_select(args: SimpleNamespace) -> int:
     canonical_id = _strip_arxiv_version(str(paper.get("id", paper_id)))
 
     records, record_sha = _load_jc_records(cfg, token)
-    records.append(
-        {
-            "week": week_tag,
-            "arxiv_id": canonical_id,
-            "title": paper.get("title", entry["title"]),
-            "historical_vote": vote_count,
-            "selected_at": selected_at,
-            "selected_by": user,
-        }
-    )
+    paper["id"] = canonical_id
+    if not _refresh_records_from_paper(records, paper, week_tag=week_tag, presenter=user):
+        # Ensure presenter annotation is still applied for the selected week.
+        for rec in records:
+            if str(rec.get("week", "")) == week_tag and str(rec.get("arxiv_id", "")) == canonical_id:
+                rec["selected_by"] = user
+                rec["selected_at"] = selected_at
+                break
     _save_jc_records(cfg, token, user, records, record_sha, f"record-select: {user} -> {canonical_id} ({week_tag})")
-
-    if paper is not None and sha is not None:
-        _delete_vote_paper(cfg, token, user, save_path, sha, f"select-delete-vote: {user} -> {canonical_id}")
-    elif paper is not None and _has_github_ssh_access():
-        # If loaded via git fallback without sha, still delete through git path.
-        _delete_vote_paper(cfg, None, user, save_path, None, f"select-delete-vote: {user} -> {canonical_id}")
+    _regenerate_papers_pages(cfg, token, user, records)
+    try:
+        _sync_wiki_pages(cfg, user, records)
+    except SystemExit as e:
+        typer.echo(f"Warning: could not update repo wiki automatically: {e}", err=True)
 
     print(f"Selected for presentation: {canonical_id} ({week_tag}) by {user}")
+    return 0
+
+
+def cmd_select_remove(args: SimpleNamespace) -> int:
+    cfg = _resolve_repo_config(args)
+    token = _get_token()
+    user = _resolve_user(token)
+    paper_id = _normalize_paper_id(args.paper_id)
+    week_tag = _current_week_tag()
+    records, record_sha = _load_jc_records(cfg, token)
+    changed = False
+    for rec in records:
+        if str(rec.get("week", "")) != week_tag:
+            continue
+        if _strip_arxiv_version(str(rec.get("arxiv_id", ""))) != paper_id:
+            continue
+        if str(rec.get("selected_by", "")).strip():
+            rec["selected_by"] = ""
+            changed = True
+    if not changed:
+        print(f"No presenter selection found for {paper_id} in {week_tag}.")
+        return 0
+    _save_jc_records(cfg, token, user, records, record_sha, f"record-unselect: {user} -> {paper_id} ({week_tag})")
+    _regenerate_papers_pages(cfg, token, user, records)
+    try:
+        _sync_wiki_pages(cfg, user, records)
+    except SystemExit as e:
+        typer.echo(f"Warning: could not update repo wiki automatically: {e}", err=True)
+    print(f"Presenter selection removed: {paper_id} ({week_tag})")
     return 0
 
 
@@ -1010,7 +1463,10 @@ def record(
 
 @app.command("select")
 def select(
-    paper_id: str = typer.Argument(..., help="arXiv id/url."),
+    action_or_paper: list[str] | None = typer.Argument(
+        None,
+        help="Use `select <id>` to mark presenter, or `select remove <id>` to undo presenter.",
+    ),
     repo: str | None = typer.Option(
         None,
         "--repo",
@@ -1022,7 +1478,17 @@ def select(
         help="Git branch to read/write.",
     ),
 ) -> None:
-    _run_cmd(cmd_select, paper_id=paper_id, repo=repo, branch=branch)
+    if not action_or_paper:
+        raise typer.BadParameter("Usage: cuhkvoting select <id> OR cuhkvoting select remove <id>")
+    action = action_or_paper[0].strip().lower()
+    if action == "remove":
+        if len(action_or_paper) != 2:
+            raise typer.BadParameter("Usage: cuhkvoting select remove <id>")
+        _run_cmd(cmd_select_remove, paper_id=action_or_paper[1], repo=repo, branch=branch)
+        return
+    if len(action_or_paper) != 1:
+        raise typer.BadParameter("Usage: cuhkvoting select <id>")
+    _run_cmd(cmd_select, paper_id=action_or_paper[0], repo=repo, branch=branch)
 
 
 @app.command("vote")
