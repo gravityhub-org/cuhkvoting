@@ -709,7 +709,7 @@ def cmd_today(args: SimpleNamespace) -> int:
         start = start_dt.strftime("%Y%m%d%H%M")
         end = now.strftime("%Y%m%d%H%M")
         params = {
-            "search_query": f"submittedDate:[{start} TO {end}]",
+            "search_query": f"(cat:gr-qc OR cat:astro-ph.*) AND submittedDate:[{start} TO {end}]",
             "start": "0",
             "max_results": "200",
             "sortBy": "submittedDate",
