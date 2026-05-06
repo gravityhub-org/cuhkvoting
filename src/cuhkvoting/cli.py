@@ -29,6 +29,7 @@ DEFAULT_REPO = "gravityhub-org/cuhkvoting-records"
 VOTE_EXPIRY_DAYS = 183
 JC_RECORD_PATH = "papers/journal_club_records.json"
 CACHE_DIR = Path.home() / ".cache" / "cuhkvoting"
+LAST_LIST_PATH = CACHE_DIR / "last_list.json"
 CONFIG_PATH = Path.home() / ".config" / "cuhkvoting" / "voting.toml"
 DEFAULT_CATEGORIES = ["gr-qc", "astro-ph.*"]
 DEFAULT_TODAY_MAX_AGE = 60
@@ -55,6 +56,7 @@ class Config:
     lastweek_max_age: int
     abstract_lines: int
     abstract_wrap: int
+    confirm_by_number: bool
 
 
 def _load_config() -> Config:
@@ -65,12 +67,14 @@ def _load_config() -> Config:
             cats = raw.get("categories", DEFAULT_CATEGORIES)
             cache_cfg = raw.get("cache", {})
             display_cfg = raw.get("display", {})
+            vote_cfg = raw.get("vote", {})
             return Config(
                 categories=cats if isinstance(cats, list) and cats else DEFAULT_CATEGORIES,
                 today_max_age=int(cache_cfg.get("today_max_age", DEFAULT_TODAY_MAX_AGE)),
                 lastweek_max_age=int(cache_cfg.get("lastweek_max_age", DEFAULT_LASTWEEK_MAX_AGE)),
                 abstract_lines=int(display_cfg.get("abstract_lines", DEFAULT_ABSTRACT_LINES)),
                 abstract_wrap=int(display_cfg.get("abstract_wrap", DEFAULT_ABSTRACT_WRAP)),
+                confirm_by_number=bool(vote_cfg.get("confirm_by_number", True)),
             )
         except Exception:
             pass
@@ -80,6 +84,7 @@ def _load_config() -> Config:
         lastweek_max_age=DEFAULT_LASTWEEK_MAX_AGE,
         abstract_lines=DEFAULT_ABSTRACT_LINES,
         abstract_wrap=DEFAULT_ABSTRACT_WRAP,
+        confirm_by_number=True,
     )
 
 
@@ -804,6 +809,63 @@ def _resolve_cache(
     return entries
 
 
+def _load_last_list() -> list[dict]:
+    if not LAST_LIST_PATH.exists():
+        return []
+    try:
+        return json.loads(LAST_LIST_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def _save_last_list(entries: list[dict]) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    LAST_LIST_PATH.write_text(
+        json.dumps([{"id": e["id"], "title": e.get("title", "")} for e in entries], indent=2),
+        encoding="utf-8",
+    )
+
+
+def _resolve_paper_ids(raw_ids: list[str]) -> list[tuple[str, str | None, int | None]]:
+    """Resolve raw IDs or 1-based integer indices to (arxiv_id, title_or_none, index_or_none) triples.
+
+    index_or_none and title are non-None only when the entry came from an integer index.
+    Raises SystemExit with a red error message if any index is out of range.
+    All indices are validated before any IDs are returned.
+    """
+    last_list: list[dict] = _load_last_list()
+    last_list_by_id = {_normalize_paper_id(e["id"]): e.get("title") or "" for e in last_list}
+    results: list[tuple[str, str | None, int | None]] = []
+    errors: list[str] = []
+
+    for r in raw_ids:
+        s = r.strip()
+        try:
+            idx = int(s)
+            is_int = True
+        except ValueError:
+            is_int = False
+
+        if is_int:
+            if not last_list or idx < 1 or idx > len(last_list):
+                n = len(last_list)
+                errors.append(f"Index {idx} out of range (last list has {n} entries).")
+            else:
+                entry = last_list[idx - 1]
+                results.append((_normalize_paper_id(entry["id"]), entry.get("title") or "", idx))
+        else:
+            arxiv_id = _normalize_paper_id(s)
+            title = last_list_by_id.get(arxiv_id)
+            results.append((arxiv_id, title, None))
+
+    if errors:
+        for err in errors:
+            typer.echo(typer.style(f"Error: {err}", fg=typer.colors.RED), err=True)
+        raise SystemExit(1)
+
+    return results
+
+
 def _fetch_today_entries(categories: list[str]) -> list[dict]:
     now = dt.datetime.utcnow()
     start = (now - dt.timedelta(days=1)).strftime("%Y%m%d%H%M")
@@ -845,7 +907,9 @@ def cmd_today(args: SimpleNamespace) -> int:
     if not entries:
         print("No papers matched keyword filter.")
         return 0
-    for idx, p in enumerate(entries[: int(args.limit)], 1):
+    displayed = entries[: int(args.limit)]
+    _save_last_list(displayed)
+    for idx, p in enumerate(displayed, 1):
         lastnames = _format_author_lastnames(p.get("authors", []), max_authors=3)
         print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {p['title']}  [{lastnames}]")
         abstract = _format_abstract(p.get("abstract", ""), abstract_lines, cfg.abstract_wrap)
@@ -866,7 +930,9 @@ def cmd_search(args: SimpleNamespace) -> int:
     if not entries:
         print("No matches.")
         return 0
-    for idx, p in enumerate(entries[:requested_limit], 1):
+    displayed = entries[:requested_limit]
+    _save_last_list(displayed)
+    for idx, p in enumerate(displayed, 1):
         pid = str(p.get("id", ""))
         print(f"{idx:>2}. {_format_clickable_id(pid)}  {p['title']}")
     return 0
@@ -901,7 +967,9 @@ def cmd_lastweek(args: SimpleNamespace) -> int:
     if not entries:
         print("No entries matched in last week (UTC).")
         return 0
-    for idx, p in enumerate(entries[: int(args.limit)], 1):
+    displayed = entries[: int(args.limit)]
+    _save_last_list(displayed)
+    for idx, p in enumerate(displayed, 1):
         lastnames = _format_author_lastnames(p.get("authors", []), max_authors=3)
         print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {p['title']}  [{lastnames}]")
         abstract = _format_abstract(p.get("abstract", ""), abstract_lines, cfg.abstract_wrap)
@@ -948,6 +1016,7 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
     if not topn:
         print("No voted papers yet.")
         return 0
+    _save_last_list(topn)
     for idx, p in enumerate(topn, 1):
         print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {p['title']} [{p['voters']}]")
     return 0
@@ -1235,9 +1304,22 @@ def vote_command(
             raise typer.BadParameter("Usage: cuhkvoting select <id>")
         _run_cmd(cmd_select, paper_id=action_or_paper[1], repo=repo, branch=branch)
         return
+    resolved = _resolve_paper_ids(action_or_paper)
+    cfg = _load_config()
+    has_index = any(idx is not None for _, _, idx in resolved)
+    if has_index and cfg.confirm_by_number:
+        max_idx = max(idx for _, _, idx in resolved if idx is not None)
+        w = len(str(max_idx))
+        typer.echo("You are about to vote for:")
+        for arxiv_id, title, idx in resolved:
+            if idx is not None:
+                typer.echo(f"  {idx:>{w}}. {arxiv_id}  {title or ''}")
+            else:
+                typer.echo(f"  {' ' * (w + 2)}{arxiv_id}  {title or ''}")
+        typer.confirm("Proceed?", abort=True)
     last_code = 0
-    for one_paper_id in action_or_paper:
-        last_code = _invoke_cmd(cmd_vote, paper_id=one_paper_id, repo=repo, branch=branch)
+    for arxiv_id, _, _ in resolved:
+        last_code = _invoke_cmd(cmd_vote, paper_id=arxiv_id, repo=repo, branch=branch)
         if last_code != 0:
             raise typer.Exit(code=last_code)
     raise typer.Exit(code=last_code)
@@ -1265,7 +1347,11 @@ def init_config(
         '# Number of abstract lines to show per entry.\n'
         '# 0 = none (default), -1 = full abstract, N = first N wrapped lines.\n'
         'abstract_lines = 0\n'
-        'abstract_wrap = 80      # line wrap width in characters\n',
+        'abstract_wrap = 80      # line wrap width in characters\n'
+        '\n'
+        '[vote]\n'
+        '# Show a confirmation prompt when voting by list index (e.g. cuhkvoting vote 3).\n'
+        'confirm_by_number = true\n',
         encoding="utf-8",
     )
     typer.echo(f"Config written to {CONFIG_PATH}")
