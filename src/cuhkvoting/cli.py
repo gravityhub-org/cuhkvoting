@@ -209,7 +209,25 @@ def _github_headers(token: str | None = None) -> dict[str, str]:
 
 
 def _get_token() -> str | None:
-    return os.getenv("CUHKVOTING_TOKEN") or os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+    token = os.getenv("CUHKVOTING_TOKEN") or os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+    if token:
+        return token
+    try:
+        proc = subprocess.run(
+            ["git", "credential", "fill"],
+            input="protocol=https\nhost=github.com\n\n",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        for line in proc.stdout.splitlines():
+            if line.startswith("password="):
+                return line[len("password="):].strip() or None
+    except Exception:
+        pass
+    return None
 
 
 def _get_user_from_token(token: str | None) -> str | None:
