@@ -641,7 +641,7 @@ def _load_vote_paper(cfg: RepoConfig, token: str | None, paper_id: str) -> tuple
         legacy_paper, legacy_sha, legacy_path = _find_legacy_paper_via_api(cfg, paper_id, token)
         if legacy_paper is not None and legacy_path is not None:
             paper, sha, save_path = legacy_paper, legacy_sha, legacy_path
-    if paper is None and _has_github_ssh_access():
+    if paper is None and token is None and _has_github_ssh_access():
         clone_dir, cleanup_dir = _with_repo_checkout(cfg)
         try:
             paper_file = Path(clone_dir) / path
@@ -1024,14 +1024,13 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
 
 def cmd_vote(args: SimpleNamespace) -> int:
     cfg = _resolve_repo_config(args)
-    token = _get_token()
-    user = _resolve_user(token)
+    token = getattr(args, "token", None) or _get_token()
+    user = getattr(args, "user", None) or _resolve_user(token)
     paper_id = _normalize_paper_id(args.paper_id)
-    validate_entry = _validate_arxiv_entry(paper_id)
     paper, sha, save_path = _load_vote_paper(cfg, token, paper_id)
 
     if paper is None:
-        entry = validate_entry
+        entry = _validate_arxiv_entry(paper_id)
         paper = {
             "id": entry["id"],
             "title": entry["title"],
@@ -1317,9 +1316,11 @@ def vote_command(
             else:
                 typer.echo(f"  {' ' * (w + 2)}{arxiv_id}  {title or ''}")
         typer.confirm("Proceed?", abort=True)
+    token = _get_token()
+    user = _resolve_user(token)
     last_code = 0
     for arxiv_id, _, _ in resolved:
-        last_code = _invoke_cmd(cmd_vote, paper_id=arxiv_id, repo=repo, branch=branch)
+        last_code = _invoke_cmd(cmd_vote, paper_id=arxiv_id, repo=repo, branch=branch, token=token, user=user)
         if last_code != 0:
             raise typer.Exit(code=last_code)
     raise typer.Exit(code=last_code)
