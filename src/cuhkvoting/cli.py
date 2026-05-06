@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import base64
 import datetime as dt
+import fnmatch
 import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -26,6 +28,10 @@ DEFAULT_REPO = "gravityhub-org/cuhkvoting-records"
 VOTE_EXPIRY_DAYS = 183
 JC_RECORD_PATH = "papers/journal_club_records.json"
 CACHE_DIR = Path.home() / ".cache" / "cuhkvoting"
+CONFIG_PATH = Path.home() / ".config" / "cuhkvoting" / "voting.toml"
+DEFAULT_CATEGORIES = ["gr-qc", "astro-ph.*"]
+DEFAULT_TODAY_MAX_AGE = 60
+DEFAULT_LASTWEEK_MAX_AGE = 360
 
 
 @dataclass
@@ -37,6 +43,34 @@ class RepoConfig:
     @property
     def ssh_clone_url(self) -> str:
         return f"git@github.com:{self.owner}/{self.repo}.git"
+
+
+@dataclass
+class Config:
+    categories: list[str]
+    today_max_age: int
+    lastweek_max_age: int
+
+
+def _load_config() -> Config:
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH, "rb") as f:
+                raw = tomllib.load(f)
+            cats = raw.get("categories", DEFAULT_CATEGORIES)
+            cache_cfg = raw.get("cache", {})
+            return Config(
+                categories=cats if isinstance(cats, list) and cats else DEFAULT_CATEGORIES,
+                today_max_age=int(cache_cfg.get("today_max_age", DEFAULT_TODAY_MAX_AGE)),
+                lastweek_max_age=int(cache_cfg.get("lastweek_max_age", DEFAULT_LASTWEEK_MAX_AGE)),
+            )
+        except Exception:
+            pass
+    return Config(
+        categories=DEFAULT_CATEGORIES,
+        today_max_age=DEFAULT_TODAY_MAX_AGE,
+        lastweek_max_age=DEFAULT_LASTWEEK_MAX_AGE,
+    )
 
 
 def _http_text(url: str, headers: dict[str, str] | None = None) -> str:
@@ -345,7 +379,7 @@ def _arxiv_query(params: dict[str, str]) -> list[dict[str, str]]:
     url = f"{ARXIV_API}?{urllib.parse.urlencode(params)}"
     xml_str = _http_text(url, headers={"User-Agent": "cuhkvoting/0.1"})
     root = ET.fromstring(xml_str)
-    ns = {"atom": "http://www.w3.org/2005/Atom"}
+    ns = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
     entries: list[dict[str, str]] = []
     for ent in root.findall("atom:entry", ns):
         entry_id = (ent.findtext("atom:id", "", ns) or "").strip()
@@ -358,6 +392,8 @@ def _arxiv_query(params: dict[str, str]) -> list[dict[str, str]]:
                 authors.append(full_name)
         arxiv_id = _strip_arxiv_version(entry_id.rsplit("/", 1)[-1])
         published = (ent.findtext("atom:published", "", ns) or "").strip()
+        primary_cat_el = ent.find("arxiv:primary_category", ns)
+        primary_category = primary_cat_el.get("term", "") if primary_cat_el is not None else ""
         entries.append(
             {
                 "id": arxiv_id,
@@ -366,6 +402,7 @@ def _arxiv_query(params: dict[str, str]) -> list[dict[str, str]]:
                 "url": f"{ARXIV_ABS}{arxiv_id}",
                 "authors": authors,
                 "published": published,
+                "primary_category": primary_category,
             }
         )
     return entries
@@ -442,6 +479,17 @@ def _build_inspire_title_query(keywords: list[str]) -> str:
     if not title_tokens:
         title_tokens = tokens
     return " and ".join(f'(title:"{t}" or author:"{t}")' for t in title_tokens)
+
+
+def _build_cat_query(categories: list[str]) -> str:
+    if len(categories) == 1:
+        return f"cat:{categories[0]}"
+    return "(" + " OR ".join(f"cat:{c}" for c in categories) + ")"
+
+
+def _entry_matches_any_category(entry: dict, categories: list[str]) -> bool:
+    primary = entry.get("primary_category", "")
+    return any(fnmatch.fnmatch(primary, pat) for pat in categories)
 
 
 def _normalize_paper_id(raw_id: str) -> str:
@@ -682,58 +730,95 @@ def _ensure_commit_identity(repo_dir: str, user: str) -> None:
     _run_git(["config", "user.email", email], cwd=repo_dir)
 
 
-def _load_cache(key: str, max_age_seconds: int) -> list[dict] | None:
+def _load_cache_data(key: str) -> dict | None:
     path = CACHE_DIR / f"{key}.json"
     if not path.exists():
         return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        fetched_at = _parse_utc(data.get("fetched_at", ""))
-        if fetched_at is None or (dt.datetime.utcnow() - fetched_at).total_seconds() > max_age_seconds:
-            return None
-        return data.get("entries")
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
 
 
-def _save_cache(key: str, entries: list[dict]) -> None:
+def _save_cache(key: str, categories: list[str], entries: list[dict]) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    data = {"fetched_at": dt.datetime.utcnow().isoformat() + "Z", "entries": entries}
+    data = {
+        "fetched_at": dt.datetime.utcnow().isoformat() + "Z",
+        "categories": sorted(categories),
+        "entries": entries,
+    }
     (CACHE_DIR / f"{key}.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+def _resolve_cache(
+    key: str,
+    categories: list[str],
+    max_age_seconds: int,
+    fetch_fn,
+) -> list[dict]:
+    """Return entries, fetching and reconciling with category changes as needed."""
+    data = _load_cache_data(key)
+
+    if data is not None:
+        fetched_at = _parse_utc(data.get("fetched_at", ""))
+        is_stale = fetched_at is None or (dt.datetime.utcnow() - fetched_at).total_seconds() > max_age_seconds
+        cached_cats = data.get("categories")
+        if not is_stale and cached_cats:
+            cached_set = set(cached_cats)
+            current_set = set(categories)
+            if cached_set == current_set:
+                return list(data.get("entries", []))
+            entries = list(data.get("entries", []))
+            removed = cached_set - current_set
+            added = current_set - cached_set
+            if removed:
+                entries = [e for e in entries if not _entry_matches_any_category(e, list(removed))]
+            if added:
+                new_entries = fetch_fn(list(added))
+                existing_ids = {e["id"] for e in entries}
+                entries += [e for e in new_entries if e["id"] not in existing_ids]
+            _save_cache(key, categories, entries)
+            return entries
+
+    entries = fetch_fn(categories)
+    _save_cache(key, categories, entries)
+    return entries
+
+
+def _fetch_today_entries(categories: list[str]) -> list[dict]:
+    now = dt.datetime.utcnow()
+    start = (now - dt.timedelta(days=1)).strftime("%Y%m%d%H%M")
+    end = now.strftime("%Y%m%d%H%M")
+    return _arxiv_query({
+        "search_query": f"{_build_cat_query(categories)} AND submittedDate:[{start} TO {end}]",
+        "start": "0",
+        "max_results": "200",
+        "sortBy": "submittedDate",
+        "sortOrder": "descending",
+    })
+
+
+def _fetch_lastweek_entries(categories: list[str]) -> list[dict]:
+    end_day = dt.datetime.utcnow().date()
+    start_day = end_day - dt.timedelta(days=7)
+    return _arxiv_query({
+        "search_query": f"{_build_cat_query(categories)} AND submittedDate:[{start_day.strftime('%Y%m%d')}0000 TO {end_day.strftime('%Y%m%d')}2359]",
+        "start": "0",
+        "max_results": "1000",
+        "sortBy": "submittedDate",
+        "sortOrder": "descending",
+    })
+
+
 def cmd_today(args: SimpleNamespace) -> int:
-    max_age_seconds = int(getattr(args, "max_age", 60)) * 60
-    entries = _load_cache("today", max_age_seconds)
-    if entries is None:
-        now = dt.datetime.utcnow()
-        start_dt = now - dt.timedelta(days=1)
-        start = start_dt.strftime("%Y%m%d%H%M")
-        end = now.strftime("%Y%m%d%H%M")
-        params = {
-            "search_query": f"(cat:gr-qc OR cat:astro-ph.*) AND submittedDate:[{start} TO {end}]",
-            "start": "0",
-            "max_results": "200",
-            "sortBy": "submittedDate",
-            "sortOrder": "descending",
-        }
-        entries = _arxiv_query(params)
-        if not entries:
-            # arXiv may have no new submissions in current UTC window.
-            entries = _arxiv_query(
-                {
-                    "search_query": "all:the",
-                    "start": "0",
-                    "max_results": "200",
-                    "sortBy": "submittedDate",
-                    "sortOrder": "descending",
-                }
-            )
-            if not entries:
-                print("No papers found for today (UTC).")
-                return 0
-            print("No new UTC-day submissions. Showing most recent arXiv entries:")
-        _save_cache("today", entries)
+    cfg = _load_config()
+    categories = [c.strip() for item in args.category for c in item.split(",")] if getattr(args, "category", None) else cfg.categories
+    max_age_minutes = getattr(args, "max_age", None)
+    max_age_seconds = (int(max_age_minutes) if max_age_minutes is not None else cfg.today_max_age) * 60
+    entries = _resolve_cache("today", categories, max_age_seconds, _fetch_today_entries)
+    if not entries:
+        print("No papers found for today (UTC).")
+        return 0
     entries = _filter_entries(entries, getattr(args, "keywords", None))
     if not entries:
         print("No papers matched keyword filter.")
@@ -763,33 +848,30 @@ def cmd_search(args: SimpleNamespace) -> int:
 
 
 def cmd_lastweek(args: SimpleNamespace) -> int:
-    max_age_seconds = int(getattr(args, "max_age", 360)) * 60
-    entries = _load_cache("lastweek", max_age_seconds)
-    if entries is None:
-        end_day = dt.datetime.utcnow().date()
-        start_day = end_day - dt.timedelta(days=7)
-        start = start_day.strftime("%Y%m%d")
-        end = end_day.strftime("%Y%m%d")
-        params = {
-            "search_query": f"(cat:gr-qc OR cat:astro-ph.*) AND submittedDate:[{start}0000 TO {end}2359]",
-            "start": "0",
-            "max_results": "1000",
-            "sortBy": "submittedDate",
-            "sortOrder": "descending",
-        }
-        entries = _arxiv_query(params)
-        _save_cache("lastweek", entries)
-        today_max_age = int(getattr(args, "max_age", 360)) * 60
-        if _load_cache("today", today_max_age) is None:
-            cutoff = dt.datetime.utcnow() - dt.timedelta(days=1)
-            today_entries = [
-                e for e in entries
-                if (_parse_utc(e.get("published", "")) or dt.datetime.min) >= cutoff
-            ]
-            _save_cache("today", today_entries)
+    cfg = _load_config()
+    categories = [c.strip() for item in args.category for c in item.split(",")] if getattr(args, "category", None) else cfg.categories
+    max_age_minutes = getattr(args, "max_age", None)
+    max_age_seconds = (int(max_age_minutes) if max_age_minutes is not None else cfg.lastweek_max_age) * 60
+    entries = _resolve_cache("lastweek", categories, max_age_seconds, _fetch_lastweek_entries)
+    # Opportunistically seed today's cache from lastweek data if today's is stale
+    today_data = _load_cache_data("today")
+    today_fetched_at = _parse_utc(today_data.get("fetched_at", "")) if today_data else None
+    today_stale = (
+        today_data is None
+        or today_fetched_at is None
+        or (dt.datetime.utcnow() - today_fetched_at).total_seconds() > cfg.today_max_age * 60
+        or set(today_data.get("categories", [])) != set(categories)
+    )
+    if today_stale:
+        cutoff = dt.datetime.utcnow() - dt.timedelta(days=1)
+        today_entries = [
+            e for e in entries
+            if (_parse_utc(e.get("published", "")) or dt.datetime.min) >= cutoff
+        ]
+        _save_cache("today", categories, today_entries)
     entries = _filter_entries(entries, getattr(args, "keywords", None))
     if not entries:
-        print("No gr-qc / astro-ph entries matched in last week (UTC).")
+        print("No entries matched in last week (UTC).")
         return 0
     for idx, p in enumerate(entries[: int(args.limit)], 1):
         lastnames = _format_author_lastnames(p.get("authors", []), max_authors=3)
@@ -1007,9 +1089,10 @@ def today(
         help="Optional keyword filters. All keywords must match title/abstract/authors.",
     ),
     limit: int = typer.Option(20, "--limit", help="Max number of entries."),
-    max_age: int = typer.Option(60, "--max-age", help="Cache max age in minutes (0 to force refresh)."),
+    max_age: int | None = typer.Option(None, "--max-age", help="Cache max age in minutes (0 to force refresh). Defaults to config value."),
+    category: list[str] | None = typer.Option(None, "--category", help="arXiv category, e.g. hep-th (overrides config, repeatable)."),
 ) -> None:
-    _run_cmd(cmd_today, limit=limit, keywords=keywords, max_age=max_age)
+    _run_cmd(cmd_today, limit=limit, keywords=keywords, max_age=max_age, category=category)
 
 
 @app.command("search")
@@ -1027,9 +1110,10 @@ def lastweek(
         help="Optional keyword filters. All keywords must match title/abstract/authors.",
     ),
     limit: int = typer.Option(1000, "--limit", help="Max number of entries."),
-    max_age: int = typer.Option(360, "--max-age", help="Cache max age in minutes (0 to force refresh)."),
+    max_age: int | None = typer.Option(None, "--max-age", help="Cache max age in minutes (0 to force refresh). Defaults to config value."),
+    category: list[str] | None = typer.Option(None, "--category", help="arXiv category, e.g. hep-th (overrides config, repeatable)."),
 ) -> None:
-    _run_cmd(cmd_lastweek, limit=limit, keywords=keywords, max_age=max_age)
+    _run_cmd(cmd_lastweek, limit=limit, keywords=keywords, max_age=max_age, category=category)
 
 
 @app.command("topvoted")
