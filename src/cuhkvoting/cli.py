@@ -1210,6 +1210,28 @@ def vote_command(
     raise typer.Exit(code=last_code)
 
 
+@app.command("init-config")
+def init_config(
+    force: bool = typer.Option(False, "--force", help="Overwrite existing config file."),
+) -> None:
+    """Create a default config file at ~/.config/cuhkvoting/voting.toml."""
+    if CONFIG_PATH.exists() and not force:
+        typer.echo(f"Config already exists: {CONFIG_PATH}  (use --force to overwrite)")
+        raise typer.Exit(code=1)
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(
+        '# arXiv categories for today/lastweek queries.\n'
+        '# Supports wildcards, e.g. "astro-ph.*" matches all astro-ph subcategories.\n'
+        'categories = ["gr-qc", "astro-ph.*"]\n'
+        '\n'
+        '[cache]\n'
+        'today_max_age = 60      # minutes\n'
+        'lastweek_max_age = 360  # minutes\n',
+        encoding="utf-8",
+    )
+    typer.echo(f"Config written to {CONFIG_PATH}")
+
+
 admin_app = typer.Typer(name="admin", help="Admin-like maintenance commands (no admin auth required).")
 
 
