@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import textwrap
 import tomllib
 import urllib.error
 import urllib.parse
@@ -32,6 +33,8 @@ CONFIG_PATH = Path.home() / ".config" / "cuhkvoting" / "voting.toml"
 DEFAULT_CATEGORIES = ["gr-qc", "astro-ph.*"]
 DEFAULT_TODAY_MAX_AGE = 60
 DEFAULT_LASTWEEK_MAX_AGE = 360
+DEFAULT_ABSTRACT_LINES = 0
+DEFAULT_ABSTRACT_WRAP = 80
 
 
 @dataclass
@@ -50,6 +53,8 @@ class Config:
     categories: list[str]
     today_max_age: int
     lastweek_max_age: int
+    abstract_lines: int
+    abstract_wrap: int
 
 
 def _load_config() -> Config:
@@ -59,10 +64,13 @@ def _load_config() -> Config:
                 raw = tomllib.load(f)
             cats = raw.get("categories", DEFAULT_CATEGORIES)
             cache_cfg = raw.get("cache", {})
+            display_cfg = raw.get("display", {})
             return Config(
                 categories=cats if isinstance(cats, list) and cats else DEFAULT_CATEGORIES,
                 today_max_age=int(cache_cfg.get("today_max_age", DEFAULT_TODAY_MAX_AGE)),
                 lastweek_max_age=int(cache_cfg.get("lastweek_max_age", DEFAULT_LASTWEEK_MAX_AGE)),
+                abstract_lines=int(display_cfg.get("abstract_lines", DEFAULT_ABSTRACT_LINES)),
+                abstract_wrap=int(display_cfg.get("abstract_wrap", DEFAULT_ABSTRACT_WRAP)),
             )
         except Exception:
             pass
@@ -70,6 +78,8 @@ def _load_config() -> Config:
         categories=DEFAULT_CATEGORIES,
         today_max_age=DEFAULT_TODAY_MAX_AGE,
         lastweek_max_age=DEFAULT_LASTWEEK_MAX_AGE,
+        abstract_lines=DEFAULT_ABSTRACT_LINES,
+        abstract_wrap=DEFAULT_ABSTRACT_WRAP,
     )
 
 
@@ -527,6 +537,15 @@ def _format_author_lastnames(authors: list[str], max_authors: int = 3) -> str:
     return ", ".join(chosen)
 
 
+def _format_abstract(abstract: str, lines: int, wrap: int) -> str:
+    if lines == 0 or not abstract:
+        return ""
+    wrapped = textwrap.wrap(abstract, width=wrap)
+    chosen = wrapped if lines < 0 else wrapped[:lines]
+    indent = "      "
+    return "\n".join(indent + line for line in chosen)
+
+
 def _format_voters(votes: list[dict]) -> str:
     voters = [str(v.get("user", "")).strip() for v in votes]
     voters = [v for v in voters if v]
@@ -815,6 +834,9 @@ def cmd_today(args: SimpleNamespace) -> int:
     categories = [c.strip() for item in args.category for c in item.split(",")] if getattr(args, "category", None) else cfg.categories
     max_age_minutes = getattr(args, "max_age", None)
     max_age_seconds = (int(max_age_minutes) if max_age_minutes is not None else cfg.today_max_age) * 60
+    abstract_lines = getattr(args, "abstract", None)
+    if abstract_lines is None:
+        abstract_lines = cfg.abstract_lines
     entries = _resolve_cache("today", categories, max_age_seconds, _fetch_today_entries)
     if not entries:
         print("No papers found for today (UTC).")
@@ -826,6 +848,9 @@ def cmd_today(args: SimpleNamespace) -> int:
     for idx, p in enumerate(entries[: int(args.limit)], 1):
         lastnames = _format_author_lastnames(p.get("authors", []), max_authors=3)
         print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {p['title']}  [{lastnames}]")
+        abstract = _format_abstract(p.get("abstract", ""), abstract_lines, cfg.abstract_wrap)
+        if abstract:
+            print(abstract)
     return 0
 
 
@@ -869,6 +894,9 @@ def cmd_lastweek(args: SimpleNamespace) -> int:
             if (_parse_utc(e.get("published", "")) or dt.datetime.min) >= cutoff
         ]
         _save_cache("today", categories, today_entries)
+    abstract_lines = getattr(args, "abstract", None)
+    if abstract_lines is None:
+        abstract_lines = cfg.abstract_lines
     entries = _filter_entries(entries, getattr(args, "keywords", None))
     if not entries:
         print("No entries matched in last week (UTC).")
@@ -876,6 +904,9 @@ def cmd_lastweek(args: SimpleNamespace) -> int:
     for idx, p in enumerate(entries[: int(args.limit)], 1):
         lastnames = _format_author_lastnames(p.get("authors", []), max_authors=3)
         print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {p['title']}  [{lastnames}]")
+        abstract = _format_abstract(p.get("abstract", ""), abstract_lines, cfg.abstract_wrap)
+        if abstract:
+            print(abstract)
     return 0
 
 
@@ -1091,8 +1122,9 @@ def today(
     limit: int = typer.Option(20, "--limit", help="Max number of entries."),
     max_age: int | None = typer.Option(None, "--max-age", help="Cache max age in minutes (0 to force refresh). Defaults to config value."),
     category: list[str] | None = typer.Option(None, "--category", help="arXiv category, e.g. hep-th (overrides config, repeatable)."),
+    abstract: int | None = typer.Option(None, "--abstract", help="Abstract lines to show (0=none, -1=full, N=first N lines). Defaults to config value."),
 ) -> None:
-    _run_cmd(cmd_today, limit=limit, keywords=keywords, max_age=max_age, category=category)
+    _run_cmd(cmd_today, limit=limit, keywords=keywords, max_age=max_age, category=category, abstract=abstract)
 
 
 @app.command("search")
@@ -1112,8 +1144,9 @@ def lastweek(
     limit: int = typer.Option(1000, "--limit", help="Max number of entries."),
     max_age: int | None = typer.Option(None, "--max-age", help="Cache max age in minutes (0 to force refresh). Defaults to config value."),
     category: list[str] | None = typer.Option(None, "--category", help="arXiv category, e.g. hep-th (overrides config, repeatable)."),
+    abstract: int | None = typer.Option(None, "--abstract", help="Abstract lines to show (0=none, -1=full, N=first N lines). Defaults to config value."),
 ) -> None:
-    _run_cmd(cmd_lastweek, limit=limit, keywords=keywords, max_age=max_age, category=category)
+    _run_cmd(cmd_lastweek, limit=limit, keywords=keywords, max_age=max_age, category=category, abstract=abstract)
 
 
 @app.command("topvoted")
@@ -1226,7 +1259,13 @@ def init_config(
         '\n'
         '[cache]\n'
         'today_max_age = 60      # minutes\n'
-        'lastweek_max_age = 360  # minutes\n',
+        'lastweek_max_age = 360  # minutes\n'
+        '\n'
+        '[display]\n'
+        '# Number of abstract lines to show per entry.\n'
+        '# 0 = none (default), -1 = full abstract, N = first N wrapped lines.\n'
+        'abstract_lines = 0\n'
+        'abstract_wrap = 80      # line wrap width in characters\n',
         encoding="utf-8",
     )
     typer.echo(f"Config written to {CONFIG_PATH}")
