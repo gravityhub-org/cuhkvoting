@@ -285,32 +285,59 @@ def sync(
             typer.echo(f"Warning: skipping non-arXiv paper: {label}", err=True)
 
     arxiv_papers = [p for p in papers if p["arxiv_id"] is not None]
+    current_ids = {p["arxiv_id"] for p in arxiv_papers}
+    current_by_id = {p["arxiv_id"]: p for p in arxiv_papers}
     synced = _load_synced()
-    new_papers = [p for p in arxiv_papers if p["arxiv_id"] not in synced]
 
-    if not new_papers:
-        typer.echo(f"All {len(arxiv_papers)} paper(s) already synced.")
+    to_add = [current_by_id[i] for i in current_ids - synced]
+    to_remove = sorted(synced - current_ids)
+
+    if not to_add and not to_remove:
+        typer.echo(f"All {len(arxiv_papers)} paper(s) already in sync.")
         return
 
-    typer.echo(f"Found {len(new_papers)} new paper(s):")
-    for p in new_papers:
-        title = p["title"] or "(no title)"
-        typer.echo(f"  {p['arxiv_id']}  {title}")
+    if to_add:
+        typer.echo(f"Adding {len(to_add)} vote(s):")
+        for p in to_add:
+            typer.echo(typer.style(f"  + {p['arxiv_id']}  {p['title'] or '(no title)'}", fg=typer.colors.GREEN))
+
+    if to_remove:
+        typer.echo(f"Removing {len(to_remove)} vote(s):")
+        for arxiv_id in to_remove:
+            typer.echo(typer.style(f"  - {arxiv_id}", fg=typer.colors.RED))
 
     if dry_run:
-        typer.echo("Dry run — no votes cast.")
+        typer.echo("Dry run — no changes made.")
         return
 
-    result = subprocess.run(
-        [sys.executable, "-m", "cuhkvoting", "vote"] + [p["arxiv_id"] for p in new_papers]
-    )
-    if result.returncode == 0:
-        synced.update(p["arxiv_id"] for p in new_papers)
-        _save_synced(synced)
-        typer.echo(f"Synced {len(new_papers)} paper(s).")
+    ok = True
+    if to_add:
+        result = subprocess.run(
+            [sys.executable, "-m", "cuhkvoting", "vote"] + [p["arxiv_id"] for p in to_add]
+        )
+        if result.returncode == 0:
+            synced.update(p["arxiv_id"] for p in to_add)
+        else:
+            typer.echo("Vote command failed.", err=True)
+            ok = False
+
+    if to_remove:
+        for arxiv_id in to_remove:
+            result = subprocess.run(
+                [sys.executable, "-m", "cuhkvoting", "vote", "remove", arxiv_id]
+            )
+            if result.returncode == 0:
+                synced.discard(arxiv_id)
+            else:
+                typer.echo(f"Remove failed for {arxiv_id}.", err=True)
+                ok = False
+
+    _save_synced(synced)
+
+    if ok:
+        typer.echo(f"Sync complete: +{len(to_add)} / -{len(to_remove)}.")
     else:
-        typer.echo("Vote command failed; synced cache not updated.", err=True)
-        raise typer.Exit(result.returncode)
+        raise typer.Exit(1)
 
 
 def main() -> None:
