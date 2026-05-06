@@ -25,6 +25,7 @@ INSPIRE_API = "https://inspirehep.net/api/literature"
 DEFAULT_REPO = "gravityhub-org/cuhkvoting-records"
 VOTE_EXPIRY_DAYS = 183
 JC_RECORD_PATH = "papers/journal_club_records.json"
+CACHE_DIR = Path.home() / ".cache" / "cuhkvoting"
 
 
 @dataclass
@@ -679,35 +680,58 @@ def _ensure_commit_identity(repo_dir: str, user: str) -> None:
     _run_git(["config", "user.email", email], cwd=repo_dir)
 
 
+def _load_cache(key: str, max_age_seconds: int) -> list[dict] | None:
+    path = CACHE_DIR / f"{key}.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        fetched_at = _parse_utc(data.get("fetched_at", ""))
+        if fetched_at is None or (dt.datetime.utcnow() - fetched_at).total_seconds() > max_age_seconds:
+            return None
+        return data.get("entries")
+    except Exception:
+        return None
+
+
+def _save_cache(key: str, entries: list[dict]) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    data = {"fetched_at": dt.datetime.utcnow().isoformat() + "Z", "entries": entries}
+    (CACHE_DIR / f"{key}.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
 def cmd_today(args: SimpleNamespace) -> int:
-    now = dt.datetime.utcnow()
-    start_dt = now - dt.timedelta(days=1)
-    start = start_dt.strftime("%Y%m%d%H%M")
-    end = now.strftime("%Y%m%d%H%M")
-    fetch_limit = max(int(args.limit), 200) if getattr(args, "keywords", None) else int(args.limit)
-    params = {
-        "search_query": f"submittedDate:[{start} TO {end}]",
-        "start": "0",
-        "max_results": str(fetch_limit),
-        "sortBy": "submittedDate",
-        "sortOrder": "descending",
-    }
-    entries = _arxiv_query(params)
-    if not entries:
-        # arXiv may have no new submissions in current UTC window.
-        entries = _arxiv_query(
-            {
-                "search_query": "all:the",
-                "start": "0",
-                "max_results": str(fetch_limit),
-                "sortBy": "submittedDate",
-                "sortOrder": "descending",
-            }
-        )
+    max_age_seconds = int(getattr(args, "max_age", 60)) * 60
+    entries = _load_cache("today", max_age_seconds)
+    if entries is None:
+        now = dt.datetime.utcnow()
+        start_dt = now - dt.timedelta(days=1)
+        start = start_dt.strftime("%Y%m%d%H%M")
+        end = now.strftime("%Y%m%d%H%M")
+        params = {
+            "search_query": f"submittedDate:[{start} TO {end}]",
+            "start": "0",
+            "max_results": "200",
+            "sortBy": "submittedDate",
+            "sortOrder": "descending",
+        }
+        entries = _arxiv_query(params)
         if not entries:
-            print("No papers found for today (UTC).")
-            return 0
-        print("No new UTC-day submissions. Showing most recent arXiv entries:")
+            # arXiv may have no new submissions in current UTC window.
+            entries = _arxiv_query(
+                {
+                    "search_query": "all:the",
+                    "start": "0",
+                    "max_results": "200",
+                    "sortBy": "submittedDate",
+                    "sortOrder": "descending",
+                }
+            )
+            if not entries:
+                print("No papers found for today (UTC).")
+                return 0
+            print("No new UTC-day submissions. Showing most recent arXiv entries:")
+        _save_cache("today", entries)
     entries = _filter_entries(entries, getattr(args, "keywords", None))
     if not entries:
         print("No papers matched keyword filter.")
@@ -737,19 +761,22 @@ def cmd_search(args: SimpleNamespace) -> int:
 
 
 def cmd_lastweek(args: SimpleNamespace) -> int:
-    end_day = dt.datetime.utcnow().date()
-    start_day = end_day - dt.timedelta(days=7)
-    start = start_day.strftime("%Y%m%d")
-    end = end_day.strftime("%Y%m%d")
-    fetch_limit = max(int(args.limit), 300) if getattr(args, "keywords", None) else int(args.limit)
-    params = {
-        "search_query": f"(cat:gr-qc OR cat:astro-ph.*) AND submittedDate:[{start}0000 TO {end}2359]",
-        "start": "0",
-        "max_results": str(fetch_limit),
-        "sortBy": "submittedDate",
-        "sortOrder": "descending",
-    }
-    entries = _arxiv_query(params)
+    max_age_seconds = int(getattr(args, "max_age", 360)) * 60
+    entries = _load_cache("lastweek", max_age_seconds)
+    if entries is None:
+        end_day = dt.datetime.utcnow().date()
+        start_day = end_day - dt.timedelta(days=7)
+        start = start_day.strftime("%Y%m%d")
+        end = end_day.strftime("%Y%m%d")
+        params = {
+            "search_query": f"(cat:gr-qc OR cat:astro-ph.*) AND submittedDate:[{start}0000 TO {end}2359]",
+            "start": "0",
+            "max_results": "1000",
+            "sortBy": "submittedDate",
+            "sortOrder": "descending",
+        }
+        entries = _arxiv_query(params)
+        _save_cache("lastweek", entries)
     entries = _filter_entries(entries, getattr(args, "keywords", None))
     if not entries:
         print("No gr-qc / astro-ph entries matched in last week (UTC).")
@@ -970,8 +997,9 @@ def today(
         help="Optional keyword filters. All keywords must match title/abstract/authors.",
     ),
     limit: int = typer.Option(20, "--limit", help="Max number of entries."),
+    max_age: int = typer.Option(60, "--max-age", help="Cache max age in minutes (0 to force refresh)."),
 ) -> None:
-    _run_cmd(cmd_today, limit=limit, keywords=keywords)
+    _run_cmd(cmd_today, limit=limit, keywords=keywords, max_age=max_age)
 
 
 @app.command("search")
@@ -989,8 +1017,9 @@ def lastweek(
         help="Optional keyword filters. All keywords must match title/abstract/authors.",
     ),
     limit: int = typer.Option(1000, "--limit", help="Max number of entries."),
+    max_age: int = typer.Option(360, "--max-age", help="Cache max age in minutes (0 to force refresh)."),
 ) -> None:
-    _run_cmd(cmd_lastweek, limit=limit, keywords=keywords)
+    _run_cmd(cmd_lastweek, limit=limit, keywords=keywords, max_age=max_age)
 
 
 @app.command("topvoted")
