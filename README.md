@@ -5,13 +5,19 @@ Minimal CLI to browse arXiv and vote on papers, with paper data and votes stored
 ### Install
 
 ```bash
+uv tool install --upgrade git+https://github.com/gravityhub-org/cuhkvoting.git && cuhkvoting --install-completion
+```
+
+Or with pip:
+
+```bash
 pip install --upgrade git+https://github.com/gravityhub-org/cuhkvoting.git && cuhkvoting --install-completion
 ```
 
-Or:
+Optional Benty-Fields addon (adds `cuhkvoting-benty`):
 
 ```bash
-uv tool install --upgrade git+https://github.com/gravityhub-org/cuhkvoting.git && cuhkvoting --install-completion
+uv tool install --upgrade "git+https://github.com/gravityhub-org/cuhkvoting.git[benty]"
 ```
 
 
@@ -169,6 +175,29 @@ If you prefer manual setup:
 ```bash
 eval "$(_CUHKVOTING_COMPLETE=bash_source cuhkvoting)"
 ```
+
+### Benty-Fields sync (optional addon)
+
+`cuhkvoting-benty` fetches papers from your Benty-Fields journal-club page and votes for any that are not already in the cuhkvoting records.
+
+```bash
+cuhkvoting-benty           # fetch + vote for new papers
+cuhkvoting-benty --dry-run # preview without voting
+cuhkvoting-benty --no-cache-cookies  # skip cookie persistence
+```
+
+Credentials are read from your git credential helper (e.g. libsecret / GNOME keyring) using `host=benty-fields.com`. If no stored credential is found, you are prompted interactively.
+
+Already-synced papers are tracked in `~/.cache/cuhkvoting/benty_synced.json` so they are not voted on twice.
+
+Session cookies are cached by default to avoid re-logging-in on every run. Disable this per-run with `--no-cache-cookies`, or permanently via config:
+
+```toml
+[benty]
+cache_cookies = false
+```
+
+If a paper on the Benty-Fields page has no arXiv link, a warning is printed and the paper is skipped.
 
 ### Data format
 
