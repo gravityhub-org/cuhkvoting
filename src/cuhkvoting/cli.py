@@ -357,6 +357,7 @@ def _arxiv_query(params: dict[str, str]) -> list[dict[str, str]]:
             if full_name:
                 authors.append(full_name)
         arxiv_id = _strip_arxiv_version(entry_id.rsplit("/", 1)[-1])
+        published = (ent.findtext("atom:published", "", ns) or "").strip()
         entries.append(
             {
                 "id": arxiv_id,
@@ -364,6 +365,7 @@ def _arxiv_query(params: dict[str, str]) -> list[dict[str, str]]:
                 "abstract": summary,
                 "url": f"{ARXIV_ABS}{arxiv_id}",
                 "authors": authors,
+                "published": published,
             }
         )
     return entries
@@ -777,6 +779,14 @@ def cmd_lastweek(args: SimpleNamespace) -> int:
         }
         entries = _arxiv_query(params)
         _save_cache("lastweek", entries)
+        today_max_age = int(getattr(args, "max_age", 360)) * 60
+        if _load_cache("today", today_max_age) is None:
+            cutoff = dt.datetime.utcnow() - dt.timedelta(days=1)
+            today_entries = [
+                e for e in entries
+                if (_parse_utc(e.get("published", "")) or dt.datetime.min) >= cutoff
+            ]
+            _save_cache("today", today_entries)
     entries = _filter_entries(entries, getattr(args, "keywords", None))
     if not entries:
         print("No gr-qc / astro-ph entries matched in last week (UTC).")
