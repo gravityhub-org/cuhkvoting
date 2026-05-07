@@ -32,7 +32,7 @@ Auth behavior:
 - `today`, `search`, `topvoted`: works without auth
 - `vote`: needs write auth via either:
   - token (`CUHKVOTING_TOKEN`, `GITHUB_TOKEN`, or `GH_TOKEN` env var), or
-  - a git credential helper (e.g. libsecret / GNOME keyring) — picked up automatically, or
+  - a git credential helper (e.g. libsecret / GNOME keyring) - picked up automatically, or
   - git SSH key for `git@github.com`
 
 Set vote identity (optional if global git `user.name` is already set):
@@ -160,9 +160,49 @@ abstract_wrap = 80      # line wrap width in characters
 [vote]
 # Show a confirmation prompt when voting by list index (e.g. cuhkvoting vote 3).
 confirm_by_number = true
+
+[highlights]
+authors = []        # ["Surname, Firstname"]
+keywords = []       # regular expressions
+keyword_count = -1  # -1 = all, 0 = glyph, N = first N
+glyph = "★"
 ```
 
 If the file is absent, all settings fall back to the defaults shown above.
+
+### Highlights
+
+Mark authors and keywords of interest so they stand out in `today`/`lastweek` listings.
+
+Configure in `~/.config/cuhkvoting/config.toml`:
+
+```toml
+[highlights]
+# Authors to highlight - "Surname, Firstname" format, case-insensitive.
+# Abbreviated arXiv firstnames (e.g. "H. von Helmholtz") are matched
+# automatically.
+authors = ["von Helmholtz, Hermann", "Einstein, Albert"]
+
+# Keywords as regular expressions - matched against title and abstract.
+keywords = ["neutron star", "black hole merger"]
+
+# How many matched keywords to show after each title.
+# -1 = all, 0 = glyph only, N = first N (with trailing + if more exist).
+keyword_count = -1
+
+# Glyph used when keyword_count = 0.
+glyph = "★"
+```
+
+Override `keyword_count` per run:
+
+```bash
+cuhkvoting today --highlight-keywords 0   # glyph only
+cuhkvoting today --highlight-keywords 3   # first 3 matches
+cuhkvoting today --highlight-keywords -1  # all matches
+```
+
+Matched author lastnames and keyword occurrences in abstracts are colored blue.
 
 ### Bash autocomplete
 
@@ -178,7 +218,11 @@ eval "$(_CUHKVOTING_COMPLETE=bash_source cuhkvoting)"
 
 ### Benty-Fields sync (optional addon)
 
-`cuhkvoting-benty` fetches papers from your Benty-Fields journal-club page and votes for any that are not already in the cuhkvoting records.
+`cuhkvoting-benty` performs a two-way sync between your Benty-Fields journal-club page and cuhkvoting records:
+
+- **Benty-Fields → cuhkvoting**: papers you voted for on Benty-Fields are voted for in cuhkvoting.
+- **cuhkvoting → Benty-Fields**: papers you voted for in cuhkvoting are voted for on Benty-Fields.
+- Votes explicitly removed in either system are removed in the other. Natural 6-month expiry in cuhkvoting does not propagate.
 
 ```bash
 cuhkvoting-benty           # fetch + vote for new papers
@@ -203,6 +247,6 @@ If a paper on the Benty-Fields page has no arXiv link, a warning is printed and 
 
 Votes and metadata are stored as JSON files in the records repo:
 
-- `papers/<arxiv_id>.json` — one file per paper, one vote per GitHub username enforced by CLI
-- `papers/journal_club_records.json` — history of selected papers
+- `papers/<arxiv_id>.json` - one file per paper, one vote per GitHub username enforced by CLI
+- `papers/journal_club_records.json` - history of selected papers
 - votes expire after 6 months
