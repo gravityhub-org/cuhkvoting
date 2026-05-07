@@ -36,6 +36,10 @@ DEFAULT_TODAY_MAX_AGE = 60
 DEFAULT_LASTWEEK_MAX_AGE = 360
 DEFAULT_ABSTRACT_LINES = 0
 DEFAULT_ABSTRACT_WRAP = 80
+DEFAULT_HIGHLIGHT_AUTHORS: list[str] = []
+DEFAULT_HIGHLIGHT_KEYWORDS: list[str] = []
+DEFAULT_HIGHLIGHT_KEYWORD_COUNT = -1
+DEFAULT_HIGHLIGHT_GLYPH = "★"
 
 
 @dataclass
@@ -57,6 +61,10 @@ class Config:
     abstract_lines: int
     abstract_wrap: int
     confirm_by_number: bool
+    highlight_authors: list[str]
+    highlight_keywords: list[str]
+    highlight_keyword_count: int
+    highlight_glyph: str
 
 
 def _load_config() -> Config:
@@ -68,6 +76,7 @@ def _load_config() -> Config:
             cache_cfg = raw.get("cache", {})
             display_cfg = raw.get("display", {})
             vote_cfg = raw.get("vote", {})
+            hl_cfg = raw.get("highlights", {})
             return Config(
                 categories=cats if isinstance(cats, list) and cats else DEFAULT_CATEGORIES,
                 today_max_age=int(cache_cfg.get("today_max_age", DEFAULT_TODAY_MAX_AGE)),
@@ -75,6 +84,10 @@ def _load_config() -> Config:
                 abstract_lines=int(display_cfg.get("abstract_lines", DEFAULT_ABSTRACT_LINES)),
                 abstract_wrap=int(display_cfg.get("abstract_wrap", DEFAULT_ABSTRACT_WRAP)),
                 confirm_by_number=bool(vote_cfg.get("confirm_by_number", True)),
+                highlight_authors=list(hl_cfg.get("authors", DEFAULT_HIGHLIGHT_AUTHORS)),
+                highlight_keywords=list(hl_cfg.get("keywords", DEFAULT_HIGHLIGHT_KEYWORDS)),
+                highlight_keyword_count=int(hl_cfg.get("keyword_count", DEFAULT_HIGHLIGHT_KEYWORD_COUNT)),
+                highlight_glyph=str(hl_cfg.get("glyph", DEFAULT_HIGHLIGHT_GLYPH)),
             )
         except Exception:
             pass
@@ -85,6 +98,10 @@ def _load_config() -> Config:
         abstract_lines=DEFAULT_ABSTRACT_LINES,
         abstract_wrap=DEFAULT_ABSTRACT_WRAP,
         confirm_by_number=True,
+        highlight_authors=DEFAULT_HIGHLIGHT_AUTHORS,
+        highlight_keywords=DEFAULT_HIGHLIGHT_KEYWORDS,
+        highlight_keyword_count=DEFAULT_HIGHLIGHT_KEYWORD_COUNT,
+        highlight_glyph=DEFAULT_HIGHLIGHT_GLYPH,
     )
 
 
@@ -551,6 +568,71 @@ def _format_abstract(abstract: str, lines: int, wrap: int) -> str:
     return "\n".join(indent + line for line in chosen)
 
 
+def _author_matches_highlight(author: str, highlight: str) -> bool:
+    """Match arXiv 'Firstname Lastname' against config 'Surname, Firstname'."""
+    a = author.strip().lower()
+    h = highlight.strip().lower()
+    # Try rearranging "Surname, Firstname" → "Firstname Surname" for exact match
+    if "," in h:
+        surname, _, firstname = h.partition(",")
+        if a == f"{firstname.strip()} {surname.strip()}":
+            return True
+    # Fallback: surname + initial — only when the arXiv firstname looks abbreviated
+    # (single letter, optionally followed by a dot), e.g. "O. Hannuksela"
+    parts = a.split()
+    if len(parts) >= 2 and re.fullmatch(r"[a-z]\.?", parts[0]):
+        surname = h.split(",")[0].strip()
+        initial = parts[0].rstrip(".")
+        config_firstname = h.partition(",")[2].strip()
+        if " ".join(parts[1:]) == surname and config_firstname.lower().startswith(initial):
+            return True
+    return False
+
+
+def _format_author_lastnames_highlighted(
+    authors: list[str], max_authors: int, highlights: list[str]
+) -> str:
+    if not authors:
+        return "unknown"
+    parts = []
+    for a in authors[:max_authors]:
+        lastname = _last_name(a)
+        if highlights and any(_author_matches_highlight(a, h) for h in highlights):
+            parts.append(typer.style(lastname, fg=typer.colors.BRIGHT_BLUE, bold=True))
+        else:
+            parts.append(lastname)
+    return ", ".join(parts)
+
+
+def _find_keyword_matches(texts: list[str], keywords: list[str]) -> list[str]:
+    seen_lower: set[str] = set()
+    results: list[str] = []
+    for pattern in keywords:
+        try:
+            for text in texts:
+                for m in re.finditer(pattern, text, re.IGNORECASE):
+                    word = m.group(0)
+                    if word.lower() not in seen_lower:
+                        seen_lower.add(word.lower())
+                        results.append(word)
+        except re.error:
+            pass
+    return results
+
+
+def _highlight_text(text: str, keywords: list[str]) -> str:
+    spans: list[tuple[int, int]] = []
+    for pattern in keywords:
+        try:
+            for m in re.finditer(pattern, text, re.IGNORECASE):
+                spans.append((m.start(), m.end()))
+        except re.error:
+            pass
+    for start, end in sorted(spans, reverse=True):
+        text = text[:start] + typer.style(text[start:end], fg=typer.colors.BRIGHT_BLUE, bold=True) + text[end:]
+    return text
+
+
 def _format_voters(votes: list[dict]) -> str:
     voters = [str(v.get("user", "")).strip() for v in votes]
     voters = [v for v in voters if v]
@@ -909,10 +991,37 @@ def cmd_today(args: SimpleNamespace) -> int:
         return 0
     displayed = entries[: int(args.limit)]
     _save_last_list(displayed)
+    highlight_kw_count = getattr(args, "highlight_keywords", None)
+    if highlight_kw_count is None:
+        highlight_kw_count = cfg.highlight_keyword_count
     for idx, p in enumerate(displayed, 1):
-        lastnames = _format_author_lastnames(p.get("authors", []), max_authors=3)
-        print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {p['title']}  [{lastnames}]")
-        abstract = _format_abstract(p.get("abstract", ""), abstract_lines, cfg.abstract_wrap)
+        authors = p.get("authors", [])
+        lastnames = _format_author_lastnames_highlighted(authors, 3, cfg.highlight_authors)
+        title = p.get("title", "")
+        abstract_text = p.get("abstract", "")
+        kw_suffix = ""
+        if cfg.highlight_keywords:
+            matches = _find_keyword_matches([title, abstract_text], cfg.highlight_keywords)
+            if matches:
+                if highlight_kw_count == 0:
+                    kw_suffix = typer.style(f" {cfg.highlight_glyph}", fg=typer.colors.BRIGHT_BLUE, bold=True)
+                else:
+                    if highlight_kw_count < 0:
+                        shown = matches
+                    else:
+                        shown = matches[:highlight_kw_count]
+                    parts = ", ".join(shown)
+                    if highlight_kw_count >= 1 and len(matches) > highlight_kw_count:
+                        parts += ", +"
+                    kw_suffix = typer.style(f" [{parts}]", fg=typer.colors.BRIGHT_BLUE, bold=True)
+        print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {title}  [{lastnames}]{kw_suffix}")
+        abstract = _format_abstract(abstract_text, abstract_lines, cfg.abstract_wrap)
+        if abstract and cfg.highlight_keywords:
+            lines_out = []
+            for line in abstract.splitlines():
+                indent = len(line) - len(line.lstrip())
+                lines_out.append(line[:indent] + _highlight_text(line[indent:], cfg.highlight_keywords))
+            abstract = "\n".join(lines_out)
         if abstract:
             print(abstract)
     return 0
@@ -969,10 +1078,37 @@ def cmd_lastweek(args: SimpleNamespace) -> int:
         return 0
     displayed = entries[: int(args.limit)]
     _save_last_list(displayed)
+    highlight_kw_count = getattr(args, "highlight_keywords", None)
+    if highlight_kw_count is None:
+        highlight_kw_count = cfg.highlight_keyword_count
     for idx, p in enumerate(displayed, 1):
-        lastnames = _format_author_lastnames(p.get("authors", []), max_authors=3)
-        print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {p['title']}  [{lastnames}]")
-        abstract = _format_abstract(p.get("abstract", ""), abstract_lines, cfg.abstract_wrap)
+        authors = p.get("authors", [])
+        lastnames = _format_author_lastnames_highlighted(authors, 3, cfg.highlight_authors)
+        title = p.get("title", "")
+        abstract_text = p.get("abstract", "")
+        kw_suffix = ""
+        if cfg.highlight_keywords:
+            matches = _find_keyword_matches([title, abstract_text], cfg.highlight_keywords)
+            if matches:
+                if highlight_kw_count == 0:
+                    kw_suffix = typer.style(f" {cfg.highlight_glyph}", fg=typer.colors.BRIGHT_BLUE, bold=True)
+                else:
+                    if highlight_kw_count < 0:
+                        shown = matches
+                    else:
+                        shown = matches[:highlight_kw_count]
+                    parts = ", ".join(shown)
+                    if highlight_kw_count >= 1 and len(matches) > highlight_kw_count:
+                        parts += ", +"
+                    kw_suffix = typer.style(f" [{parts}]", fg=typer.colors.BRIGHT_BLUE, bold=True)
+        print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {title}  [{lastnames}]{kw_suffix}")
+        abstract = _format_abstract(abstract_text, abstract_lines, cfg.abstract_wrap)
+        if abstract and cfg.highlight_keywords:
+            lines_out = []
+            for line in abstract.splitlines():
+                indent = len(line) - len(line.lstrip())
+                lines_out.append(line[:indent] + _highlight_text(line[indent:], cfg.highlight_keywords))
+            abstract = "\n".join(lines_out)
         if abstract:
             print(abstract)
     return 0
@@ -1199,8 +1335,9 @@ def today(
     max_age: int | None = typer.Option(None, "--max-age", help="Cache max age in minutes (0 to force refresh). Defaults to config value."),
     category: list[str] | None = typer.Option(None, "--category", help="arXiv category, e.g. hep-th (overrides config, repeatable)."),
     abstract: int | None = typer.Option(None, "--abstract", help="Abstract lines to show (0=none, -1=full, N=first N lines). Defaults to config value."),
+    highlight_keywords: int | None = typer.Option(None, "--highlight-keywords", help="Keyword matches to show per entry (0=glyph, -1=all, N=first N). Defaults to config value."),
 ) -> None:
-    _run_cmd(cmd_today, limit=limit, keywords=keywords, max_age=max_age, category=category, abstract=abstract)
+    _run_cmd(cmd_today, limit=limit, keywords=keywords, max_age=max_age, category=category, abstract=abstract, highlight_keywords=highlight_keywords)
 
 
 @app.command("search")
@@ -1221,8 +1358,9 @@ def lastweek(
     max_age: int | None = typer.Option(None, "--max-age", help="Cache max age in minutes (0 to force refresh). Defaults to config value."),
     category: list[str] | None = typer.Option(None, "--category", help="arXiv category, e.g. hep-th (overrides config, repeatable)."),
     abstract: int | None = typer.Option(None, "--abstract", help="Abstract lines to show (0=none, -1=full, N=first N lines). Defaults to config value."),
+    highlight_keywords: int | None = typer.Option(None, "--highlight-keywords", help="Keyword matches to show per entry (0=glyph, -1=all, N=first N). Defaults to config value."),
 ) -> None:
-    _run_cmd(cmd_lastweek, limit=limit, keywords=keywords, max_age=max_age, category=category, abstract=abstract)
+    _run_cmd(cmd_lastweek, limit=limit, keywords=keywords, max_age=max_age, category=category, abstract=abstract, highlight_keywords=highlight_keywords)
 
 
 @app.command("topvoted")
@@ -1360,7 +1498,18 @@ def init_config(
         '\n'
         '[vote]\n'
         '# Show a confirmation prompt when voting by list index (e.g. cuhkvoting vote 3).\n'
-        'confirm_by_number = true\n',
+        'confirm_by_number = true\n'
+        '\n'
+        '[highlights]\n'
+        '# Authors to highlight. Format: "Surname, Firstname" (case-insensitive).\n'
+        'authors = []\n'
+        '# Keywords to highlight (regular expressions).\n'
+        'keywords = []\n'
+        '# Number of matched words to show after each title.\n'
+        '# 0 = glyph only, -1 = all matches, N = first N distinct matches.\n'
+        'keyword_count = -1\n'
+        '# Glyph shown when keyword_count = 0.\n'
+        'glyph = "★"\n',
         encoding="utf-8",
     )
     typer.echo(f"Config written to {CONFIG_PATH}")
