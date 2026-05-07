@@ -11,8 +11,12 @@ dependencies = [
     "typer-slim",
 ]
 
+[project.optional-dependencies]
+benty = ["beautifulsoup4"]
+
 [project.scripts]
 cuhkvoting = "cuhkvoting:main"
+cuhkvoting-benty = "cuhkvoting.benty:main"
 
 [build-system]
 requires = ["uv_build>=0.11.7,<0.12.0"]
