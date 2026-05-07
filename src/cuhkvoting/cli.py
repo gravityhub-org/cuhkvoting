@@ -1172,6 +1172,14 @@ def _invoke_cmd(func, **kwargs: object) -> int:
     except urllib.error.URLError as e:
         typer.echo(f"Network error: {e.reason}", err=True)
         return 1
+    except ConnectionError as e:
+        typer.echo(
+            f"arXiv closed the connection ({e}). "
+            "This is usually a temporary rate limit — retry in a moment, "
+            "or use --max-age to serve results from the local cache.",
+            err=True,
+        )
+        return 1
     except SystemExit as e:
         typer.echo(str(e), err=True)
         return 1
