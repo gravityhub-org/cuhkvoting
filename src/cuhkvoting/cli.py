@@ -25,6 +25,7 @@ from types import SimpleNamespace
 import typer
 
 
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0"
 ARXIV_API = "https://export.arxiv.org/api/query"
 ARXIV_ABS = "https://arxiv.org/abs/"
 INSPIRE_API = "https://inspirehep.net/api/literature"
@@ -274,7 +275,7 @@ def _github_headers(token: str | None = None) -> dict[str, str]:
     headers = {
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "cuhkvoting/0.1",
+        "User-Agent": USER_AGENT,
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -461,7 +462,7 @@ def _arxiv_query(params: dict[str, str]) -> list[dict[str, str]]:
             typer.echo(f"arXiv rate limit, retrying in {delay}s…", err=True)
             time.sleep(delay)
         try:
-            xml_str = _http_text(url, headers={"User-Agent": "cuhkvoting/0.1"})
+            xml_str = _http_text(url, headers={"User-Agent": USER_AGENT})
             break
         except (ConnectionError, urllib.error.HTTPError, http.client.IncompleteRead) as e:
             code = getattr(e, "code", None)
@@ -505,7 +506,7 @@ def _inspire_query(query: str, limit: int) -> list[dict[str, str]]:
         "fields": "titles,abstracts,authors,arxiv_eprints,control_number",
     }
     url = f"{INSPIRE_API}?{urllib.parse.urlencode(params)}"
-    data = _http_json(url, headers={"User-Agent": "cuhkvoting/0.1"})
+    data = _http_json(url, headers={"User-Agent": USER_AGENT})
     hits = data.get("hits", {}).get("hits", [])
     entries: list[dict[str, str]] = []
     for hit in hits if isinstance(hits, list) else []:
