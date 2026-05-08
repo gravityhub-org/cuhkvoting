@@ -1114,11 +1114,12 @@ def cmd_lastweek(args: SimpleNamespace) -> int:
 
 
 def cmd_topvoted(args: SimpleNamespace) -> int:
-    cfg = _resolve_repo_config(args)
+    cfg = _load_config()
+    repo_cfg = _resolve_repo_config(args)
     token = _get_token()
-    papers = _list_papers_via_api(cfg, token)
+    papers = _list_papers_via_api(repo_cfg, token)
     if not papers and _has_github_ssh_access():
-        clone_dir, cleanup_dir = _with_repo_checkout(cfg)
+        clone_dir, cleanup_dir = _with_repo_checkout(repo_cfg)
         try:
             papers_dir = Path(clone_dir) / "papers"
             for path in sorted(papers_dir.glob("*.json")) if papers_dir.exists() else []:
@@ -1141,7 +1142,8 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
         rows.append(
             {
                 "id": _strip_arxiv_version(str(paper.get("id", "(unknown)"))),
-                "title": paper.get("title", "(no title)"),
+                "title": " ".join(paper.get("title", "(no title)").split()),
+                "abstract": " ".join(paper.get("abstract", "").split()),
                 "votes": vote_count,
                 "voters": _format_voters(votes),
             }
@@ -1152,8 +1154,56 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
         print("No voted papers yet.")
         return 0
     _save_last_list(topn)
-    for idx, p in enumerate(topn, 1):
-        print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {p['title']} [{p['voters']}]")
+
+    abstract_lines = getattr(args, "abstract", None)
+    if abstract_lines is None:
+        abstract_lines = cfg.abstract_lines
+
+    # Group consecutive papers by vote count
+    groups: list[list[dict]] = []
+    for p in topn:
+        if groups and groups[-1][0]["votes"] == p["votes"]:
+            groups[-1].append(p)
+        else:
+            groups.append([p])
+
+    has_ties = any(len(g) > 1 for g in groups)
+    w = len(str(len(topn)))
+
+    idx = 1
+    for group in groups:
+        for k, p in enumerate(group):
+            is_first = k == 0
+            is_last = k == len(group) - 1
+            grey = not is_first
+
+            if has_ties:
+                if len(group) == 1:
+                    box = " "
+                elif is_first:
+                    box = "┳"
+                elif is_last:
+                    box = "┗"
+                else:
+                    box = "┣"
+                abs_prefix = f"{' ' * (w + 2)}┃ " if not is_last else f"{' ' * (w + 4)}"
+            else:
+                box = ""
+                abs_prefix = f"{' ' * (w + 2)}"
+
+            idx_str = typer.style(f"{idx:>{w}}.", fg=typer.colors.BRIGHT_BLACK) if grey else f"{idx:>{w}}."
+            if has_ties:
+                print(f"{idx_str} {box} {_format_clickable_id(p['id'])}  {p['title']} [{p['voters']}]")
+            else:
+                print(f"{idx_str} {_format_clickable_id(p['id'])}  {p['title']} [{p['voters']}]")
+
+            if abstract_lines:
+                wrapped = textwrap.wrap(p.get("abstract", ""), width=cfg.abstract_wrap)
+                shown = wrapped if abstract_lines < 0 else wrapped[:abstract_lines]
+                for al in shown:
+                    print(abs_prefix + al)
+
+            idx += 1
     return 0
 
 
@@ -1407,8 +1457,12 @@ def topvoted(
         "--branch",
         help="Git branch to read/write.",
     ),
+    abstract: int | None = typer.Option(
+        None, "--abstract",
+        help="Abstract lines to show (0=none, -1=full, N=first N). Defaults to config value.",
+    ),
 ) -> None:
-    _run_cmd(cmd_topvoted, N=n, repo=repo, branch=branch)
+    _run_cmd(cmd_topvoted, N=n, repo=repo, branch=branch, abstract=abstract)
 
 
 @app.command("record")
