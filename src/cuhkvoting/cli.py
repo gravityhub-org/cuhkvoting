@@ -29,6 +29,7 @@ import typer
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0"
 ARXIV_API = "https://export.arxiv.org/api/query"
 ARXIV_ABS = "https://arxiv.org/abs/"
+ARXIV_FOUNDING_DATE = dt.date(1991, 8, 14)
 INSPIRE_API = "https://inspirehep.net/api/literature"
 DEFAULT_REPO = "gravityhub-org/cuhkvoting-records"
 VOTE_EXPIRY_DAYS = 183
@@ -116,8 +117,11 @@ def _load_config() -> Config:
                 highlight_keyword_count=int(hl_cfg.get("keyword_count", DEFAULT_HIGHLIGHT_KEYWORD_COUNT)),
                 highlight_glyph=str(hl_cfg.get("glyph", DEFAULT_HIGHLIGHT_GLYPH)),
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            typer.echo(
+                typer.style(f"Warning: could not parse {CONFIG_PATH}: {exc}", fg=typer.colors.YELLOW),
+                err=True,
+            )
     return Config(
         categories=DEFAULT_CATEGORIES,
         today_max_age=DEFAULT_TODAY_MAX_AGE,
@@ -145,45 +149,17 @@ def _http_json(url: str, headers: dict[str, str] | None = None) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _http_put_json(url: str, payload: dict, headers: dict[str, str] | None = None) -> dict:
+def _http_json_request(
+    url: str,
+    method: str,
+    payload: dict,
+    headers: dict[str, str] | None = None,
+) -> dict:
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
         headers=headers or {},
-        method="PUT",
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-def _http_delete_json(url: str, payload: dict, headers: dict[str, str] | None = None) -> dict:
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers=headers or {},
-        method="DELETE",
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-def _http_post_json(url: str, payload: dict, headers: dict[str, str] | None = None) -> dict:
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers=headers or {},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-def _http_patch_json(url: str, payload: dict, headers: dict[str, str] | None = None) -> dict:
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers=headers or {},
-        method="PATCH",
+        method=method,
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode("utf-8"))
@@ -363,7 +339,7 @@ def _save_paper_via_api(
     }
     if sha:
         payload["sha"] = sha
-    _http_put_json(url, payload, headers=_github_headers(token))
+    _http_json_request(url, "PUT", payload, headers=_github_headers(token))
 
 
 def _save_json_via_api(cfg: RepoConfig, path: str, body: dict, sha: str | None, token: str, message: str) -> None:
@@ -373,7 +349,7 @@ def _save_json_via_api(cfg: RepoConfig, path: str, body: dict, sha: str | None, 
 def _delete_paper_via_api(cfg: RepoConfig, path: str, sha: str, token: str, message: str) -> None:
     url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/contents/{path}"
     payload = {"message": message, "branch": cfg.branch, "sha": sha}
-    _http_delete_json(url, payload, headers=_github_headers(token))
+    _http_json_request(url, "DELETE", payload, headers=_github_headers(token))
 
 
 def _load_jc_records(cfg: RepoConfig, token: str | None) -> tuple[list[dict], str | None]:
@@ -382,7 +358,7 @@ def _load_jc_records(cfg: RepoConfig, token: str | None) -> tuple[list[dict], st
         records = data.get("records", [])
         return (records if isinstance(records, list) else []), sha
     if _has_github_ssh_access():
-        clone_dir, cleanup_dir = _with_repo_checkout(cfg)
+        clone_dir = _with_repo_checkout(cfg)
         try:
             p = Path(clone_dir) / JC_RECORD_PATH
             if p.exists():
@@ -390,7 +366,7 @@ def _load_jc_records(cfg: RepoConfig, token: str | None) -> tuple[list[dict], st
                 records = body.get("records", [])
                 return (records if isinstance(records, list) else []), None
         finally:
-            shutil.rmtree(cleanup_dir, ignore_errors=True)
+            shutil.rmtree(clone_dir, ignore_errors=True)
     return [], None
 
 
@@ -401,7 +377,7 @@ def _save_jc_records(cfg: RepoConfig, token: str | None, user: str, records: lis
         return
     if not _has_github_ssh_access():
         raise SystemExit(f"Writing records needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure SSH key.\n\n{_ssh_setup_instructions()}")
-    clone_dir, cleanup_dir = _with_repo_checkout(cfg)
+    clone_dir = _with_repo_checkout(cfg)
     try:
         p = Path(clone_dir) / JC_RECORD_PATH
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -411,7 +387,7 @@ def _save_jc_records(cfg: RepoConfig, token: str | None, user: str, records: lis
         _run_git(["commit", "-m", message], cwd=clone_dir)
         _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
     finally:
-        shutil.rmtree(cleanup_dir, ignore_errors=True)
+        shutil.rmtree(clone_dir, ignore_errors=True)
 
 
 def _list_papers_via_graphql(cfg: RepoConfig, token: str) -> list[dict]:
@@ -453,7 +429,8 @@ def _list_papers_via_api(cfg: RepoConfig, token: str | None) -> list[dict]:
     if token:
         try:
             return _list_papers_via_graphql(cfg, token)
-        except Exception:
+        except (urllib.error.HTTPError, urllib.error.URLError,
+                json.JSONDecodeError, KeyError, RuntimeError):
             pass
     url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/git/trees/{cfg.branch}?recursive=1"
     try:
@@ -681,30 +658,42 @@ def _format_author_lastnames_highlighted(
     return ", ".join(parts)
 
 
+_RE_CACHE: dict[str, re.Pattern | None] = {}
+
+
+def _get_re(pattern: str) -> re.Pattern | None:
+    if pattern not in _RE_CACHE:
+        try:
+            _RE_CACHE[pattern] = re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            _RE_CACHE[pattern] = None
+    return _RE_CACHE[pattern]
+
+
 def _find_keyword_matches(texts: list[str], keywords: list[str]) -> list[str]:
     seen_lower: set[str] = set()
     results: list[str] = []
     for pattern in keywords:
-        try:
-            for text in texts:
-                for m in re.finditer(pattern, text, re.IGNORECASE):
-                    word = m.group(0)
-                    if word.lower() not in seen_lower:
-                        seen_lower.add(word.lower())
-                        results.append(word)
-        except re.error:
-            pass
+        rx = _get_re(pattern)
+        if rx is None:
+            continue
+        for text in texts:
+            for m in rx.finditer(text):
+                word = m.group(0)
+                if word.lower() not in seen_lower:
+                    seen_lower.add(word.lower())
+                    results.append(word)
     return results
 
 
 def _highlight_text(text: str, keywords: list[str]) -> str:
     spans: list[tuple[int, int]] = []
     for pattern in keywords:
-        try:
-            for m in re.finditer(pattern, text, re.IGNORECASE):
-                spans.append((m.start(), m.end()))
-        except re.error:
-            pass
+        rx = _get_re(pattern)
+        if rx is None:
+            continue
+        for m in rx.finditer(text):
+            spans.append((m.start(), m.end()))
     for start, end in sorted(spans, reverse=True):
         text = text[:start] + typer.style(text[start:end], fg=typer.colors.BRIGHT_BLUE, bold=True) + text[end:]
     return text
@@ -780,7 +769,7 @@ def _entry_in_date_spans(entry: dict, spans: list[tuple[dt.date, dt.date]]) -> b
     try:
         d = dt.date.fromisoformat(pub)
     except ValueError:
-        return True
+        return False
     return any(s <= d <= e for s, e in spans)
 
 
@@ -847,7 +836,7 @@ def _load_vote_paper(cfg: RepoConfig, token: str | None, paper_id: str) -> tuple
         if legacy_paper is not None and legacy_path is not None:
             paper, sha, save_path = legacy_paper, legacy_sha, legacy_path
     if paper is None and token is None and _has_github_ssh_access():
-        clone_dir, cleanup_dir = _with_repo_checkout(cfg)
+        clone_dir = _with_repo_checkout(cfg)
         try:
             paper_file = Path(clone_dir) / path
             if paper_file.exists():
@@ -865,7 +854,7 @@ def _load_vote_paper(cfg: RepoConfig, token: str | None, paper_id: str) -> tuple
                             save_path = str(cand.relative_to(clone_dir))
                             break
         finally:
-            shutil.rmtree(cleanup_dir, ignore_errors=True)
+            shutil.rmtree(clone_dir, ignore_errors=True)
     return paper, sha, save_path
 
 
@@ -883,7 +872,7 @@ def _save_vote_paper(
         return
     if not _has_github_ssh_access():
         raise SystemExit(f"Voting needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure SSH key.\n\n{_ssh_setup_instructions()}")
-    clone_dir, cleanup_dir = _with_repo_checkout(cfg)
+    clone_dir = _with_repo_checkout(cfg)
     try:
         paper_file = Path(clone_dir) / save_path
         paper_file.parent.mkdir(parents=True, exist_ok=True)
@@ -893,7 +882,7 @@ def _save_vote_paper(
         _run_git(["commit", "-m", message], cwd=clone_dir)
         _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
     finally:
-        shutil.rmtree(cleanup_dir, ignore_errors=True)
+        shutil.rmtree(clone_dir, ignore_errors=True)
 
 
 def _delete_vote_paper(
@@ -911,7 +900,7 @@ def _delete_vote_paper(
         return
     if not _has_github_ssh_access():
         raise SystemExit(f"Voting needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure SSH key.\n\n{_ssh_setup_instructions()}")
-    clone_dir, cleanup_dir = _with_repo_checkout(cfg)
+    clone_dir = _with_repo_checkout(cfg)
     try:
         paper_file = Path(clone_dir) / save_path
         if not paper_file.exists():
@@ -921,7 +910,7 @@ def _delete_vote_paper(
         _run_git(["commit", "-m", message], cwd=clone_dir)
         _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
     finally:
-        shutil.rmtree(cleanup_dir, ignore_errors=True)
+        shutil.rmtree(clone_dir, ignore_errors=True)
 
 
 def _validate_arxiv_entry(paper_id: str) -> dict:
@@ -931,20 +920,24 @@ def _validate_arxiv_entry(paper_id: str) -> dict:
     return entries[0]
 
 
-def _with_repo_checkout(cfg: RepoConfig) -> tuple[str, str]:
+def _with_repo_checkout(cfg: RepoConfig) -> str:
     tmpdir = tempfile.mkdtemp(prefix="cuhkvoting-")
     try:
         _run_git(["clone", "--depth", "1", "--branch", cfg.branch, cfg.ssh_clone_url, tmpdir])
-        return tmpdir, tmpdir
+        return tmpdir
     except SystemExit:
         shutil.rmtree(tmpdir, ignore_errors=True)
         tmpdir = tempfile.mkdtemp(prefix="cuhkvoting-")
-        _run_git(["clone", "--depth", "1", cfg.ssh_clone_url, tmpdir])
         try:
-            _run_git(["checkout", cfg.branch], cwd=tmpdir)
+            _run_git(["clone", "--depth", "1", cfg.ssh_clone_url, tmpdir])
+            try:
+                _run_git(["checkout", cfg.branch], cwd=tmpdir)
+            except SystemExit:
+                _run_git(["checkout", "-b", cfg.branch], cwd=tmpdir)
+            return tmpdir
         except SystemExit:
-            _run_git(["checkout", "-b", cfg.branch], cwd=tmpdir)
-    return tmpdir, tmpdir
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            raise
 
 
 def _ensure_commit_identity(repo_dir: str, user: str) -> None:
@@ -1160,9 +1153,69 @@ def _fetch_daterange_entries(start: dt.date, end: dt.date, categories: list[str]
     })
 
 
+def _parse_categories(args_category: list[str] | None, default: list[str]) -> list[str]:
+    if args_category:
+        return [c.strip() for item in args_category for c in item.split(",")]
+    return default
+
+
+def _format_kw_suffix(matches: list[str], count: int, glyph: str) -> str:
+    if not matches:
+        return ""
+    if count == 0:
+        return typer.style(f" {glyph} × {len(matches)}", fg=typer.colors.BRIGHT_BLUE, bold=True)
+    shown = matches if count < 0 else matches[:count]
+    parts = ", ".join(shown)
+    if count >= 1 and len(matches) > count:
+        parts += f", {len(matches) - count}+"
+    return typer.style(f" [{parts}]", fg=typer.colors.BRIGHT_BLUE, bold=True)
+
+
+def _apply_keyword_highlights(abstract: str, keywords: list[str]) -> str:
+    lines_out = []
+    for line in abstract.splitlines():
+        indent = len(line) - len(line.lstrip())
+        lines_out.append(line[:indent] + _highlight_text(line[indent:], keywords))
+    return "\n".join(lines_out)
+
+
+def _update_dn_table(dn_table: dict, user: str, display_name: str) -> bool:
+    if display_name:
+        if dn_table.get(user) != display_name:
+            dn_table[user] = display_name
+            return True
+    elif user in dn_table:
+        del dn_table[user]
+        return True
+    return False
+
+
+def _print_entry_list(
+    entries: list[dict],
+    cfg: Config,
+    abstract_lines: int,
+    highlight_kw_count: int,
+) -> None:
+    for idx, p in enumerate(entries, 1):
+        authors = p.get("authors", [])
+        lastnames = _format_author_lastnames_highlighted(authors, 3, cfg.highlight_authors)
+        title = p.get("title", "")
+        abstract_text = p.get("abstract", "")
+        kw_suffix = ""
+        if cfg.highlight_keywords:
+            matches = _find_keyword_matches([title, abstract_text], cfg.highlight_keywords)
+            kw_suffix = _format_kw_suffix(matches, highlight_kw_count, cfg.highlight_glyph)
+        print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {title}  [{lastnames}]{kw_suffix}")
+        abstract = _format_abstract(abstract_text, abstract_lines, cfg.abstract_wrap)
+        if abstract and cfg.highlight_keywords:
+            abstract = _apply_keyword_highlights(abstract, cfg.highlight_keywords)
+        if abstract:
+            print(abstract)
+
+
 def cmd_today(args: SimpleNamespace) -> int:
     cfg = _load_config()
-    categories = [c.strip() for item in args.category for c in item.split(",")] if getattr(args, "category", None) else cfg.categories
+    categories = _parse_categories(getattr(args, "category", None), cfg.categories)
     max_age_minutes = getattr(args, "max_age", None)
     max_age_seconds = (int(max_age_minutes) if max_age_minutes is not None else cfg.today_max_age) * 60
     abstract_lines = getattr(args, "abstract", None)
@@ -1181,36 +1234,7 @@ def cmd_today(args: SimpleNamespace) -> int:
     highlight_kw_count = getattr(args, "highlight_keywords", None)
     if highlight_kw_count is None:
         highlight_kw_count = cfg.highlight_keyword_count
-    for idx, p in enumerate(displayed, 1):
-        authors = p.get("authors", [])
-        lastnames = _format_author_lastnames_highlighted(authors, 3, cfg.highlight_authors)
-        title = p.get("title", "")
-        abstract_text = p.get("abstract", "")
-        kw_suffix = ""
-        if cfg.highlight_keywords:
-            matches = _find_keyword_matches([title, abstract_text], cfg.highlight_keywords)
-            if matches:
-                if highlight_kw_count == 0:
-                    kw_suffix = typer.style(f" {cfg.highlight_glyph} × {len(matches)}", fg=typer.colors.BRIGHT_BLUE, bold=True)
-                else:
-                    if highlight_kw_count < 0:
-                        shown = matches
-                    else:
-                        shown = matches[:highlight_kw_count]
-                    parts = ", ".join(shown)
-                    if highlight_kw_count >= 1 and len(matches) > highlight_kw_count:
-                        parts += f", {len(matches) - highlight_kw_count}+"
-                    kw_suffix = typer.style(f" [{parts}]", fg=typer.colors.BRIGHT_BLUE, bold=True)
-        print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {title}  [{lastnames}]{kw_suffix}")
-        abstract = _format_abstract(abstract_text, abstract_lines, cfg.abstract_wrap)
-        if abstract and cfg.highlight_keywords:
-            lines_out = []
-            for line in abstract.splitlines():
-                indent = len(line) - len(line.lstrip())
-                lines_out.append(line[:indent] + _highlight_text(line[indent:], cfg.highlight_keywords))
-            abstract = "\n".join(lines_out)
-        if abstract:
-            print(abstract)
+    _print_entry_list(displayed, cfg, abstract_lines, highlight_kw_count)
     return 0
 
 
@@ -1236,7 +1260,7 @@ def cmd_search(args: SimpleNamespace) -> int:
 
 def cmd_lastweek(args: SimpleNamespace) -> int:
     cfg = _load_config()
-    categories = [c.strip() for item in args.category for c in item.split(",")] if getattr(args, "category", None) else cfg.categories
+    categories = _parse_categories(getattr(args, "category", None), cfg.categories)
     max_age_minutes = getattr(args, "max_age", None)
     max_age_seconds = (int(max_age_minutes) if max_age_minutes is not None else cfg.lastweek_max_age) * 60
     entries = _resolve_cache("lastweek", categories, max_age_seconds, _fetch_lastweek_entries)
@@ -1268,36 +1292,7 @@ def cmd_lastweek(args: SimpleNamespace) -> int:
     highlight_kw_count = getattr(args, "highlight_keywords", None)
     if highlight_kw_count is None:
         highlight_kw_count = cfg.highlight_keyword_count
-    for idx, p in enumerate(displayed, 1):
-        authors = p.get("authors", [])
-        lastnames = _format_author_lastnames_highlighted(authors, 3, cfg.highlight_authors)
-        title = p.get("title", "")
-        abstract_text = p.get("abstract", "")
-        kw_suffix = ""
-        if cfg.highlight_keywords:
-            matches = _find_keyword_matches([title, abstract_text], cfg.highlight_keywords)
-            if matches:
-                if highlight_kw_count == 0:
-                    kw_suffix = typer.style(f" {cfg.highlight_glyph} × {len(matches)}", fg=typer.colors.BRIGHT_BLUE, bold=True)
-                else:
-                    if highlight_kw_count < 0:
-                        shown = matches
-                    else:
-                        shown = matches[:highlight_kw_count]
-                    parts = ", ".join(shown)
-                    if highlight_kw_count >= 1 and len(matches) > highlight_kw_count:
-                        parts += f", {len(matches) - highlight_kw_count}+"
-                    kw_suffix = typer.style(f" [{parts}]", fg=typer.colors.BRIGHT_BLUE, bold=True)
-        print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {title}  [{lastnames}]{kw_suffix}")
-        abstract = _format_abstract(abstract_text, abstract_lines, cfg.abstract_wrap)
-        if abstract and cfg.highlight_keywords:
-            lines_out = []
-            for line in abstract.splitlines():
-                indent = len(line) - len(line.lstrip())
-                lines_out.append(line[:indent] + _highlight_text(line[indent:], cfg.highlight_keywords))
-            abstract = "\n".join(lines_out)
-        if abstract:
-            print(abstract)
+    _print_entry_list(displayed, cfg, abstract_lines, highlight_kw_count)
     return 0
 
 
@@ -1307,7 +1302,7 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
     token = _get_token()
     papers = _list_papers_via_api(repo_cfg, token)
     if not papers and _has_github_ssh_access():
-        clone_dir, cleanup_dir = _with_repo_checkout(repo_cfg)
+        clone_dir = _with_repo_checkout(repo_cfg)
         try:
             papers_dir = Path(clone_dir) / "papers"
             for path in sorted(papers_dir.glob("*.json")) if papers_dir.exists() else []:
@@ -1316,7 +1311,7 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
                 except Exception:
                     continue
         finally:
-            shutil.rmtree(cleanup_dir, ignore_errors=True)
+            shutil.rmtree(clone_dir, ignore_errors=True)
 
     dn_table = _fetch_display_names(repo_cfg, token)
     rows = []
@@ -1326,7 +1321,7 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
             continue
         votes = paper.get("votes", [])
         vote_count = len(votes)
-        if vote_count <= 0:
+        if vote_count == 0:
             continue
         rows.append(
             {
@@ -1413,25 +1408,13 @@ def cmd_show(args: SimpleNamespace) -> int:
         kw_suffix = ""
         if cfg.highlight_keywords:
             matches = _find_keyword_matches([title, abstract_text], cfg.highlight_keywords)
-            if matches:
-                if cfg.highlight_keyword_count == 0:
-                    kw_suffix = typer.style(f" {cfg.highlight_glyph} × {len(matches)}", fg=typer.colors.BRIGHT_BLUE, bold=True)
-                else:
-                    shown_kw = matches if cfg.highlight_keyword_count < 0 else matches[:cfg.highlight_keyword_count]
-                    parts = ", ".join(shown_kw)
-                    if cfg.highlight_keyword_count >= 1 and len(matches) > cfg.highlight_keyword_count:
-                        parts += f", {len(matches) - cfg.highlight_keyword_count}+"
-                    kw_suffix = typer.style(f" [{parts}]", fg=typer.colors.BRIGHT_BLUE, bold=True)
+            kw_suffix = _format_kw_suffix(matches, cfg.highlight_keyword_count, cfg.highlight_glyph)
         if i > 0:
             print()
         print(f"{_format_clickable_id(arxiv_id)}  {title}  [{lastnames}]{kw_suffix}")
         abstract = _format_abstract(abstract_text, -1, cfg.abstract_wrap)
         if abstract and cfg.highlight_keywords:
-            lines_out = []
-            for line in abstract.splitlines():
-                indent = len(line) - len(line.lstrip())
-                lines_out.append(line[:indent] + _highlight_text(line[indent:], cfg.highlight_keywords))
-            abstract = "\n".join(lines_out)
+            abstract = _apply_keyword_highlights(abstract, cfg.highlight_keywords)
         if abstract:
             print(abstract)
     return 0
@@ -1446,15 +1429,11 @@ def cmd_show_date(args: SimpleNamespace) -> int:
     today = dt.date.today()
     if end > today:
         raise SystemExit("Date is in the future.")
-    if start < dt.date(1991, 8, 14):
+    if start < ARXIV_FOUNDING_DATE:
         raise SystemExit("arXiv was founded on 1991-08-14.")
 
     cfg = _load_config()
-    categories = (
-        [c.strip() for item in args.categories for c in item.split(",")]
-        if getattr(args, "categories", None)
-        else cfg.categories
-    )
+    categories = _parse_categories(getattr(args, "categories", None), cfg.categories)
     abstract_lines = getattr(args, "abstract", None)
     if abstract_lines is None:
         abstract_lines = cfg.abstract_lines
@@ -1484,33 +1463,7 @@ def cmd_show_date(args: SimpleNamespace) -> int:
     highlight_kw_count = getattr(args, "highlight_keywords", None)
     if highlight_kw_count is None:
         highlight_kw_count = cfg.highlight_keyword_count
-    for idx, p in enumerate(displayed, 1):
-        authors = p.get("authors", [])
-        lastnames = _format_author_lastnames_highlighted(authors, 3, cfg.highlight_authors)
-        title = p.get("title", "")
-        abstract_text = p.get("abstract", "")
-        kw_suffix = ""
-        if cfg.highlight_keywords:
-            matches = _find_keyword_matches([title, abstract_text], cfg.highlight_keywords)
-            if matches:
-                if highlight_kw_count == 0:
-                    kw_suffix = typer.style(f" {cfg.highlight_glyph} × {len(matches)}", fg=typer.colors.BRIGHT_BLUE, bold=True)
-                else:
-                    shown = matches if highlight_kw_count < 0 else matches[:highlight_kw_count]
-                    parts = ", ".join(shown)
-                    if highlight_kw_count >= 1 and len(matches) > highlight_kw_count:
-                        parts += f", {len(matches) - highlight_kw_count}+"
-                    kw_suffix = typer.style(f" [{parts}]", fg=typer.colors.BRIGHT_BLUE, bold=True)
-        print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {title}  [{lastnames}]{kw_suffix}")
-        abstract = _format_abstract(abstract_text, abstract_lines, cfg.abstract_wrap)
-        if abstract and cfg.highlight_keywords:
-            lines_out = []
-            for line in abstract.splitlines():
-                indent = len(line) - len(line.lstrip())
-                lines_out.append(line[:indent] + _highlight_text(line[indent:], cfg.highlight_keywords))
-            abstract = "\n".join(lines_out)
-        if abstract:
-            print(abstract)
+    _print_entry_list(displayed, cfg, abstract_lines, highlight_kw_count)
     return 0
 
 
@@ -1527,7 +1480,7 @@ def _batch_vote_papers_ssh(
     """
     if not papers:
         return []
-    clone_dir, cleanup_dir = _with_repo_checkout(cfg)
+    clone_dir = _with_repo_checkout(cfg)
     voted: list[str] = []
     new_votes: list[str] = []
     try:
@@ -1567,14 +1520,7 @@ def _batch_vote_papers_ssh(
                 dn_table = json.loads(dn_file.read_text(encoding="utf-8"))
             except Exception:
                 pass
-        dn_changed = False
-        if display_name:
-            if dn_table.get(user) != display_name:
-                dn_table[user] = display_name
-                dn_changed = True
-        elif user in dn_table:
-            del dn_table[user]
-            dn_changed = True
+        dn_changed = _update_dn_table(dn_table, user, display_name)
         if dn_changed:
             dn_file.write_text(json.dumps(dn_table, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -1592,7 +1538,7 @@ def _batch_vote_papers_ssh(
             _run_git(["commit", "-m", msg], cwd=clone_dir)
             _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
     finally:
-        shutil.rmtree(cleanup_dir, ignore_errors=True)
+        shutil.rmtree(clone_dir, ignore_errors=True)
     return voted
 
 
@@ -1614,19 +1560,22 @@ def _git_batch_commit(
             f"{base_url}/git/commits/{head_sha}", headers=_github_headers(token)
         )
         base_tree_sha = commit_data["tree"]["sha"]
-        tree_resp = _http_post_json(
+        tree_resp = _http_json_request(
             f"{base_url}/git/trees",
+            "POST",
             {"base_tree": base_tree_sha, "tree": tree_entries},
             headers=json_headers,
         )
-        commit_resp = _http_post_json(
+        commit_resp = _http_json_request(
             f"{base_url}/git/commits",
+            "POST",
             {"message": commit_msg, "tree": tree_resp["sha"], "parents": [head_sha]},
             headers=json_headers,
         )
         try:
-            _http_patch_json(
+            _http_json_request(
                 f"{base_url}/git/refs/heads/{branch}",
+                "PATCH",
                 {"sha": commit_resp["sha"], "force": False},
                 headers=json_headers,
             )
@@ -1727,14 +1676,7 @@ def _batch_vote_papers_api(
             dn_table = json.loads(dn_text)
         except Exception:
             pass
-    dn_changed = False
-    if display_name:
-        if dn_table.get(user) != display_name:
-            dn_table[user] = display_name
-            dn_changed = True
-    elif user in dn_table:
-        del dn_table[user]
-        dn_changed = True
+    dn_changed = _update_dn_table(dn_table, user, display_name)
     if dn_changed:
         updates.append((DISPLAY_NAMES_PATH, "__dn__", dn_table))
 
@@ -1747,8 +1689,9 @@ def _batch_vote_papers_api(
         content = base64.b64encode(
             (json.dumps(paper, indent=2, sort_keys=True) + "\n").encode("utf-8")
         ).decode("ascii")
-        resp = _http_post_json(
+        resp = _http_json_request(
             f"{base_url}/git/blobs",
+            "POST",
             {"content": content, "encoding": "base64"},
             headers=json_headers,
         )
@@ -2069,7 +2012,7 @@ def select(
 def vote_command(
     action_or_paper: list[str] | None = typer.Argument(
         None,
-        help="One or more arXiv ids/urls OR action `remove <id>` (use top-level `select <id>`).",
+        help="One or more arXiv ids/urls OR action `remove <id>` (use `cuhkvoting select <id>`).",
     ),
     repo: str | None = typer.Option(
         None,
@@ -2137,15 +2080,19 @@ def vote_command(
             "url": f"{ARXIV_ABS}{arxiv_id}",
         })
 
-    if _has_github_ssh_access():
-        # One clone → write all files → single commit/push
-        _batch_vote_papers_ssh(repo_cfg, user, papers_meta, display_name)
-    elif token:
-        # One GraphQL read (per file) → parallel blob POSTs → single commit
-        # Avoids the O(N) legacy-paper scan that cmd_vote triggers for new papers
-        _batch_vote_papers_api(repo_cfg, token, user, papers_meta, display_name)
-    else:
-        raise SystemExit(f"Voting needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure SSH key.\n\n{_ssh_setup_instructions()}")
+    try:
+        if _has_github_ssh_access():
+            # One clone → write all files → single commit/push
+            _batch_vote_papers_ssh(repo_cfg, user, papers_meta, display_name)
+        elif token:
+            # One GraphQL read (per file) → parallel blob POSTs → single commit
+            # Avoids the O(N) legacy-paper scan that cmd_vote triggers for new papers
+            _batch_vote_papers_api(repo_cfg, token, user, papers_meta, display_name)
+        else:
+            raise SystemExit(f"Voting needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure SSH key.\n\n{_ssh_setup_instructions()}")
+    except RuntimeError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1)
     raise typer.Exit(code=0)
 
 
@@ -2293,7 +2240,7 @@ def admin_sanitize(
     typer.echo("Sanitizing: whitespace normalization, legacy display_name removal.")
 
     if _has_github_ssh_access():
-        clone_dir, cleanup_dir = _with_repo_checkout(cfg)
+        clone_dir = _with_repo_checkout(cfg)
         try:
             papers_dir = Path(clone_dir) / "papers"
             changed = 0
@@ -2323,7 +2270,7 @@ def admin_sanitize(
             _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
             typer.echo(f"Sanitized {changed} record(s).")
         finally:
-            shutil.rmtree(cleanup_dir, ignore_errors=True)
+            shutil.rmtree(clone_dir, ignore_errors=True)
         return
 
     if not token:
@@ -2379,8 +2326,8 @@ def admin_sanitize(
         content = base64.b64encode(
             (json.dumps(paper, indent=2, sort_keys=True) + "\n").encode("utf-8")
         ).decode("ascii")
-        resp = _http_post_json(
-            f"{base_url}/git/blobs", {"content": content, "encoding": "base64"}, headers=json_headers
+        resp = _http_json_request(
+            f"{base_url}/git/blobs", "POST", {"content": content, "encoding": "base64"}, headers=json_headers
         )
         return path, resp["sha"]
 

@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -33,12 +34,13 @@ try:
 except ImportError:
     _BS4_OK = False
 
+from cuhkvoting.cli import VOTE_EXPIRY_DAYS, _user_cache_dir, _user_config_dir
+
 BENTY_BASE = "https://www.benty-fields.com"
-CACHE_DIR = Path.home() / ".cache" / "cuhkvoting"
-SYNCED_PATH = CACHE_DIR / "benty_synced.json"
+CACHE_DIR    = _user_cache_dir()
+SYNCED_PATH  = CACHE_DIR / "benty_synced.json"
 COOKIES_PATH = CACHE_DIR / "benty_cookies.json"
-CONFIG_PATH = Path.home() / ".config" / "cuhkvoting" / "config.toml"
-EXPIRY_DAYS = 183
+CONFIG_PATH  = _user_config_dir() / "config.toml"
 
 _PAPER_ID_PAT = re.compile(
     r"paper_id=([0-9]{4}\.[0-9]{4,5}(?:v\d+)?|[a-z\-]+/[0-9]{7})",
@@ -54,9 +56,12 @@ app = typer.Typer(help="Two-way sync between Benty-Fields and cuhkvoting.")
 
 def _cache_cookies_enabled() -> bool:
     if CONFIG_PATH.exists():
-        with open(CONFIG_PATH, "rb") as f:
-            cfg = tomllib.load(f)
-        return cfg.get("benty", {}).get("cache_cookies", True)
+        try:
+            with open(CONFIG_PATH, "rb") as f:
+                cfg = tomllib.load(f)
+            return cfg.get("benty", {}).get("cache_cookies", True)
+        except Exception:
+            pass
     return True
 
 
@@ -171,7 +176,11 @@ def _post_json(opener: urllib.request.OpenerDirector, url: str, payload: dict) -
         headers={"Content-Type": "application/json; charset=utf-8"},
     )
     with opener.open(req) as r:
-        return json.loads(r.read())
+        body = r.read()
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Unexpected non-JSON response from {url}: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +291,7 @@ def _get_cuhk_voted_ids(user: str) -> dict[str, dict]:
     papers = _list_papers_via_api(cfg, token)
 
     now = dt.datetime.now(dt.timezone.utc)
-    cutoff = now - dt.timedelta(days=EXPIRY_DAYS)
+    cutoff = now - dt.timedelta(days=VOTE_EXPIRY_DAYS)
 
     result: dict[str, dict] = {}
     for paper in papers:
@@ -315,7 +324,11 @@ def _get_cuhk_voted_ids(user: str) -> dict[str, dict]:
 def _load_synced() -> dict[str, dict]:
     if not SYNCED_PATH.exists():
         return {}
-    data = json.loads(SYNCED_PATH.read_text())
+    try:
+        data = json.loads(SYNCED_PATH.read_text())
+    except Exception as exc:
+        typer.echo(f"Warning: could not read synced cache ({exc}), starting fresh.", err=True)
+        return {}
     if isinstance(data, list):
         # Migrate from old list-of-IDs format
         return {arxiv_id: {"voted_at": None, "benty_vote_id": None} for arxiv_id in data}
@@ -341,10 +354,6 @@ def sync(
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview without making changes."),
     no_cache_cookies: bool = typer.Option(
         False, "--no-cache-cookies", help="Do not persist session cookies."
-    ),
-    dump_html: bool = typer.Option(
-        False, "--dump-html", help="Save manage_jc HTML to /tmp/manage_jc.html and exit.",
-        hidden=True,
     ),
 ) -> None:
     """Two-way sync between Benty-Fields manage_jc and cuhkvoting."""
@@ -377,7 +386,11 @@ def sync(
     opener = _make_opener(jar)
 
     if cookies_loaded:
-        html, final_url = _fetch_page(opener, f"{BENTY_BASE}/manage_jc")
+        try:
+            html, final_url = _fetch_page(opener, f"{BENTY_BASE}/manage_jc")
+        except (urllib.error.URLError, urllib.error.HTTPError) as exc:
+            typer.echo(f"Error fetching Benty-Fields page: {exc}", err=True)
+            raise typer.Exit(1)
         needs_login = "/login" in final_url
     else:
         needs_login = True
@@ -387,21 +400,19 @@ def sync(
         email, password = _get_credentials()
         try:
             _login(opener, email, password)
-        except RuntimeError as exc:
+        except (RuntimeError, urllib.error.URLError, urllib.error.HTTPError) as exc:
             typer.echo(f"Error: {exc}", err=True)
             raise typer.Exit(1)
-        html, final_url = _fetch_page(opener, f"{BENTY_BASE}/manage_jc")
+        try:
+            html, final_url = _fetch_page(opener, f"{BENTY_BASE}/manage_jc")
+        except (urllib.error.URLError, urllib.error.HTTPError) as exc:
+            typer.echo(f"Error fetching Benty-Fields page: {exc}", err=True)
+            raise typer.Exit(1)
         if "/login" in final_url:
             typer.echo("Error: could not access manage_jc after login.", err=True)
             raise typer.Exit(1)
         if cache_cookies:
             _save_cookies(jar)
-
-    if dump_html:
-        out = Path("/tmp/manage_jc.html")
-        out.write_text(html)
-        typer.echo(f"HTML saved to {out}")
-        return
 
     group_id = _extract_group_id(html)
     if not group_id:
@@ -412,8 +423,13 @@ def sync(
 
     # Collect state from both systems
     benty_papers = _extract_papers(html)
-    benty_voted_ids = {p["arxiv_id"] for p in benty_papers if p["user_voted"] and p["arxiv_id"]}
-    benty_by_id = {p["arxiv_id"]: p for p in benty_papers if p["arxiv_id"]}
+    benty_voted_ids: set[str] = set()
+    benty_by_id: dict[str, dict] = {}
+    for p in benty_papers:
+        if p["arxiv_id"]:
+            benty_by_id[p["arxiv_id"]] = p
+            if p["user_voted"]:
+                benty_voted_ids.add(p["arxiv_id"])
 
     for p in benty_papers:
         if p["arxiv_id"] is None:
@@ -435,7 +451,7 @@ def sync(
             meta["benty_vote_id"] = benty_by_id[arxiv_id].get("vote_id")
 
     now = dt.datetime.now(dt.timezone.utc)
-    cutoff = now - dt.timedelta(days=EXPIRY_DAYS)
+    cutoff = now - dt.timedelta(days=VOTE_EXPIRY_DAYS)
 
     # Compute what needs to change
     to_add_cuhk = [benty_by_id[i] for i in (benty_voted_ids - synced_ids)]
@@ -508,84 +524,57 @@ def sync(
         owner, repo_name = DEFAULT_REPO.split("/", 1)
         branch = os.getenv("CUHKVOTING_BRANCH", "main")
         repo_cfg = RepoConfig(owner=owner, repo=repo_name, branch=branch)
+        papers_meta = [
+            {"paper_id": p["arxiv_id"], "title": p.get("title") or "", "url": f"{ARXIV_ABS}{p['arxiv_id']}"}
+            for p in to_add_cuhk
+        ]
+        vote_id_by_arxiv = {p["arxiv_id"]: p.get("vote_id") for p in to_add_cuhk}
+        title_by_arxiv   = {p["arxiv_id"]: p.get("title") or "" for p in to_add_cuhk}
+        voted_ids: list[str] = []
         if _has_github_ssh_access():
-            # SSH path: one clone/commit/push for all papers (fast batch)
-            papers_meta = [
-                {
-                    "paper_id": p["arxiv_id"],
-                    "title": p.get("title") or "",
-                    "url": f"{ARXIV_ABS}{p['arxiv_id']}",
-                }
-                for p in to_add_cuhk
-            ]
-            vote_id_by_arxiv = {p["arxiv_id"]: p.get("vote_id") for p in to_add_cuhk}
             try:
                 voted_ids = _batch_vote_papers_ssh(repo_cfg, cuhk_user, papers_meta, display_name)
             except Exception as exc:
                 typer.echo(f"Batch SSH vote failed: {exc}", err=True)
                 ok = False
-                voted_ids = []
-            for arxiv_id in voted_ids:
-                title = next((p.get("title") or "" for p in to_add_cuhk if p["arxiv_id"] == arxiv_id), "")
-                synced[arxiv_id] = {
-                    "voted_at": ts_now,
-                    "benty_vote_id": vote_id_by_arxiv.get(arxiv_id),
-                    "title": title,
-                    "url": f"{ARXIV_ABS}{arxiv_id}",
-                }
         elif gh_token and len(to_add_cuhk) > 1:
-            # Token/API path with multiple papers: one commit for all (fast batch)
-            papers_meta = [
-                {
-                    "paper_id": p["arxiv_id"],
-                    "title": p.get("title") or "",
-                    "url": f"{ARXIV_ABS}{p['arxiv_id']}",
-                }
-                for p in to_add_cuhk
-            ]
-            vote_id_by_arxiv = {p["arxiv_id"]: p.get("vote_id") for p in to_add_cuhk}
             try:
                 voted_ids = _batch_vote_papers_api(repo_cfg, gh_token, cuhk_user, papers_meta, display_name)
             except Exception as exc:
                 typer.echo(f"Batch API vote failed: {exc}", err=True)
                 ok = False
-                voted_ids = []
-            for arxiv_id in voted_ids:
-                title = next((p.get("title") or "" for p in to_add_cuhk if p["arxiv_id"] == arxiv_id), "")
-                synced[arxiv_id] = {
-                    "voted_at": ts_now,
-                    "benty_vote_id": vote_id_by_arxiv.get(arxiv_id),
-                    "title": title,
-                    "url": f"{ARXIV_ABS}{arxiv_id}",
-                }
         else:
-            # Single paper or no token: fall back to per-paper vote
             for p in to_add_cuhk:
                 arxiv_id = p["arxiv_id"]
-                title = p.get("title") or ""
-                url = f"{ARXIV_ABS}{arxiv_id}"
                 try:
-                    code = _vote_paper_with_metadata(repo_cfg, gh_token, cuhk_user, arxiv_id, title, url, display_name)
-                except SystemExit as exc:
-                    typer.echo(f"cuhkvoting vote failed for {arxiv_id}: {exc}", err=True)
+                    _vote_paper_with_metadata(
+                        repo_cfg, gh_token, cuhk_user, arxiv_id,
+                        title_by_arxiv.get(arxiv_id, ""),
+                        f"{ARXIV_ABS}{arxiv_id}", display_name,
+                    )
+                except (SystemExit, RuntimeError) as exc:
+                    typer.echo(f"Vote failed for {arxiv_id}: {exc}", err=True)
                     ok = False
                     continue
-                if code == 0:
-                    synced[arxiv_id] = {
-                        "voted_at": ts_now,
-                        "benty_vote_id": p.get("vote_id"),
-                        "title": title,
-                        "url": url,
-                    }
+                voted_ids.append(arxiv_id)
+        for arxiv_id in voted_ids:
+            synced[arxiv_id] = {
+                "voted_at": ts_now,
+                "benty_vote_id": vote_id_by_arxiv.get(arxiv_id),
+                "title": title_by_arxiv.get(arxiv_id, ""),
+                "url": f"{ARXIV_ABS}{arxiv_id}",
+            }
 
     for arxiv_id in to_remove_cuhk:
         result = subprocess.run(
-            [sys.executable, "-m", "cuhkvoting", "vote", "remove", arxiv_id]
+            [sys.executable, "-m", "cuhkvoting", "vote", "remove", arxiv_id],
+            capture_output=True, text=True,
         )
         if result.returncode == 0:
             synced.pop(arxiv_id, None)
         else:
-            typer.echo(f"cuhkvoting vote remove failed for {arxiv_id}.", err=True)
+            msg = result.stderr.strip() or result.stdout.strip() or "(no output)"
+            typer.echo(f"cuhkvoting vote remove failed for {arxiv_id}: {msg}", err=True)
             ok = False
 
     if not group_id and to_add_benty:

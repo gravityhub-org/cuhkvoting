@@ -1,7 +1,7 @@
 [project]
 name = "cuhkvoting"
 version = "0.1.0"
-description = "Add your description here"
+description = "CLI to browse arXiv papers and vote on them, with records stored in GitHub."
 readme = "README.md"
 authors = [
     { name = "Otto Akseli Hannuksela", email = "otto.akseli.hannuksela@gmail.com" }
