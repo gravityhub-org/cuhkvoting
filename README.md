@@ -115,11 +115,19 @@ cuhkvoting lastweek --category gr-qc --category hep-th
 cuhkvoting show 2026-03-12 --category hep-th
 ```
 
-To change the default, set `categories` in the config file (see below).
+To change the default, set `categories` in the config file (see [Configuration file](#configuration-file)).
 
 ### Local cache
 
-`today`, `lastweek`, and `show` (date mode) cache results locally in `~/.cache/cuhkvoting/` to avoid hitting the arXiv API on every call, and thus avoid exceeding its limit rate.
+`today`, `lastweek`, and `show` (date mode) cache results locally to avoid hitting the arXiv API on every call, and thus avoid exceeding its limit rate.
+
+Cache location by platform:
+
+| Platform | Path |
+|----------|------|
+| Linux    | `~/.cache/cuhkvoting/` (or `$XDG_CACHE_HOME/cuhkvoting/`) |
+| macOS    | `~/Library/Caches/cuhkvoting/` |
+| Windows  | `%LOCALAPPDATA%\cuhkvoting\cache\` |
 
 Default cache lifetime: 60 min for `today`, 360 min for `lastweek`. Running `lastweek` also seeds the `today` cache from its results. Date-based results (`show DATE`) are cached permanently since past days don't change.
 
@@ -150,7 +158,15 @@ cuhkvoting today --abstract 0     # no abstract (default)
 
 ### Configuration file
 
-Generate a default config file at `~/.config/cuhkvoting/config.toml`:
+Config location by platform:
+
+| Platform | Path |
+|----------|------|
+| Linux    | `~/.config/cuhkvoting/config.toml` (or `$XDG_CONFIG_HOME/cuhkvoting/config.toml`) |
+| macOS    | `~/Library/Application Support/cuhkvoting/config.toml` |
+| Windows  | `%APPDATA%\cuhkvoting\config.toml` |
+
+Generate a default config file at that location:
 
 ```bash
 cuhkvoting init-config
@@ -193,7 +209,7 @@ If the file is absent, all settings fall back to the defaults shown above.
 
 Mark authors and keywords of interest so they stand out in `today`/`lastweek` listings.
 
-Configure in `~/.config/cuhkvoting/config.toml`:
+Configure in the config file (see [Configuration file](#configuration-file)):
 
 ```toml
 [highlights]
@@ -253,7 +269,7 @@ cuhkvoting-benty --no-cache-cookies  # skip cookie persistence
 
 Credentials are read from your git credential helper (e.g. libsecret / GNOME keyring) using `host=benty-fields.com`. If no stored credential is found, you are prompted interactively.
 
-Already-synced papers are tracked in `~/.cache/cuhkvoting/benty_synced.json` so they are not voted on twice.
+Already-synced papers are tracked in `benty_synced.json` inside the cache directory (see [Local cache](#local-cache)) so they are not voted on twice.
 
 Session cookies are cached by default to avoid re-logging-in on every run. Disable this per-run with `--no-cache-cookies`, or permanently via config:
 
