@@ -1566,7 +1566,6 @@ def cmd_vote_remove(args: SimpleNamespace) -> int:
     token = _get_token()
     user = _resolve_user(token)
     paper_id = _normalize_paper_id(args.paper_id)
-    _validate_arxiv_entry(paper_id)
     paper, sha, save_path = _load_vote_paper(cfg, token, paper_id)
     if paper is None:
         raise SystemExit(f"No vote record found for '{paper_id}'.")
@@ -1818,7 +1817,8 @@ def vote_command(
             return
         if len(action_or_paper) > 2:
             raise typer.BadParameter("Usage: cuhkvoting vote remove <id>")
-        _run_cmd(cmd_vote_remove, paper_id=action_or_paper[1], repo=repo, branch=branch)
+        resolved_remove = _resolve_paper_ids([action_or_paper[1]])
+        _run_cmd(cmd_vote_remove, paper_id=resolved_remove[0][0], repo=repo, branch=branch)
         return
     if action == "select":
         if len(action_or_paper) < 2:
