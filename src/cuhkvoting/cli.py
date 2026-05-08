@@ -1842,15 +1842,39 @@ def vote_command(
         typer.confirm("Proceed?", abort=True)
     token = _get_token()
     user = _resolve_user(token)
-    last_code = 0
-    total = len(resolved)
-    for i, (arxiv_id, _, _) in enumerate(resolved):
-        if total > 8 and i > 0 and i % 4 == 0:
-            time.sleep(2)
-        last_code = _invoke_cmd(cmd_vote, paper_id=arxiv_id, repo=repo, branch=branch, token=token, user=user)
-        if last_code != 0:
-            raise typer.Exit(code=last_code)
-    raise typer.Exit(code=last_code)
+    repo_cfg = _resolve_repo_config(SimpleNamespace(repo=repo, branch=branch))
+
+    # Resolve title/url for each paper from local cache, falling back to arXiv.
+    papers_meta: list[dict] = []
+    for arxiv_id, title, _ in resolved:
+        if not title:
+            cached = _lookup_local_cache(arxiv_id)
+            if cached:
+                title = cached.get("title", "")
+            else:
+                entry = _validate_arxiv_entry(arxiv_id)
+                title = entry.get("title", "")
+        papers_meta.append({
+            "paper_id": arxiv_id,
+            "title": title or "",
+            "url": f"{ARXIV_ABS}{arxiv_id}",
+        })
+
+    if _has_github_ssh_access():
+        # One clone → write all files → single commit/push
+        _batch_vote_papers_ssh(repo_cfg, user, papers_meta, display_name)
+    elif token:
+        if len(papers_meta) > 1:
+            # One GraphQL read → parallel blob POSTs → single commit
+            _batch_vote_papers_api(repo_cfg, token, user, papers_meta, display_name)
+        else:
+            # Single paper via token: existing per-file path is fine
+            p = papers_meta[0]
+            _invoke_cmd(cmd_vote, paper_id=p["paper_id"], repo=repo, branch=branch,
+                        token=token, user=user, display_name=display_name)
+    else:
+        raise SystemExit(f"Voting needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure SSH key.\n\n{_ssh_setup_instructions()}")
+    raise typer.Exit(code=0)
 
 
 @app.command("show")
