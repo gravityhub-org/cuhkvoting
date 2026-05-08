@@ -1629,6 +1629,96 @@ def admin_trash(
     _run_cmd(cmd_admin_trash, vote_id=vote_id, repo=repo, branch=branch)
 
 
+@admin_app.command("sanitize")
+def admin_sanitize(
+    repo: str | None = typer.Option(
+        None, "--repo",
+        help=f"GitHub repo owner/name. Only {DEFAULT_REPO} is accepted.",
+    ),
+    branch: str = typer.Option(
+        os.getenv("CUHKVOTING_BRANCH", "main"),
+        "--branch",
+        help="Git branch to read/write.",
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without writing."),
+) -> None:
+    """Normalize whitespace in title/abstract of all paper records."""
+    args = SimpleNamespace(repo=repo, branch=branch)
+    cfg = _resolve_repo_config(args)
+    token = _get_token()
+    user = _resolve_user(token)
+
+    if _has_github_ssh_access():
+        clone_dir, cleanup_dir = _with_repo_checkout(cfg)
+        try:
+            papers_dir = Path(clone_dir) / "papers"
+            changed = 0
+            for path in sorted(papers_dir.glob("*.json")) if papers_dir.exists() else []:
+                if path.name == "journal_club_records.json":
+                    continue
+                try:
+                    paper = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                new_title    = " ".join(paper.get("title",    "").split())
+                new_abstract = " ".join(paper.get("abstract", "").split())
+                if new_title == paper.get("title") and new_abstract == paper.get("abstract"):
+                    continue
+                typer.echo(f"  {path.name}")
+                if not dry_run:
+                    paper["title"]    = new_title
+                    paper["abstract"] = new_abstract
+                    path.write_text(json.dumps(paper, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                changed += 1
+            if changed == 0:
+                typer.echo("All records already clean.")
+                return
+            if dry_run:
+                typer.echo(f"Would sanitize {changed} record(s).")
+                return
+            _ensure_commit_identity(clone_dir, user)
+            _run_git(["add", "papers/"], cwd=clone_dir)
+            _run_git(["commit", "-m", f"sanitize: normalize whitespace in {changed} paper record(s)"], cwd=clone_dir)
+            _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
+            typer.echo(f"Sanitized {changed} record(s).")
+        finally:
+            shutil.rmtree(cleanup_dir, ignore_errors=True)
+        return
+
+    if not token:
+        raise SystemExit(f"Sanitize needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure SSH key.\n\n{_ssh_setup_instructions()}")
+
+    # API path: load tree, update changed files individually
+    url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/git/trees/{cfg.branch}?recursive=1"
+    data = _http_json(url, headers=_github_headers(token))
+    changed = 0
+    for obj in data.get("tree", []):
+        path = obj.get("path", "")
+        if obj.get("type") != "blob" or not path.startswith("papers/") or not path.endswith(".json"):
+            continue
+        if path == f"papers/journal_club_records.json":
+            continue
+        paper, sha = _load_paper_via_api(cfg, path, token)
+        if not paper or not sha:
+            continue
+        new_title    = " ".join(paper.get("title",    "").split())
+        new_abstract = " ".join(paper.get("abstract", "").split())
+        if new_title == paper.get("title") and new_abstract == paper.get("abstract"):
+            continue
+        typer.echo(f"  {path}")
+        changed += 1
+        if not dry_run:
+            paper["title"]    = new_title
+            paper["abstract"] = new_abstract
+            _save_paper_via_api(cfg, path, paper, sha, token, f"sanitize: normalize whitespace in {path}")
+    if changed == 0:
+        typer.echo("All records already clean.")
+    elif dry_run:
+        typer.echo(f"Would sanitize {changed} record(s).")
+    else:
+        typer.echo(f"Sanitized {changed} record(s).")
+
+
 app.add_typer(admin_app, name="admin")
 
 
