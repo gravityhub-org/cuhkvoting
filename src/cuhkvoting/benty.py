@@ -319,9 +319,11 @@ def _load_synced() -> dict[str, dict]:
     if isinstance(data, list):
         # Migrate from old list-of-IDs format
         return {arxiv_id: {"voted_at": None, "benty_vote_id": None} for arxiv_id in data}
-    # Backfill missing benty_vote_id key for entries written before this field existed
+    # Backfill missing keys for entries written before these fields existed
     for meta in data.values():
         meta.setdefault("benty_vote_id", None)
+        meta.setdefault("title", None)
+        meta.setdefault("url", None)
     return data
 
 
@@ -354,7 +356,10 @@ def sync(
         raise typer.Exit(1)
 
     # Resolve cuhkvoting user (GitHub username)
-    from cuhkvoting.cli import _get_token, _resolve_user  # noqa: PLC0415
+    from cuhkvoting.cli import (  # noqa: PLC0415
+        ARXIV_ABS, DEFAULT_REPO, RepoConfig,
+        _get_token, _resolve_user, _vote_paper_with_metadata,
+    )
     gh_token = _get_token()
     try:
         cuhk_user = _resolve_user(gh_token)
@@ -497,15 +502,26 @@ def sync(
     ts_now = now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     if to_add_cuhk:
-        result = subprocess.run(
-            [sys.executable, "-m", "cuhkvoting", "vote"] + [p["arxiv_id"] for p in to_add_cuhk]
-        )
-        if result.returncode == 0:
-            for p in to_add_cuhk:
-                synced[p["arxiv_id"]] = {"voted_at": ts_now, "benty_vote_id": p.get("vote_id")}
-        else:
-            typer.echo("cuhkvoting vote failed.", err=True)
-            ok = False
+        owner, repo_name = DEFAULT_REPO.split("/", 1)
+        branch = os.getenv("CUHKVOTING_BRANCH", "main")
+        repo_cfg = RepoConfig(owner=owner, repo=repo_name, branch=branch)
+        for p in to_add_cuhk:
+            arxiv_id = p["arxiv_id"]
+            title = p.get("title") or ""
+            url = f"{ARXIV_ABS}{arxiv_id}"
+            try:
+                code = _vote_paper_with_metadata(repo_cfg, gh_token, cuhk_user, arxiv_id, title, url)
+            except SystemExit as exc:
+                typer.echo(f"cuhkvoting vote failed for {arxiv_id}: {exc}", err=True)
+                ok = False
+                continue
+            if code == 0:
+                synced[arxiv_id] = {
+                    "voted_at": ts_now,
+                    "benty_vote_id": p.get("vote_id"),
+                    "title": title,
+                    "url": url,
+                }
 
     for arxiv_id in to_remove_cuhk:
         result = subprocess.run(
@@ -524,7 +540,12 @@ def sync(
         for arxiv_id in to_add_benty:
             try:
                 _benty_vote(opener, arxiv_id, group_id)  # type: ignore[arg-type]
-                synced[arxiv_id] = {"voted_at": cuhk_voted[arxiv_id].get("voted_at"), "benty_vote_id": None}
+                synced[arxiv_id] = {
+                    "voted_at": cuhk_voted[arxiv_id].get("voted_at"),
+                    "benty_vote_id": None,
+                    "title": cuhk_voted[arxiv_id].get("title") or "",
+                    "url": f"{ARXIV_ABS}{arxiv_id}",
+                }
             except RuntimeError as exc:
                 typer.echo(f"Benty-Fields vote failed for {arxiv_id}: {exc}", err=True)
                 ok = False

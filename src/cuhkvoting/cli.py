@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import textwrap
+import time
 import tomllib
 import urllib.error
 import urllib.parse
@@ -409,7 +410,18 @@ def _list_papers_via_api(cfg: RepoConfig, token: str | None) -> list[dict]:
 
 def _arxiv_query(params: dict[str, str]) -> list[dict[str, str]]:
     url = f"{ARXIV_API}?{urllib.parse.urlencode(params)}"
-    xml_str = _http_text(url, headers={"User-Agent": "cuhkvoting/0.1"})
+    delays = [10, 20, 60]
+    for attempt, delay in enumerate([-1] + delays):
+        if attempt > 0:
+            typer.echo(f"arXiv rate limit, retrying in {delay}s…", err=True)
+            time.sleep(delay)
+        try:
+            xml_str = _http_text(url, headers={"User-Agent": "cuhkvoting/0.1"})
+            break
+        except (ConnectionError, urllib.error.HTTPError) as e:
+            code = getattr(e, "code", None)
+            if attempt == len(delays) or (code is not None and code not in (429, 503)):
+                raise
     root = ET.fromstring(xml_str)
     ns = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
     entries: list[dict[str, str]] = []
@@ -856,6 +868,17 @@ def _save_cache(key: str, categories: list[str], entries: list[dict]) -> None:
     (CACHE_DIR / f"{key}.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+def _lookup_local_cache(paper_id: str) -> dict | None:
+    for key in ("today", "lastweek"):
+        data = _load_cache_data(key)
+        if not data:
+            continue
+        for entry in data.get("entries", []):
+            if _strip_arxiv_version(str(entry.get("id", ""))) == paper_id:
+                return entry
+    return None
+
+
 def _resolve_cache(
     key: str,
     categories: list[str],
@@ -1158,6 +1181,30 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
     return 0
 
 
+def _vote_paper_with_metadata(
+    cfg: RepoConfig,
+    token: str | None,
+    user: str,
+    paper_id: str,
+    title: str,
+    url: str,
+) -> int:
+    """Vote for a paper using pre-known metadata, skipping arXiv validation."""
+    paper, sha, save_path = _load_vote_paper(cfg, token, paper_id)
+    if paper is None:
+        paper = {"id": paper_id, "title": title, "abstract": "", "url": url, "votes": []}
+    _prune_expired_votes(paper)
+    votes = paper.setdefault("votes", [])
+    if any(v.get("user") == user for v in votes):
+        print(f"Already voted: {user} -> {paper_id}")
+        return 0
+    paper["id"] = _strip_arxiv_version(str(paper.get("id", paper_id)))
+    votes.append({"user": user, "voted_at": dt.datetime.utcnow().isoformat() + "Z"})
+    _save_vote_paper(cfg, token, user, paper, sha, save_path, f"vote: {user} -> {paper['id']}")
+    print(f"Vote recorded: {user} -> {paper['id']}")
+    return 0
+
+
 def cmd_vote(args: SimpleNamespace) -> int:
     cfg = _resolve_repo_config(args)
     token = getattr(args, "token", None) or _get_token()
@@ -1166,14 +1213,22 @@ def cmd_vote(args: SimpleNamespace) -> int:
     paper, sha, save_path = _load_vote_paper(cfg, token, paper_id)
 
     if paper is None:
-        entry = _validate_arxiv_entry(paper_id)
+        cached = _lookup_local_cache(paper_id)
+        entry = cached if cached else _validate_arxiv_entry(paper_id)
         paper = {
             "id": entry["id"],
-            "title": entry["title"],
-            "abstract": entry["abstract"],
-            "url": entry["url"],
+            "title": entry.get("title", ""),
+            "abstract": entry.get("abstract", ""),
+            "url": entry.get("url", f"{ARXIV_ABS}{paper_id}"),
             "votes": [],
         }
+    elif not paper.get("abstract"):
+        cached = _lookup_local_cache(paper_id)
+        if cached and cached.get("abstract"):
+            paper["abstract"] = cached["abstract"]
+        elif not cached:
+            entry = _validate_arxiv_entry(paper_id)
+            paper["abstract"] = entry.get("abstract", "")
 
     _prune_expired_votes(paper)
     votes = paper.setdefault("votes", [])
@@ -1465,7 +1520,10 @@ def vote_command(
     token = _get_token()
     user = _resolve_user(token)
     last_code = 0
-    for arxiv_id, _, _ in resolved:
+    total = len(resolved)
+    for i, (arxiv_id, _, _) in enumerate(resolved):
+        if total > 8 and i > 0 and i % 4 == 0:
+            time.sleep(2)
         last_code = _invoke_cmd(cmd_vote, paper_id=arxiv_id, repo=repo, branch=branch, token=token, user=user)
         if last_code != 0:
             raise typer.Exit(code=last_code)
