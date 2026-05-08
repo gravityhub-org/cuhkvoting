@@ -33,6 +33,7 @@ VOTE_EXPIRY_DAYS = 183
 JC_RECORD_PATH = "papers/journal_club_records.json"
 CACHE_DIR = Path.home() / ".cache" / "cuhkvoting"
 LAST_LIST_PATH = CACHE_DIR / "last_list.json"
+DISPLAY_NAME_CACHE = CACHE_DIR / "display_name.txt"
 CONFIG_PATH = Path.home() / ".config" / "cuhkvoting" / "config.toml"
 DEFAULT_CATEGORIES = ["gr-qc", "astro-ph.*"]
 DEFAULT_TODAY_MAX_AGE = 60
@@ -64,6 +65,7 @@ class Config:
     abstract_lines: int
     abstract_wrap: int
     confirm_by_number: bool
+    display_name: str
     highlight_authors: list[str]
     highlight_keywords: list[str]
     highlight_keyword_count: int
@@ -87,6 +89,7 @@ def _load_config() -> Config:
                 abstract_lines=int(display_cfg.get("abstract_lines", DEFAULT_ABSTRACT_LINES)),
                 abstract_wrap=int(display_cfg.get("abstract_wrap", DEFAULT_ABSTRACT_WRAP)),
                 confirm_by_number=bool(vote_cfg.get("confirm_by_number", True)),
+                display_name=str(vote_cfg.get("display_name", "")),
                 highlight_authors=list(hl_cfg.get("authors", DEFAULT_HIGHLIGHT_AUTHORS)),
                 highlight_keywords=list(hl_cfg.get("keywords", DEFAULT_HIGHLIGHT_KEYWORDS)),
                 highlight_keyword_count=int(hl_cfg.get("keyword_count", DEFAULT_HIGHLIGHT_KEYWORD_COUNT)),
@@ -101,6 +104,7 @@ def _load_config() -> Config:
         abstract_lines=DEFAULT_ABSTRACT_LINES,
         abstract_wrap=DEFAULT_ABSTRACT_WRAP,
         confirm_by_number=True,
+        display_name="",
         highlight_authors=DEFAULT_HIGHLIGHT_AUTHORS,
         highlight_keywords=DEFAULT_HIGHLIGHT_KEYWORDS,
         highlight_keyword_count=DEFAULT_HIGHLIGHT_KEYWORD_COUNT,
@@ -686,11 +690,18 @@ def _highlight_text(text: str, keywords: list[str]) -> str:
 
 
 def _format_voters(votes: list[dict]) -> str:
-    voters = [str(v.get("user", "")).strip() for v in votes]
+    voters = [str(v.get("display_name") or v.get("user", "")).strip() for v in votes]
     voters = [v for v in voters if v]
     if not voters:
         return "-"
     return ", ".join(sorted(set(voters), key=str.lower))
+
+
+def _make_vote_entry(user: str, display_name: str = "") -> dict:
+    entry: dict = {"user": user, "voted_at": dt.datetime.utcnow().isoformat() + "Z"}
+    if display_name:
+        entry["display_name"] = display_name
+    return entry
 
 
 def _filter_entries(entries: list[dict[str, str]], keywords: list[str] | None) -> list[dict[str, str]]:
@@ -969,6 +980,31 @@ def _save_last_list(entries: list[dict]) -> None:
         json.dumps([{"id": e["id"], "title": e.get("title", "")} for e in entries], indent=2),
         encoding="utf-8",
     )
+
+
+def _warn_if_display_name_changed(current: str) -> None:
+    """Warn once when display_name differs from the last recorded value."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    previous = DISPLAY_NAME_CACHE.read_text(encoding="utf-8").strip() if DISPLAY_NAME_CACHE.exists() else None
+    DISPLAY_NAME_CACHE.write_text(current, encoding="utf-8")
+    if previous is None or previous == current:
+        return
+    if previous:
+        typer.echo(
+            typer.style(
+                f"Note: display name changed ('{previous}' → '{current}'). "
+                "Run `cuhkvoting admin sanitize` to update existing vote records.",
+                fg=typer.colors.YELLOW,
+            )
+        )
+    else:
+        typer.echo(
+            typer.style(
+                f"Note: display name set to '{current}'. "
+                "Run `cuhkvoting admin sanitize` to apply it to existing vote records.",
+                fg=typer.colors.YELLOW,
+            )
+        )
 
 
 def _resolve_paper_ids(raw_ids: list[str]) -> list[tuple[str, str | None, int | None]]:
@@ -1316,6 +1352,7 @@ def _batch_vote_papers_ssh(
     cfg: RepoConfig,
     user: str,
     papers: list[dict],
+    display_name: str = "",
 ) -> list[str]:
     """Vote for multiple papers in a single clone/commit/push cycle.
 
@@ -1352,7 +1389,7 @@ def _batch_vote_papers_ssh(
                 voted.append(paper_id)
                 continue
             paper["id"] = paper_id
-            votes.append({"user": user, "voted_at": ts})
+            votes.append(_make_vote_entry(user, display_name))
             paper_file.write_text(json.dumps(paper, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             voted.append(paper_id)
             new_votes.append(paper_id)
@@ -1372,6 +1409,7 @@ def _batch_vote_papers_api(
     token: str,
     user: str,
     papers: list[dict],
+    display_name: str = "",
 ) -> list[str]:
     """Vote for multiple papers in a single Git commit via the GitHub Git Data API.
 
@@ -1436,7 +1474,7 @@ def _batch_vote_papers_api(
             continue
 
         paper["id"] = paper_id
-        votes.append({"user": user, "voted_at": ts})
+        votes.append(_make_vote_entry(user, display_name))
         updates.append((path, paper_id, paper))
         voted.append(paper_id)
 
@@ -1507,6 +1545,7 @@ def _vote_paper_with_metadata(
     paper_id: str,
     title: str,
     url: str,
+    display_name: str = "",
 ) -> int:
     """Vote for a paper using pre-known metadata, skipping arXiv validation."""
     paper, sha, save_path = _load_vote_paper(cfg, token, paper_id)
@@ -1518,13 +1557,15 @@ def _vote_paper_with_metadata(
         print(f"Already voted: {user} -> {paper_id}")
         return 0
     paper["id"] = _strip_arxiv_version(str(paper.get("id", paper_id)))
-    votes.append({"user": user, "voted_at": dt.datetime.utcnow().isoformat() + "Z"})
+    votes.append(_make_vote_entry(user, display_name))
     _save_vote_paper(cfg, token, user, paper, sha, save_path, f"vote: {user} -> {paper['id']}")
     print(f"Vote recorded: {user} -> {paper['id']}")
     return 0
 
 
 def cmd_vote(args: SimpleNamespace) -> int:
+    app_cfg = _load_config()
+    display_name = getattr(args, "display_name", None) or app_cfg.display_name
     cfg = _resolve_repo_config(args)
     token = getattr(args, "token", None) or _get_token()
     user = getattr(args, "user", None) or _resolve_user(token)
@@ -1555,7 +1596,7 @@ def cmd_vote(args: SimpleNamespace) -> int:
         raise SystemExit(f"User '{user}' already voted for {paper.get('id', paper_id)}.")
     paper_vote_id = _strip_arxiv_version(str(paper.get("id", paper_id)))
     paper["id"] = paper_vote_id
-    votes.append({"user": user, "voted_at": dt.datetime.utcnow().isoformat() + "Z"})
+    votes.append(_make_vote_entry(user, display_name))
     _save_vote_paper(cfg, token, user, paper, sha, save_path, f"vote: {user} -> {paper_vote_id}")
     print(f"Vote recorded: {user} -> {paper_vote_id}")
     return 0
@@ -1842,6 +1883,8 @@ def vote_command(
         typer.confirm("Proceed?", abort=True)
     token = _get_token()
     user = _resolve_user(token)
+    display_name = cfg.display_name
+    _warn_if_display_name_changed(display_name)
     last_code = 0
     total = len(resolved)
     for i, (arxiv_id, _, _) in enumerate(resolved):
@@ -1890,6 +1933,8 @@ def init_config(
         '[vote]\n'
         '# Show a confirmation prompt when voting by list index (e.g. cuhkvoting vote 3).\n'
         'confirm_by_number = true\n'
+        '# Human-readable name stored in vote records. GitHub username is used if empty.\n'
+        'display_name = ""\n'
         '\n'
         '[highlights]\n'
         '# Authors to highlight. Format: "Surname, Firstname" (case-insensitive).\n'
@@ -1945,11 +1990,46 @@ def admin_sanitize(
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview without writing."),
 ) -> None:
-    """Normalize whitespace in title/abstract of all paper records."""
+    """Normalize whitespace in title/abstract and update display names in paper records."""
     args = SimpleNamespace(repo=repo, branch=branch)
     cfg = _resolve_repo_config(args)
+    app_cfg = _load_config()
     token = _get_token()
     user = _resolve_user(token)
+    display_name = app_cfg.display_name
+
+    def _sanitize_paper(paper: dict) -> list[str]:
+        """Apply all sanitizations in-place; return list of change descriptions (empty = no change)."""
+        reasons: list[str] = []
+        new_title    = " ".join(paper.get("title",    "").split())
+        new_abstract = " ".join(paper.get("abstract", "").split())
+        if new_title != paper.get("title"):
+            paper["title"] = new_title
+            reasons.append("whitespace in title")
+        if new_abstract != paper.get("abstract"):
+            paper["abstract"] = new_abstract
+            reasons.append("whitespace in abstract")
+        for v in paper.get("votes", []):
+            if v.get("user") != user:
+                continue
+            if display_name:
+                if v.get("display_name") != display_name:
+                    old = v.get("display_name") or v["user"]
+                    v["display_name"] = display_name
+                    reasons.append(f"display name: '{old}' → '{display_name}'")
+            else:
+                if "display_name" in v:
+                    del v["display_name"]
+                    reasons.append("display name removed")
+        return reasons
+
+    # Describe what will be checked
+    checks = ["whitespace normalization"]
+    if display_name:
+        checks.append(f"display name sync ('{display_name}' for {user})")
+    else:
+        checks.append(f"display name cleanup for {user}")
+    typer.echo("Sanitizing: " + ", ".join(checks) + ".")
 
     if _has_github_ssh_access():
         clone_dir, cleanup_dir = _with_repo_checkout(cfg)
@@ -1963,14 +2043,11 @@ def admin_sanitize(
                     paper = json.loads(path.read_text(encoding="utf-8"))
                 except Exception:
                     continue
-                new_title    = " ".join(paper.get("title",    "").split())
-                new_abstract = " ".join(paper.get("abstract", "").split())
-                if new_title == paper.get("title") and new_abstract == paper.get("abstract"):
+                reasons = _sanitize_paper(paper)
+                if not reasons:
                     continue
-                typer.echo(f"  {path.name}")
+                typer.echo(f"  {path.name}  ({'; '.join(reasons)})")
                 if not dry_run:
-                    paper["title"]    = new_title
-                    paper["abstract"] = new_abstract
                     path.write_text(json.dumps(paper, indent=2, sort_keys=True) + "\n", encoding="utf-8")
                 changed += 1
             if changed == 0:
@@ -1981,7 +2058,7 @@ def admin_sanitize(
                 return
             _ensure_commit_identity(clone_dir, user)
             _run_git(["add", "papers/"], cwd=clone_dir)
-            _run_git(["commit", "-m", f"sanitize: normalize whitespace in {changed} paper record(s)"], cwd=clone_dir)
+            _run_git(["commit", "-m", f"sanitize: {changed} paper record(s)"], cwd=clone_dir)
             _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
             typer.echo(f"Sanitized {changed} record(s).")
         finally:
@@ -1999,21 +2076,18 @@ def admin_sanitize(
         path = obj.get("path", "")
         if obj.get("type") != "blob" or not path.startswith("papers/") or not path.endswith(".json"):
             continue
-        if path == f"papers/journal_club_records.json":
+        if path == "papers/journal_club_records.json":
             continue
         paper, sha = _load_paper_via_api(cfg, path, token)
         if not paper or not sha:
             continue
-        new_title    = " ".join(paper.get("title",    "").split())
-        new_abstract = " ".join(paper.get("abstract", "").split())
-        if new_title == paper.get("title") and new_abstract == paper.get("abstract"):
+        reasons = _sanitize_paper(paper)
+        if not reasons:
             continue
-        typer.echo(f"  {path}")
+        typer.echo(f"  {path}  ({'; '.join(reasons)})")
         changed += 1
         if not dry_run:
-            paper["title"]    = new_title
-            paper["abstract"] = new_abstract
-            _save_paper_via_api(cfg, path, paper, sha, token, f"sanitize: normalize whitespace in {path}")
+            _save_paper_via_api(cfg, path, paper, sha, token, f"sanitize: {path}")
     if changed == 0:
         typer.echo("All records already clean.")
     elif dry_run:
