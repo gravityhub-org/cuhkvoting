@@ -1907,14 +1907,9 @@ def vote_command(
         # One clone → write all files → single commit/push
         _batch_vote_papers_ssh(repo_cfg, user, papers_meta, display_name)
     elif token:
-        if len(papers_meta) > 1:
-            # One GraphQL read → parallel blob POSTs → single commit
-            _batch_vote_papers_api(repo_cfg, token, user, papers_meta, display_name)
-        else:
-            # Single paper via token: existing per-file path is fine
-            p = papers_meta[0]
-            _invoke_cmd(cmd_vote, paper_id=p["paper_id"], repo=repo, branch=branch,
-                        token=token, user=user, display_name=display_name)
+        # One GraphQL read (per file) → parallel blob POSTs → single commit
+        # Avoids the O(N) legacy-paper scan that cmd_vote triggers for new papers
+        _batch_vote_papers_api(repo_cfg, token, user, papers_meta, display_name)
     else:
         raise SystemExit(f"Voting needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure SSH key.\n\n{_ssh_setup_instructions()}")
     raise typer.Exit(code=0)
