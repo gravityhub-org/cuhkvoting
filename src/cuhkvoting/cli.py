@@ -34,6 +34,7 @@ JC_RECORD_PATH = "papers/journal_club_records.json"
 CACHE_DIR = Path.home() / ".cache" / "cuhkvoting"
 LAST_LIST_PATH = CACHE_DIR / "last_list.json"
 DISPLAY_NAME_CACHE = CACHE_DIR / "display_name.txt"
+DISPLAY_NAMES_PATH = "display_names.json"
 CONFIG_PATH = Path.home() / ".config" / "cuhkvoting" / "config.toml"
 DEFAULT_CATEGORIES = ["gr-qc", "astro-ph.*"]
 DEFAULT_TODAY_MAX_AGE = 60
@@ -689,19 +690,16 @@ def _highlight_text(text: str, keywords: list[str]) -> str:
     return text
 
 
-def _format_voters(votes: list[dict]) -> str:
-    voters = [str(v.get("display_name") or v.get("user", "")).strip() for v in votes]
+def _format_voters(votes: list[dict], table: dict[str, str] | None = None) -> str:
+    voters = [_resolve_display_name(str(v.get("user", "")).strip(), table or {}) for v in votes]
     voters = [v for v in voters if v]
     if not voters:
         return "-"
     return ", ".join(sorted(set(voters), key=str.lower))
 
 
-def _make_vote_entry(user: str, display_name: str = "") -> dict:
-    entry: dict = {"user": user, "voted_at": dt.datetime.utcnow().isoformat() + "Z"}
-    if display_name:
-        entry["display_name"] = display_name
-    return entry
+def _make_vote_entry(user: str) -> dict:
+    return {"user": user, "voted_at": dt.datetime.utcnow().isoformat() + "Z"}
 
 
 def _filter_entries(entries: list[dict[str, str]], keywords: list[str] | None) -> list[dict[str, str]]:
@@ -982,6 +980,21 @@ def _save_last_list(entries: list[dict]) -> None:
     )
 
 
+def _fetch_display_names(cfg: RepoConfig, token: str | None) -> dict[str, str]:
+    """Load the display_names.json table from the repo. Returns {} if absent."""
+    try:
+        data, _ = _load_paper_via_api(cfg, DISPLAY_NAMES_PATH, token)
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def _resolve_display_name(user: str, table: dict[str, str]) -> str:
+    return table.get(user) or user
+
+
 def _warn_if_display_name_changed(current: str) -> None:
     """Warn once when display_name differs from the last recorded value."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -993,7 +1006,7 @@ def _warn_if_display_name_changed(current: str) -> None:
         typer.echo(
             typer.style(
                 f"Note: display name changed ('{previous}' → '{current}'). "
-                "Run `cuhkvoting admin sanitize` to update existing vote records.",
+                "The shared table will be updated with your next vote.",
                 fg=typer.colors.YELLOW,
             )
         )
@@ -1001,7 +1014,7 @@ def _warn_if_display_name_changed(current: str) -> None:
         typer.echo(
             typer.style(
                 f"Note: display name set to '{current}'. "
-                "Run `cuhkvoting admin sanitize` to apply it to existing vote records.",
+                "The shared table will be updated with your next vote.",
                 fg=typer.colors.YELLOW,
             )
         )
@@ -1230,6 +1243,7 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
         finally:
             shutil.rmtree(cleanup_dir, ignore_errors=True)
 
+    dn_table = _fetch_display_names(repo_cfg, token)
     rows = []
     for paper in papers:
         _prune_expired_votes(paper)
@@ -1245,7 +1259,7 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
                 "title": " ".join(paper.get("title", "(no title)").split()),
                 "abstract": " ".join(paper.get("abstract", "").split()),
                 "votes": vote_count,
-                "voters": _format_voters(votes),
+                "voters": _format_voters(votes, dn_table),
             }
         )
     rows.sort(key=lambda p: (-p["votes"], p["id"]))
@@ -1389,19 +1403,91 @@ def _batch_vote_papers_ssh(
                 voted.append(paper_id)
                 continue
             paper["id"] = paper_id
-            votes.append(_make_vote_entry(user, display_name))
+            votes.append(_make_vote_entry(user))
             paper_file.write_text(json.dumps(paper, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             voted.append(paper_id)
             new_votes.append(paper_id)
-        if new_votes:
+        # Update display_names.json if the user's entry has changed
+        dn_file = Path(clone_dir) / DISPLAY_NAMES_PATH
+        dn_table: dict = {}
+        if dn_file.exists():
+            try:
+                dn_table = json.loads(dn_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        dn_changed = False
+        if display_name:
+            if dn_table.get(user) != display_name:
+                dn_table[user] = display_name
+                dn_changed = True
+        elif user in dn_table:
+            del dn_table[user]
+            dn_changed = True
+        if dn_changed:
+            dn_file.write_text(json.dumps(dn_table, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        if new_votes or dn_changed:
             _ensure_commit_identity(clone_dir, user)
-            _run_git(["add", "papers/"], cwd=clone_dir)
-            ids_str = ", ".join(new_votes[:3]) + ("…" if len(new_votes) > 3 else "")
-            _run_git(["commit", "-m", f"vote: {user} -> [{ids_str}] ({len(new_votes)} papers)"], cwd=clone_dir)
+            if new_votes:
+                _run_git(["add", "papers/"], cwd=clone_dir)
+            if dn_changed:
+                _run_git(["add", DISPLAY_NAMES_PATH], cwd=clone_dir)
+            if new_votes:
+                ids_str = ", ".join(new_votes[:3]) + ("…" if len(new_votes) > 3 else "")
+                msg = f"vote: {user} -> [{ids_str}] ({len(new_votes)} papers)"
+            else:
+                msg = f"display-name: update {user}"
+            _run_git(["commit", "-m", msg], cwd=clone_dir)
             _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
     finally:
         shutil.rmtree(cleanup_dir, ignore_errors=True)
     return voted
+
+
+def _git_batch_commit(
+    base_url: str,
+    json_headers: dict,
+    token: str,
+    branch: str,
+    tree_entries: list[dict],
+    commit_msg: str,
+) -> None:
+    """Read HEAD → create tree → create commit → PATCH ref. Retries once on 422 (concurrent push)."""
+    for _attempt in range(2):
+        ref_data = _http_json(
+            f"{base_url}/git/refs/heads/{branch}", headers=_github_headers(token)
+        )
+        head_sha = ref_data["object"]["sha"]
+        commit_data = _http_json(
+            f"{base_url}/git/commits/{head_sha}", headers=_github_headers(token)
+        )
+        base_tree_sha = commit_data["tree"]["sha"]
+        tree_resp = _http_post_json(
+            f"{base_url}/git/trees",
+            {"base_tree": base_tree_sha, "tree": tree_entries},
+            headers=json_headers,
+        )
+        commit_resp = _http_post_json(
+            f"{base_url}/git/commits",
+            {"message": commit_msg, "tree": tree_resp["sha"], "parents": [head_sha]},
+            headers=json_headers,
+        )
+        try:
+            _http_patch_json(
+                f"{base_url}/git/refs/heads/{branch}",
+                {"sha": commit_resp["sha"], "force": False},
+                headers=json_headers,
+            )
+            return
+        except urllib.error.HTTPError as e:
+            if e.code == 422 and _attempt == 0:
+                continue  # re-read HEAD and retry
+            try:
+                body = json.loads(e.read().decode("utf-8"))
+                msg = body.get("message", e.reason)
+            except Exception:
+                msg = e.reason
+            raise RuntimeError(f"GitHub ref update failed (HTTP {e.code}): {msg}") from e
 
 
 def _batch_vote_papers_api(
@@ -1424,7 +1510,7 @@ def _batch_vote_papers_api(
     json_headers = {**_github_headers(token), "Content-Type": "application/json"}
     ts = dt.datetime.utcnow().isoformat() + "Z"
 
-    # Step 1: fetch all needed paper files in one GraphQL request
+    # Step 1: fetch all needed paper files + display_names.json in one GraphQL request
     aliases: list[str] = []
     alias_map: dict[str, tuple[str, str, dict]] = {}  # alias -> (paper_id, path, input_dict)
     for i, p in enumerate(papers):
@@ -1435,6 +1521,9 @@ def _batch_vote_papers_api(
             f'{alias}: object(expression: "{cfg.branch}:{path}") {{ ... on Blob {{ text }} }}'
         )
         alias_map[alias] = (paper_id, path, p)
+    aliases.append(
+        f'dn: object(expression: "{cfg.branch}:{DISPLAY_NAMES_PATH}") {{ ... on Blob {{ text }} }}'
+    )
 
     query = '{ repository(owner: "%s", name: "%s") { %s } }' % (
         cfg.owner, cfg.repo, " ".join(aliases)
@@ -1474,9 +1563,28 @@ def _batch_vote_papers_api(
             continue
 
         paper["id"] = paper_id
-        votes.append(_make_vote_entry(user, display_name))
+        votes.append(_make_vote_entry(user))
         updates.append((path, paper_id, paper))
         voted.append(paper_id)
+
+    # Check if display_names.json needs updating
+    dn_text = (repo_node.get("dn") or {}).get("text")
+    dn_table: dict[str, str] = {}
+    if dn_text:
+        try:
+            dn_table = json.loads(dn_text)
+        except Exception:
+            pass
+    dn_changed = False
+    if display_name:
+        if dn_table.get(user) != display_name:
+            dn_table[user] = display_name
+            dn_changed = True
+    elif user in dn_table:
+        del dn_table[user]
+        dn_changed = True
+    if dn_changed:
+        updates.append((DISPLAY_NAMES_PATH, "__dn__", dn_table))
 
     if not updates:
         return voted
@@ -1497,44 +1605,18 @@ def _batch_vote_papers_api(
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(updates))) as ex:
         blob_results = list(ex.map(_post_blob, updates))
 
-    # Steps 4–7: read HEAD → create tree → create commit → update ref
-    ref_data = _http_json(
-        f"{base_url}/git/ref/heads/{cfg.branch}", headers=_github_headers(token)
+    new_ids = [pid for _, pid, _ in updates if pid != "__dn__"]
+    ids_str = ", ".join(new_ids[:3]) + ("…" if len(new_ids) > 3 else "")
+    commit_msg = (
+        f"vote: {user} -> [{ids_str}] ({len(new_ids)} papers)"
+        if new_ids
+        else f"display-name: update {user}"
     )
-    head_sha = ref_data["object"]["sha"]
-    commit_data = _http_json(
-        f"{base_url}/git/commits/{head_sha}", headers=_github_headers(token)
-    )
-    base_tree_sha = commit_data["tree"]["sha"]
-
     tree_entries = [
         {"path": path, "mode": "100644", "type": "blob", "sha": blob_sha}
         for path, blob_sha in blob_results
     ]
-    tree_resp = _http_post_json(
-        f"{base_url}/git/trees",
-        {"base_tree": base_tree_sha, "tree": tree_entries},
-        headers=json_headers,
-    )
-
-    new_ids = [pid for _, pid, _ in updates]
-    ids_str = ", ".join(new_ids[:3]) + ("…" if len(new_ids) > 3 else "")
-    commit_resp = _http_post_json(
-        f"{base_url}/git/commits",
-        {
-            "message": f"vote: {user} -> [{ids_str}] ({len(new_ids)} papers)",
-            "tree": tree_resp["sha"],
-            "parents": [head_sha],
-        },
-        headers=json_headers,
-    )
-
-    _http_patch_json(
-        f"{base_url}/git/refs/heads/{cfg.branch}",
-        {"sha": commit_resp["sha"], "force": False},
-        headers=json_headers,
-    )
-
+    _git_batch_commit(base_url, json_headers, token, cfg.branch, tree_entries, commit_msg)
     return voted
 
 
@@ -1557,7 +1639,7 @@ def _vote_paper_with_metadata(
         print(f"Already voted: {user} -> {paper_id}")
         return 0
     paper["id"] = _strip_arxiv_version(str(paper.get("id", paper_id)))
-    votes.append(_make_vote_entry(user, display_name))
+    votes.append(_make_vote_entry(user))
     _save_vote_paper(cfg, token, user, paper, sha, save_path, f"vote: {user} -> {paper['id']}")
     print(f"Vote recorded: {user} -> {paper['id']}")
     return 0
@@ -1596,7 +1678,7 @@ def cmd_vote(args: SimpleNamespace) -> int:
         raise SystemExit(f"User '{user}' already voted for {paper.get('id', paper_id)}.")
     paper_vote_id = _strip_arxiv_version(str(paper.get("id", paper_id)))
     paper["id"] = paper_vote_id
-    votes.append(_make_vote_entry(user, display_name))
+    votes.append(_make_vote_entry(user))
     _save_vote_paper(cfg, token, user, paper, sha, save_path, f"vote: {user} -> {paper_vote_id}")
     print(f"Vote recorded: {user} -> {paper_vote_id}")
     return 0
@@ -1952,7 +2034,7 @@ def init_config(
         '[vote]\n'
         '# Show a confirmation prompt when voting by list index (e.g. cuhkvoting vote 3).\n'
         'confirm_by_number = true\n'
-        '# Human-readable name stored in vote records. GitHub username is used if empty.\n'
+        '# Human-readable name stored in the shared display_names.json table. GitHub username is used if empty.\n'
         'display_name = ""\n'
         '\n'
         '[highlights]\n'
@@ -2009,13 +2091,11 @@ def admin_sanitize(
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview without writing."),
 ) -> None:
-    """Normalize whitespace in title/abstract and update display names in paper records."""
+    """Normalize whitespace in title/abstract and strip legacy display_name fields from vote entries."""
     args = SimpleNamespace(repo=repo, branch=branch)
     cfg = _resolve_repo_config(args)
-    app_cfg = _load_config()
     token = _get_token()
     user = _resolve_user(token)
-    display_name = app_cfg.display_name
 
     def _sanitize_paper(paper: dict) -> list[str]:
         """Apply all sanitizations in-place; return list of change descriptions (empty = no change)."""
@@ -2029,26 +2109,12 @@ def admin_sanitize(
             paper["abstract"] = new_abstract
             reasons.append("whitespace in abstract")
         for v in paper.get("votes", []):
-            if v.get("user") != user:
-                continue
-            if display_name:
-                if v.get("display_name") != display_name:
-                    old = v.get("display_name") or v["user"]
-                    v["display_name"] = display_name
-                    reasons.append(f"display name: '{old}' → '{display_name}'")
-            else:
-                if "display_name" in v:
-                    del v["display_name"]
-                    reasons.append("display name removed")
+            if "display_name" in v:
+                del v["display_name"]
+                reasons.append(f"legacy display_name removed ({v.get('user', '?')})")
         return reasons
 
-    # Describe what will be checked
-    checks = ["whitespace normalization"]
-    if display_name:
-        checks.append(f"display name sync ('{display_name}' for {user})")
-    else:
-        checks.append(f"display name cleanup for {user}")
-    typer.echo("Sanitizing: " + ", ".join(checks) + ".")
+    typer.echo("Sanitizing: whitespace normalization, legacy display_name removal.")
 
     if _has_github_ssh_access():
         clone_dir, cleanup_dir = _with_repo_checkout(cfg)
@@ -2087,18 +2153,35 @@ def admin_sanitize(
     if not token:
         raise SystemExit(f"Sanitize needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure SSH key.\n\n{_ssh_setup_instructions()}")
 
-    # API path: load tree, update changed files individually
-    url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/git/trees/{cfg.branch}?recursive=1"
+    # API path: fetch all blobs in parallel, then batch-commit all changes in one round-trip
+    base_url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}"
+    json_headers = {**_github_headers(token), "Content-Type": "application/json"}
+
+    url = f"{base_url}/git/trees/{cfg.branch}?recursive=1"
     data = _http_json(url, headers=_github_headers(token))
+    paper_items = [
+        obj for obj in data.get("tree", [])
+        if obj.get("type") == "blob"
+        and obj.get("path", "").startswith("papers/")
+        and obj.get("path", "").endswith(".json")
+        and obj["path"] != "papers/journal_club_records.json"
+    ]
+
+    def _fetch_blob_content(item: dict) -> tuple[str, dict | None]:
+        try:
+            blob = _http_json(f"{base_url}/git/blobs/{item['sha']}", headers=_github_headers(token))
+            content = base64.b64decode(blob["content"]).decode("utf-8")
+            return item["path"], json.loads(content)
+        except Exception:
+            return item["path"], None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        fetched = list(ex.map(_fetch_blob_content, paper_items))
+
     changed = 0
-    for obj in data.get("tree", []):
-        path = obj.get("path", "")
-        if obj.get("type") != "blob" or not path.startswith("papers/") or not path.endswith(".json"):
-            continue
-        if path == "papers/journal_club_records.json":
-            continue
-        paper, sha = _load_paper_via_api(cfg, path, token)
-        if not paper or not sha:
+    updates: list[tuple[str, dict]] = []
+    for path, paper in fetched:
+        if paper is None:
             continue
         reasons = _sanitize_paper(paper)
         if not reasons:
@@ -2106,13 +2189,37 @@ def admin_sanitize(
         typer.echo(f"  {path}  ({'; '.join(reasons)})")
         changed += 1
         if not dry_run:
-            _save_paper_via_api(cfg, path, paper, sha, token, f"sanitize: {path}")
+            updates.append((path, paper))
+
     if changed == 0:
         typer.echo("All records already clean.")
-    elif dry_run:
+        return
+    if dry_run:
         typer.echo(f"Would sanitize {changed} record(s).")
-    else:
-        typer.echo(f"Sanitized {changed} record(s).")
+        return
+
+    def _post_sanitized_blob(path_paper: tuple[str, dict]) -> tuple[str, str]:
+        path, paper = path_paper
+        content = base64.b64encode(
+            (json.dumps(paper, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        ).decode("ascii")
+        resp = _http_post_json(
+            f"{base_url}/git/blobs", {"content": content, "encoding": "base64"}, headers=json_headers
+        )
+        return path, resp["sha"]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(updates))) as ex:
+        blob_results = list(ex.map(_post_sanitized_blob, updates))
+
+    tree_entries = [
+        {"path": path, "mode": "100644", "type": "blob", "sha": sha}
+        for path, sha in blob_results
+    ]
+    _git_batch_commit(
+        base_url, json_headers, token, cfg.branch, tree_entries,
+        f"sanitize: {changed} paper record(s)",
+    )
+    typer.echo(f"Sanitized {changed} record(s).")
 
 
 app.add_typer(admin_app, name="admin")

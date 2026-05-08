@@ -164,7 +164,8 @@ abstract_wrap = 80      # line wrap width in characters
 [vote]
 # Show a confirmation prompt when voting by list index (e.g. cuhkvoting vote 3).
 confirm_by_number = true
-# Human-readable name stored in vote records. GitHub username is used if empty.
+# Human-readable name stored in the shared display_names.json table in the records repo.
+# GitHub username is used if empty. Updated automatically on each vote.
 display_name = ""
 
 [highlights]
