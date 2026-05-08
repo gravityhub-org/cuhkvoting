@@ -1255,10 +1255,13 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
                 abs_prefix = f"{' ' * (w + 2)}"
 
             idx_str = typer.style(f"{idx:>{w}}.", fg=typer.colors.BRIGHT_BLACK) if grey else f"{idx:>{w}}."
+            n = p["votes"]
+            vote_label = f"{n} vote" + ("s" if n != 1 else "")
+            voters_str = typer.style(f"[{p['voters']}] ⇒ {vote_label}", fg=typer.colors.CYAN)
             if has_ties:
-                print(f"{idx_str} {box} {_format_clickable_id(p['id'])}  {p['title']} [{p['voters']}]")
+                print(f"{idx_str} {box} {_format_clickable_id(p['id'])}  {p['title']}  {voters_str}")
             else:
-                print(f"{idx_str} {_format_clickable_id(p['id'])}  {p['title']} [{p['voters']}]")
+                print(f"{idx_str} {_format_clickable_id(p['id'])}  {p['title']}  {voters_str}")
 
             if abstract_lines:
                 wrapped = textwrap.wrap(p.get("abstract", ""), width=cfg.abstract_wrap)
