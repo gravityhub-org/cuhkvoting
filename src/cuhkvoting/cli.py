@@ -722,6 +722,48 @@ def _filter_entries(entries: list[dict[str, str]], keywords: list[str] | None) -
     return filtered
 
 
+def _parse_single_date(s: str) -> dt.date | None:
+    """Parse YYYY-MM-DD or M-DD / MM-DD (most recent past occurrence). Returns None if not a date."""
+    try:
+        return dt.date.fromisoformat(s)
+    except ValueError:
+        pass
+    m = re.fullmatch(r"(\d{1,2})-(\d{2})", s)
+    if m:
+        month, day = int(m.group(1)), int(m.group(2))
+        today = dt.date.today()
+        try:
+            candidate = dt.date(today.year, month, day)
+        except ValueError:
+            return None
+        if candidate > today:
+            candidate = dt.date(today.year - 1, month, day)
+        return candidate
+    return None
+
+
+def _parse_date_token(s: str) -> tuple[dt.date, dt.date] | None:
+    """Parse a date or A..B range into (start, end). Returns None if not a date token."""
+    if ".." in s:
+        parts = s.split("..", 1)
+        a = _parse_single_date(parts[0])
+        b = _parse_single_date(parts[1])
+        if a and b:
+            return (min(a, b), max(a, b))
+        return None
+    d = _parse_single_date(s)
+    return (d, d) if d else None
+
+
+def _entry_in_date_spans(entry: dict, spans: list[tuple[dt.date, dt.date]]) -> bool:
+    pub = entry.get("published", "")[:10]
+    try:
+        d = dt.date.fromisoformat(pub)
+    except ValueError:
+        return True
+    return any(s <= d <= e for s, e in spans)
+
+
 def _find_legacy_paper_via_api(cfg: RepoConfig, base_id: str, token: str | None) -> tuple[dict | None, str | None, str | None]:
     url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/git/trees/{cfg.branch}?recursive=1"
     try:
@@ -1085,6 +1127,19 @@ def _fetch_lastweek_entries(categories: list[str]) -> list[dict]:
     })
 
 
+def _fetch_daterange_entries(start: dt.date, end: dt.date, categories: list[str]) -> list[dict]:
+    return _arxiv_query({
+        "search_query": (
+            f"{_build_cat_query(categories)} AND "
+            f"submittedDate:[{start.strftime('%Y%m%d')}0000 TO {end.strftime('%Y%m%d')}2359]"
+        ),
+        "start": "0",
+        "max_results": "500",
+        "sortBy": "submittedDate",
+        "sortOrder": "descending",
+    })
+
+
 def cmd_today(args: SimpleNamespace) -> int:
     cfg = _load_config()
     categories = [c.strip() for item in args.category for c in item.split(",")] if getattr(args, "category", None) else cfg.categories
@@ -1351,6 +1406,83 @@ def cmd_show(args: SimpleNamespace) -> int:
             print()
         print(f"{_format_clickable_id(arxiv_id)}  {title}  [{lastnames}]{kw_suffix}")
         abstract = _format_abstract(abstract_text, -1, cfg.abstract_wrap)
+        if abstract and cfg.highlight_keywords:
+            lines_out = []
+            for line in abstract.splitlines():
+                indent = len(line) - len(line.lstrip())
+                lines_out.append(line[:indent] + _highlight_text(line[indent:], cfg.highlight_keywords))
+            abstract = "\n".join(lines_out)
+        if abstract:
+            print(abstract)
+    return 0
+
+
+def cmd_show_date(args: SimpleNamespace) -> int:
+    """Show papers for a specific date or date range, numbered for index-based vote."""
+    date_spans: list[tuple[dt.date, dt.date]] = args.date_spans
+    start = min(s for s, _ in date_spans)
+    end   = max(e for _, e in date_spans)
+
+    today = dt.date.today()
+    if end > today:
+        raise SystemExit("Date is in the future.")
+    if start < dt.date(1991, 8, 14):
+        raise SystemExit("arXiv was founded on 1991-08-14.")
+
+    cfg = _load_config()
+    categories = (
+        [c.strip() for item in args.categories for c in item.split(",")]
+        if getattr(args, "categories", None)
+        else cfg.categories
+    )
+    abstract_lines = getattr(args, "abstract", None)
+    if abstract_lines is None:
+        abstract_lines = cfg.abstract_lines
+
+    cache_key = f"date-{start.strftime('%Y%m%d')}-{end.strftime('%Y%m%d')}"
+    all_entries = _resolve_cache(
+        cache_key, categories, 999_999_999,
+        lambda cats: _fetch_daterange_entries(start, end, cats),
+    )
+
+    entries = [e for e in all_entries if _entry_in_date_spans(e, date_spans)]
+    entries = _filter_entries(entries, getattr(args, "keywords", None) or [])
+
+    if not entries:
+        print("No papers found for the requested date(s).")
+        return 0
+
+    displayed = entries[: int(getattr(args, "limit", 200))]
+    _save_last_list(displayed)
+
+    # Header
+    def _span_label(s: dt.date, e: dt.date) -> str:
+        return s.isoformat() if s == e else f"{s.isoformat()}..{e.isoformat()}"
+    header_label = ", ".join(_span_label(s, e) for s, e in date_spans)
+    print(f"Papers for {header_label} ({len(displayed)} entries):")
+
+    highlight_kw_count = getattr(args, "highlight_keywords", None)
+    if highlight_kw_count is None:
+        highlight_kw_count = cfg.highlight_keyword_count
+    for idx, p in enumerate(displayed, 1):
+        authors = p.get("authors", [])
+        lastnames = _format_author_lastnames_highlighted(authors, 3, cfg.highlight_authors)
+        title = p.get("title", "")
+        abstract_text = p.get("abstract", "")
+        kw_suffix = ""
+        if cfg.highlight_keywords:
+            matches = _find_keyword_matches([title, abstract_text], cfg.highlight_keywords)
+            if matches:
+                if highlight_kw_count == 0:
+                    kw_suffix = typer.style(f" {cfg.highlight_glyph} × {len(matches)}", fg=typer.colors.BRIGHT_BLUE, bold=True)
+                else:
+                    shown = matches if highlight_kw_count < 0 else matches[:highlight_kw_count]
+                    parts = ", ".join(shown)
+                    if highlight_kw_count >= 1 and len(matches) > highlight_kw_count:
+                        parts += f", {len(matches) - highlight_kw_count}+"
+                    kw_suffix = typer.style(f" [{parts}]", fg=typer.colors.BRIGHT_BLUE, bold=True)
+        print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {title}  [{lastnames}]{kw_suffix}")
+        abstract = _format_abstract(abstract_text, abstract_lines, cfg.abstract_wrap)
         if abstract and cfg.highlight_keywords:
             lines_out = []
             for line in abstract.splitlines():
@@ -2000,11 +2132,35 @@ def vote_command(
 @app.command("show")
 def show_command(
     paper_ids: list[str] = typer.Argument(
-        ..., help="arXiv IDs or list indices from the last today/lastweek/search call."
+        ..., help="arXiv IDs, list indices, or dates (YYYY-MM-DD / M-DD / A..B range).",
+    ),
+    category: list[str] | None = typer.Option(
+        None, "--category", help="arXiv category filter (date mode only).", show_default=False,
+    ),
+    abstract: int | None = typer.Option(
+        None, "--abstract", help="Abstract lines per entry: 0=none, -1=full, N=first N (date mode only).", show_default=False,
+    ),
+    limit: int = typer.Option(200, "--limit", help="Max entries to show (date mode only)."),
+    highlight_keywords: int | None = typer.Option(
+        None, "--highlight-keywords", help="Keyword match count to show (date mode only).", show_default=False,
     ),
 ) -> None:
-    """Show full details (title, authors, abstract) for one or more papers."""
-    _run_cmd(cmd_show, paper_ids=paper_ids)
+    """Show paper details by arXiv ID/index, or list papers for a date/range."""
+    date_spans: list[tuple[dt.date, dt.date]] = []
+    keywords: list[str] = []
+    for tok in paper_ids:
+        span = _parse_date_token(tok)
+        if span:
+            date_spans.append(span)
+        else:
+            keywords.append(tok)
+
+    if date_spans:
+        _run_cmd(cmd_show_date, date_spans=date_spans, keywords=keywords,
+                 categories=category, limit=limit, abstract=abstract,
+                 highlight_keywords=highlight_keywords)
+    else:
+        _run_cmd(cmd_show, paper_ids=paper_ids)
 
 
 @app.command("init-config")

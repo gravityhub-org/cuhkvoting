@@ -77,7 +77,7 @@ cuhkvoting vote 2504.12345
 cuhkvoting vote 2504.12345 2504.67890   # vote for multiple papers at once
 cuhkvoting vote remove 2504.12345
 
-# Vote by list index (refers to the last printed list from today/lastweek/search/topvoted)
+# Vote by list index (refers to the last printed list from today/lastweek/search/topvoted/show)
 cuhkvoting vote 3
 cuhkvoting vote 1 5 2504.12345          # mix of indices and arXiv IDs
 
@@ -85,15 +85,26 @@ cuhkvoting vote 1 5 2504.12345          # mix of indices and arXiv IDs
 cuhkvoting show 3
 cuhkvoting show 1 5 2504.12345          # mix of indices and arXiv IDs
 
+# Browse papers by date or date range (results are numbered; indices work with vote)
+cuhkvoting show 2026-03-12                      # all papers for that date
+cuhkvoting show 3-12                            # most recent March 12th
+cuhkvoting show 2026-03-12..2026-03-15          # inclusive range (12th through 15th)
+cuhkvoting show 2026-03-12 2026-03-15           # union: 12th AND 15th only (not 13–14)
+cuhkvoting show 3-12..3-15 "gravitational wave" # range + keyword filter
+cuhkvoting show 2026-03-12 --abstract -1        # with full abstracts
+cuhkvoting show 2026-03-12 --category hep-th    # override arXiv category
+
 # Journal club records
 cuhkvoting record
 cuhkvoting select 2504.12345
 cuhkvoting admin trash 2504.12345
+cuhkvoting admin sanitize                       # strip legacy fields, normalize whitespace
+cuhkvoting admin sanitize --dry-run             # preview without writing
 ```
 
 ### Category filtering
 
-`today` and `lastweek` filter by arXiv category. The default categories are `gr-qc` and `astro-ph.*`.
+`today`, `lastweek`, and `show` (date mode) filter by arXiv category. The default categories are `gr-qc` and `astro-ph.*`.
 
 Override for a single run (comma-separated or repeatable):
 
@@ -101,15 +112,16 @@ Override for a single run (comma-separated or repeatable):
 cuhkvoting lastweek --category hep-th
 cuhkvoting lastweek --category "gr-qc,hep-th"
 cuhkvoting lastweek --category gr-qc --category hep-th
+cuhkvoting show 2026-03-12 --category hep-th
 ```
 
 To change the default, set `categories` in the config file (see below).
 
 ### Local cache
 
-`today` and `lastweek` cache results locally in `~/.cache/cuhkvoting/` to avoid hitting the arXiv API on every call, and thus avoid exceeding its limit rate.
+`today`, `lastweek`, and `show` (date mode) cache results locally in `~/.cache/cuhkvoting/` to avoid hitting the arXiv API on every call, and thus avoid exceeding its limit rate.
 
-Default cache lifetime: 60 min for `today`, 360 min for `lastweek`. Running `lastweek` also seeds the `today` cache from its results.
+Default cache lifetime: 60 min for `today`, 360 min for `lastweek`. Running `lastweek` also seeds the `today` cache from its results. Date-based results (`show DATE`) are cached permanently since past days don't change.
 
 Force a refresh:
 
@@ -204,10 +216,12 @@ glyph = "★"
 Override `keyword_count` per run:
 
 ```bash
-cuhkvoting today --highlight-keywords 0   # glyph only
-cuhkvoting today --highlight-keywords 3   # first 3 matches
+cuhkvoting today --highlight-keywords 0   # glyph only: ★ × 3
+cuhkvoting today --highlight-keywords 3   # first 3 matches: [black hole, neutron star, 2+]
 cuhkvoting today --highlight-keywords -1  # all matches
 ```
+
+When `keyword_count = 0`, the glyph is shown with a match count: `★ × 3`. When truncated (`N > 0`), the number of hidden matches is appended: `[black hole, 2+]`.
 
 Matched author lastnames and keyword occurrences in abstracts are colored blue.
 
