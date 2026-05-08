@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import time
@@ -32,11 +33,29 @@ INSPIRE_API = "https://inspirehep.net/api/literature"
 DEFAULT_REPO = "gravityhub-org/cuhkvoting-records"
 VOTE_EXPIRY_DAYS = 183
 JC_RECORD_PATH = "papers/journal_club_records.json"
-CACHE_DIR = Path.home() / ".cache" / "cuhkvoting"
+def _user_config_dir() -> Path:
+    if sys.platform == "win32":
+        return Path(os.environ.get("APPDATA") or Path.home()) / "cuhkvoting"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "cuhkvoting"
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    return (Path(xdg) if xdg else Path.home() / ".config") / "cuhkvoting"
+
+
+def _user_cache_dir() -> Path:
+    if sys.platform == "win32":
+        return Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "cuhkvoting" / "cache"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "cuhkvoting"
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    return (Path(xdg) if xdg else Path.home() / ".cache") / "cuhkvoting"
+
+
+CACHE_DIR = _user_cache_dir()
 LAST_LIST_PATH = CACHE_DIR / "last_list.json"
 DISPLAY_NAME_CACHE = CACHE_DIR / "display_name.txt"
 DISPLAY_NAMES_PATH = "display_names.json"
-CONFIG_PATH = Path.home() / ".config" / "cuhkvoting" / "config.toml"
+CONFIG_PATH = _user_config_dir() / "config.toml"
 DEFAULT_CATEGORIES = ["gr-qc", "astro-ph.*"]
 DEFAULT_TODAY_MAX_AGE = 60
 DEFAULT_LASTWEEK_MAX_AGE = 360
