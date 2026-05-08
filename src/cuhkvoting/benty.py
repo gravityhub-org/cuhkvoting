@@ -359,7 +359,7 @@ def sync(
     from cuhkvoting.cli import (  # noqa: PLC0415
         ARXIV_ABS, DEFAULT_REPO, RepoConfig,
         _batch_vote_papers_api, _batch_vote_papers_ssh,
-        _get_token, _has_github_ssh_access,
+        _get_token, _has_github_ssh_access, _load_config,
         _resolve_user, _vote_paper_with_metadata,
     )
     gh_token = _get_token()
@@ -368,6 +368,7 @@ def sync(
     except SystemExit as exc:
         typer.echo(f"Error resolving cuhkvoting user: {exc}", err=True)
         raise typer.Exit(1)
+    display_name = _load_config().display_name
 
     # Login to Benty-Fields
     cache_cookies = _cache_cookies_enabled() and not no_cache_cookies
@@ -519,7 +520,7 @@ def sync(
             ]
             vote_id_by_arxiv = {p["arxiv_id"]: p.get("vote_id") for p in to_add_cuhk}
             try:
-                voted_ids = _batch_vote_papers_ssh(repo_cfg, cuhk_user, papers_meta)
+                voted_ids = _batch_vote_papers_ssh(repo_cfg, cuhk_user, papers_meta, display_name)
             except Exception as exc:
                 typer.echo(f"Batch SSH vote failed: {exc}", err=True)
                 ok = False
@@ -544,7 +545,7 @@ def sync(
             ]
             vote_id_by_arxiv = {p["arxiv_id"]: p.get("vote_id") for p in to_add_cuhk}
             try:
-                voted_ids = _batch_vote_papers_api(repo_cfg, gh_token, cuhk_user, papers_meta)
+                voted_ids = _batch_vote_papers_api(repo_cfg, gh_token, cuhk_user, papers_meta, display_name)
             except Exception as exc:
                 typer.echo(f"Batch API vote failed: {exc}", err=True)
                 ok = False
@@ -564,7 +565,7 @@ def sync(
                 title = p.get("title") or ""
                 url = f"{ARXIV_ABS}{arxiv_id}"
                 try:
-                    code = _vote_paper_with_metadata(repo_cfg, gh_token, cuhk_user, arxiv_id, title, url)
+                    code = _vote_paper_with_metadata(repo_cfg, gh_token, cuhk_user, arxiv_id, title, url, display_name)
                 except SystemExit as exc:
                     typer.echo(f"cuhkvoting vote failed for {arxiv_id}: {exc}", err=True)
                     ok = False
