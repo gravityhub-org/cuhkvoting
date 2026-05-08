@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+import http.client
 import datetime as dt
 import fnmatch
 import json
@@ -457,7 +458,7 @@ def _arxiv_query(params: dict[str, str]) -> list[dict[str, str]]:
         try:
             xml_str = _http_text(url, headers={"User-Agent": "cuhkvoting/0.1"})
             break
-        except (ConnectionError, urllib.error.HTTPError) as e:
+        except (ConnectionError, urllib.error.HTTPError, http.client.IncompleteRead) as e:
             code = getattr(e, "code", None)
             if attempt == len(delays) or (code is not None and code not in (429, 503)):
                 raise
@@ -1066,7 +1067,7 @@ def cmd_today(args: SimpleNamespace) -> int:
             matches = _find_keyword_matches([title, abstract_text], cfg.highlight_keywords)
             if matches:
                 if highlight_kw_count == 0:
-                    kw_suffix = typer.style(f" {cfg.highlight_glyph}", fg=typer.colors.BRIGHT_BLUE, bold=True)
+                    kw_suffix = typer.style(f" {cfg.highlight_glyph} × {len(matches)}", fg=typer.colors.BRIGHT_BLUE, bold=True)
                 else:
                     if highlight_kw_count < 0:
                         shown = matches
@@ -1074,7 +1075,7 @@ def cmd_today(args: SimpleNamespace) -> int:
                         shown = matches[:highlight_kw_count]
                     parts = ", ".join(shown)
                     if highlight_kw_count >= 1 and len(matches) > highlight_kw_count:
-                        parts += ", +"
+                        parts += f", {len(matches) - highlight_kw_count}+"
                     kw_suffix = typer.style(f" [{parts}]", fg=typer.colors.BRIGHT_BLUE, bold=True)
         print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {title}  [{lastnames}]{kw_suffix}")
         abstract = _format_abstract(abstract_text, abstract_lines, cfg.abstract_wrap)
@@ -1153,7 +1154,7 @@ def cmd_lastweek(args: SimpleNamespace) -> int:
             matches = _find_keyword_matches([title, abstract_text], cfg.highlight_keywords)
             if matches:
                 if highlight_kw_count == 0:
-                    kw_suffix = typer.style(f" {cfg.highlight_glyph}", fg=typer.colors.BRIGHT_BLUE, bold=True)
+                    kw_suffix = typer.style(f" {cfg.highlight_glyph} × {len(matches)}", fg=typer.colors.BRIGHT_BLUE, bold=True)
                 else:
                     if highlight_kw_count < 0:
                         shown = matches
@@ -1161,7 +1162,7 @@ def cmd_lastweek(args: SimpleNamespace) -> int:
                         shown = matches[:highlight_kw_count]
                     parts = ", ".join(shown)
                     if highlight_kw_count >= 1 and len(matches) > highlight_kw_count:
-                        parts += ", +"
+                        parts += f", {len(matches) - highlight_kw_count}+"
                     kw_suffix = typer.style(f" [{parts}]", fg=typer.colors.BRIGHT_BLUE, bold=True)
         print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {title}  [{lastnames}]{kw_suffix}")
         abstract = _format_abstract(abstract_text, abstract_lines, cfg.abstract_wrap)
@@ -1270,6 +1271,44 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
                     print(abs_prefix + al)
 
             idx += 1
+    return 0
+
+
+def cmd_show(args: SimpleNamespace) -> int:
+    cfg = _load_config()
+    resolved = _resolve_paper_ids(args.paper_ids)
+    for i, (arxiv_id, _title, _idx) in enumerate(resolved):
+        entry = _lookup_local_cache(arxiv_id)
+        if entry is None:
+            entry = _validate_arxiv_entry(arxiv_id)
+        authors = entry.get("authors", [])
+        lastnames = _format_author_lastnames_highlighted(authors, 3, cfg.highlight_authors)
+        title = entry.get("title", "")
+        abstract_text = entry.get("abstract", "")
+        kw_suffix = ""
+        if cfg.highlight_keywords:
+            matches = _find_keyword_matches([title, abstract_text], cfg.highlight_keywords)
+            if matches:
+                if cfg.highlight_keyword_count == 0:
+                    kw_suffix = typer.style(f" {cfg.highlight_glyph} × {len(matches)}", fg=typer.colors.BRIGHT_BLUE, bold=True)
+                else:
+                    shown_kw = matches if cfg.highlight_keyword_count < 0 else matches[:cfg.highlight_keyword_count]
+                    parts = ", ".join(shown_kw)
+                    if cfg.highlight_keyword_count >= 1 and len(matches) > cfg.highlight_keyword_count:
+                        parts += f", {len(matches) - cfg.highlight_keyword_count}+"
+                    kw_suffix = typer.style(f" [{parts}]", fg=typer.colors.BRIGHT_BLUE, bold=True)
+        if i > 0:
+            print()
+        print(f"{_format_clickable_id(arxiv_id)}  {title}  [{lastnames}]{kw_suffix}")
+        abstract = _format_abstract(abstract_text, -1, cfg.abstract_wrap)
+        if abstract and cfg.highlight_keywords:
+            lines_out = []
+            for line in abstract.splitlines():
+                indent = len(line) - len(line.lstrip())
+                lines_out.append(line[:indent] + _highlight_text(line[indent:], cfg.highlight_keywords))
+            abstract = "\n".join(lines_out)
+        if abstract:
+            print(abstract)
     return 0
 
 
@@ -1812,6 +1851,16 @@ def vote_command(
         if last_code != 0:
             raise typer.Exit(code=last_code)
     raise typer.Exit(code=last_code)
+
+
+@app.command("show")
+def show_command(
+    paper_ids: list[str] = typer.Argument(
+        ..., help="arXiv IDs or list indices from the last today/lastweek/search call."
+    ),
+) -> None:
+    """Show full details (title, authors, abstract) for one or more papers."""
+    _run_cmd(cmd_show, paper_ids=paper_ids)
 
 
 @app.command("init-config")

@@ -81,6 +81,10 @@ cuhkvoting vote remove 2504.12345
 cuhkvoting vote 3
 cuhkvoting vote 1 5 2504.12345          # mix of indices and arXiv IDs
 
+# Show full details (title, authors, full abstract) for specific papers
+cuhkvoting show 3
+cuhkvoting show 1 5 2504.12345          # mix of indices and arXiv IDs
+
 # Journal club records
 cuhkvoting record
 cuhkvoting select 2504.12345
