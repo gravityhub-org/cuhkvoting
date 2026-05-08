@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import datetime as dt
 import fnmatch
 import json
@@ -135,6 +136,28 @@ def _http_delete_json(url: str, payload: dict, headers: dict[str, str] | None = 
         data=json.dumps(payload).encode("utf-8"),
         headers=headers or {},
         method="DELETE",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _http_post_json(url: str, payload: dict, headers: dict[str, str] | None = None) -> dict:
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers or {},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _http_patch_json(url: str, payload: dict, headers: dict[str, str] | None = None) -> dict:
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers or {},
+        method="PATCH",
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode("utf-8"))
@@ -365,7 +388,47 @@ def _save_jc_records(cfg: RepoConfig, token: str | None, user: str, records: lis
         shutil.rmtree(cleanup_dir, ignore_errors=True)
 
 
+def _list_papers_via_graphql(cfg: RepoConfig, token: str) -> list[dict]:
+    query = (
+        '{ repository(owner: "%s", name: "%s") {'
+        '  object(expression: "%s:papers") {'
+        '    ... on Tree { entries { name object { ... on Blob { text } } } }'
+        '  } } }'
+    ) % (cfg.owner, cfg.repo, cfg.branch)
+    req = urllib.request.Request(
+        "https://api.github.com/graphql",
+        data=json.dumps({"query": query}).encode("utf-8"),
+        headers={**_github_headers(token), "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if "errors" in data:
+        raise RuntimeError(f"GraphQL errors: {data['errors']}")
+    entries = ((data.get("data") or {}).get("repository") or {}).get("object") or {}
+    papers: list[dict] = []
+    for entry in entries.get("entries", []):
+        name = entry.get("name", "")
+        if not name.endswith(".json") or name == "journal_club_records.json":
+            continue
+        text = (entry.get("object") or {}).get("text")
+        if not text:
+            continue
+        try:
+            paper = json.loads(text)
+            if isinstance(paper, dict):
+                papers.append(paper)
+        except Exception:
+            continue
+    return papers
+
+
 def _list_papers_via_api(cfg: RepoConfig, token: str | None) -> list[dict]:
+    if token:
+        try:
+            return _list_papers_via_graphql(cfg, token)
+        except Exception:
+            pass
     url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/git/trees/{cfg.branch}?recursive=1"
     try:
         data = _http_json(url, headers=_github_headers(token))
@@ -1205,6 +1268,194 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
 
             idx += 1
     return 0
+
+
+def _batch_vote_papers_ssh(
+    cfg: RepoConfig,
+    user: str,
+    papers: list[dict],
+) -> list[str]:
+    """Vote for multiple papers in a single clone/commit/push cycle.
+
+    Each dict in `papers` must have: paper_id, title, url.
+    Returns the list of paper_ids for which a vote was recorded.
+    """
+    if not papers:
+        return []
+    clone_dir, cleanup_dir = _with_repo_checkout(cfg)
+    voted: list[str] = []
+    new_votes: list[str] = []
+    try:
+        papers_dir = Path(clone_dir) / "papers"
+        papers_dir.mkdir(parents=True, exist_ok=True)
+        ts = dt.datetime.utcnow().isoformat() + "Z"
+        for p in papers:
+            paper_id = _strip_arxiv_version(p["paper_id"])
+            title = p.get("title", "")
+            url = p.get("url", f"{ARXIV_ABS}{paper_id}")
+            paper_file = papers_dir / f"{_safe_filename(paper_id)}.json"
+            # No individual API GET — files are read directly from the local checkout,
+            # preserving any existing votes from other users without extra round-trips.
+            if paper_file.exists():
+                try:
+                    paper = json.loads(paper_file.read_text(encoding="utf-8"))
+                except Exception:
+                    paper = {"id": paper_id, "title": title, "abstract": "", "url": url, "votes": []}
+            else:
+                paper = {"id": paper_id, "title": title, "abstract": "", "url": url, "votes": []}
+            _prune_expired_votes(paper)
+            votes = paper.setdefault("votes", [])
+            if any(v.get("user") == user for v in votes):
+                print(f"Already voted: {user} -> {paper_id}")
+                voted.append(paper_id)
+                continue
+            paper["id"] = paper_id
+            votes.append({"user": user, "voted_at": ts})
+            paper_file.write_text(json.dumps(paper, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            voted.append(paper_id)
+            new_votes.append(paper_id)
+        if new_votes:
+            _ensure_commit_identity(clone_dir, user)
+            _run_git(["add", "papers/"], cwd=clone_dir)
+            ids_str = ", ".join(new_votes[:3]) + ("…" if len(new_votes) > 3 else "")
+            _run_git(["commit", "-m", f"vote: {user} -> [{ids_str}] ({len(new_votes)} papers)"], cwd=clone_dir)
+            _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
+    finally:
+        shutil.rmtree(cleanup_dir, ignore_errors=True)
+    return voted
+
+
+def _batch_vote_papers_api(
+    cfg: RepoConfig,
+    token: str,
+    user: str,
+    papers: list[dict],
+) -> list[str]:
+    """Vote for multiple papers in a single Git commit via the GitHub Git Data API.
+
+    Each dict in `papers` must have: paper_id, title, url.
+    Returns the list of paper_ids for which a vote was recorded (including already-voted).
+    Reduces API calls from 2N sequential to N parallel blob POSTs + 5 overhead calls.
+    """
+    if not papers:
+        return []
+
+    base_url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}"
+    json_headers = {**_github_headers(token), "Content-Type": "application/json"}
+    ts = dt.datetime.utcnow().isoformat() + "Z"
+
+    # Step 1: fetch all needed paper files in one GraphQL request
+    aliases: list[str] = []
+    alias_map: dict[str, tuple[str, str, dict]] = {}  # alias -> (paper_id, path, input_dict)
+    for i, p in enumerate(papers):
+        paper_id = _strip_arxiv_version(p["paper_id"])
+        path = f"papers/{_safe_filename(paper_id)}.json"
+        alias = f"p{i}"
+        aliases.append(
+            f'{alias}: object(expression: "{cfg.branch}:{path}") {{ ... on Blob {{ text }} }}'
+        )
+        alias_map[alias] = (paper_id, path, p)
+
+    query = '{ repository(owner: "%s", name: "%s") { %s } }' % (
+        cfg.owner, cfg.repo, " ".join(aliases)
+    )
+    req = urllib.request.Request(
+        "https://api.github.com/graphql",
+        data=json.dumps({"query": query}).encode("utf-8"),
+        headers=json_headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        gql_data = json.loads(resp.read().decode("utf-8"))
+
+    repo_node = ((gql_data.get("data") or {}).get("repository") or {})
+
+    # Step 2: apply votes to each paper dict
+    updates: list[tuple[str, str, dict]] = []  # (path, paper_id, updated_paper)
+    voted: list[str] = []
+
+    for alias, (paper_id, path, p) in alias_map.items():
+        title = p.get("title", "")
+        url = p.get("url", f"{ARXIV_ABS}{paper_id}")
+        text = (repo_node.get(alias) or {}).get("text")
+        if text:
+            try:
+                paper = json.loads(text)
+            except Exception:
+                paper = {"id": paper_id, "title": title, "abstract": "", "url": url, "votes": []}
+        else:
+            paper = {"id": paper_id, "title": title, "abstract": "", "url": url, "votes": []}
+
+        _prune_expired_votes(paper)
+        votes = paper.setdefault("votes", [])
+        if any(v.get("user") == user for v in votes):
+            print(f"Already voted: {user} -> {paper_id}")
+            voted.append(paper_id)
+            continue
+
+        paper["id"] = paper_id
+        votes.append({"user": user, "voted_at": ts})
+        updates.append((path, paper_id, paper))
+        voted.append(paper_id)
+
+    if not updates:
+        return voted
+
+    # Step 3: POST blobs concurrently (one per updated file)
+    def _post_blob(path_paper: tuple[str, str, dict]) -> tuple[str, str]:
+        path, _pid, paper = path_paper
+        content = base64.b64encode(
+            (json.dumps(paper, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        ).decode("ascii")
+        resp = _http_post_json(
+            f"{base_url}/git/blobs",
+            {"content": content, "encoding": "base64"},
+            headers=json_headers,
+        )
+        return path, resp["sha"]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(updates))) as ex:
+        blob_results = list(ex.map(_post_blob, updates))
+
+    # Steps 4–7: read HEAD → create tree → create commit → update ref
+    ref_data = _http_json(
+        f"{base_url}/git/ref/heads/{cfg.branch}", headers=_github_headers(token)
+    )
+    head_sha = ref_data["object"]["sha"]
+    commit_data = _http_json(
+        f"{base_url}/git/commits/{head_sha}", headers=_github_headers(token)
+    )
+    base_tree_sha = commit_data["tree"]["sha"]
+
+    tree_entries = [
+        {"path": path, "mode": "100644", "type": "blob", "sha": blob_sha}
+        for path, blob_sha in blob_results
+    ]
+    tree_resp = _http_post_json(
+        f"{base_url}/git/trees",
+        {"base_tree": base_tree_sha, "tree": tree_entries},
+        headers=json_headers,
+    )
+
+    new_ids = [pid for _, pid, _ in updates]
+    ids_str = ", ".join(new_ids[:3]) + ("…" if len(new_ids) > 3 else "")
+    commit_resp = _http_post_json(
+        f"{base_url}/git/commits",
+        {
+            "message": f"vote: {user} -> [{ids_str}] ({len(new_ids)} papers)",
+            "tree": tree_resp["sha"],
+            "parents": [head_sha],
+        },
+        headers=json_headers,
+    )
+
+    _http_patch_json(
+        f"{base_url}/git/refs/heads/{cfg.branch}",
+        {"sha": commit_resp["sha"], "force": False},
+        headers=json_headers,
+    )
+
+    return voted
 
 
 def _vote_paper_with_metadata(

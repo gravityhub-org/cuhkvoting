@@ -358,7 +358,9 @@ def sync(
     # Resolve cuhkvoting user (GitHub username)
     from cuhkvoting.cli import (  # noqa: PLC0415
         ARXIV_ABS, DEFAULT_REPO, RepoConfig,
-        _get_token, _resolve_user, _vote_paper_with_metadata,
+        _batch_vote_papers_api, _batch_vote_papers_ssh,
+        _get_token, _has_github_ssh_access,
+        _resolve_user, _vote_paper_with_metadata,
     )
     gh_token = _get_token()
     try:
@@ -505,23 +507,75 @@ def sync(
         owner, repo_name = DEFAULT_REPO.split("/", 1)
         branch = os.getenv("CUHKVOTING_BRANCH", "main")
         repo_cfg = RepoConfig(owner=owner, repo=repo_name, branch=branch)
-        for p in to_add_cuhk:
-            arxiv_id = p["arxiv_id"]
-            title = p.get("title") or ""
-            url = f"{ARXIV_ABS}{arxiv_id}"
+        if _has_github_ssh_access():
+            # SSH path: one clone/commit/push for all papers (fast batch)
+            papers_meta = [
+                {
+                    "paper_id": p["arxiv_id"],
+                    "title": p.get("title") or "",
+                    "url": f"{ARXIV_ABS}{p['arxiv_id']}",
+                }
+                for p in to_add_cuhk
+            ]
+            vote_id_by_arxiv = {p["arxiv_id"]: p.get("vote_id") for p in to_add_cuhk}
             try:
-                code = _vote_paper_with_metadata(repo_cfg, gh_token, cuhk_user, arxiv_id, title, url)
-            except SystemExit as exc:
-                typer.echo(f"cuhkvoting vote failed for {arxiv_id}: {exc}", err=True)
+                voted_ids = _batch_vote_papers_ssh(repo_cfg, cuhk_user, papers_meta)
+            except Exception as exc:
+                typer.echo(f"Batch SSH vote failed: {exc}", err=True)
                 ok = False
-                continue
-            if code == 0:
+                voted_ids = []
+            for arxiv_id in voted_ids:
+                title = next((p.get("title") or "" for p in to_add_cuhk if p["arxiv_id"] == arxiv_id), "")
                 synced[arxiv_id] = {
                     "voted_at": ts_now,
-                    "benty_vote_id": p.get("vote_id"),
+                    "benty_vote_id": vote_id_by_arxiv.get(arxiv_id),
                     "title": title,
-                    "url": url,
+                    "url": f"{ARXIV_ABS}{arxiv_id}",
                 }
+        elif gh_token and len(to_add_cuhk) > 1:
+            # Token/API path with multiple papers: one commit for all (fast batch)
+            papers_meta = [
+                {
+                    "paper_id": p["arxiv_id"],
+                    "title": p.get("title") or "",
+                    "url": f"{ARXIV_ABS}{p['arxiv_id']}",
+                }
+                for p in to_add_cuhk
+            ]
+            vote_id_by_arxiv = {p["arxiv_id"]: p.get("vote_id") for p in to_add_cuhk}
+            try:
+                voted_ids = _batch_vote_papers_api(repo_cfg, gh_token, cuhk_user, papers_meta)
+            except Exception as exc:
+                typer.echo(f"Batch API vote failed: {exc}", err=True)
+                ok = False
+                voted_ids = []
+            for arxiv_id in voted_ids:
+                title = next((p.get("title") or "" for p in to_add_cuhk if p["arxiv_id"] == arxiv_id), "")
+                synced[arxiv_id] = {
+                    "voted_at": ts_now,
+                    "benty_vote_id": vote_id_by_arxiv.get(arxiv_id),
+                    "title": title,
+                    "url": f"{ARXIV_ABS}{arxiv_id}",
+                }
+        else:
+            # Single paper or no token: fall back to per-paper vote
+            for p in to_add_cuhk:
+                arxiv_id = p["arxiv_id"]
+                title = p.get("title") or ""
+                url = f"{ARXIV_ABS}{arxiv_id}"
+                try:
+                    code = _vote_paper_with_metadata(repo_cfg, gh_token, cuhk_user, arxiv_id, title, url)
+                except SystemExit as exc:
+                    typer.echo(f"cuhkvoting vote failed for {arxiv_id}: {exc}", err=True)
+                    ok = False
+                    continue
+                if code == 0:
+                    synced[arxiv_id] = {
+                        "voted_at": ts_now,
+                        "benty_vote_id": p.get("vote_id"),
+                        "title": title,
+                        "url": url,
+                    }
 
     for arxiv_id in to_remove_cuhk:
         result = subprocess.run(
