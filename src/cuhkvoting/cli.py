@@ -151,21 +151,6 @@ def _parse_repo_url(url: str) -> tuple[str, str] | None:
     return None
 
 
-def _derive_repo_from_git() -> tuple[str, str, str] | None:
-    try:
-        out = subprocess.check_output(
-            ["git", "config", "--get", "remote.origin.url"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
-        if out:
-            parsed = _parse_repo_url(out)
-            if parsed:
-                return parsed[0], parsed[1], out
-    except Exception:
-        return None
-    return None
-
 
 def _run_git(args: list[str], cwd: str | None = None) -> str:
     proc = subprocess.run(
@@ -241,15 +226,6 @@ def _resolve_repo_config(args: SimpleNamespace) -> RepoConfig:
         provided_owner, provided_repo = repo_arg.split("/", 1)
         if (provided_owner, provided_repo) != (owner, repo):
             raise SystemExit(f"Only {DEFAULT_REPO} is supported.")
-    else:
-        parsed = _derive_repo_from_git()
-        if parsed:
-            detected_owner, detected_repo, _remote_url = parsed
-            if (detected_owner, detected_repo) != (owner, repo):
-                raise SystemExit(
-                    f"Current git remote points to {detected_owner}/{detected_repo}. "
-                    f"Only {DEFAULT_REPO} is supported. Pass --repo {DEFAULT_REPO} or set CUHKVOTING_REPO."
-                )
     return RepoConfig(owner=owner, repo=repo, branch=args.branch)
 
 
