@@ -1,6 +1,6 @@
 [project]
 name = "cuhkvoting"
-version = "0.2.0"
+version = "0.2.1"
 description = "CLI to browse arXiv papers and vote on them, with records stored in GitHub."
 readme = "README.md"
 authors = [

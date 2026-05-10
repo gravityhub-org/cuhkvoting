@@ -4,10 +4,10 @@ Minimal CLI to browse arXiv and vote on papers, with paper data and votes stored
 
 ### Quickstart
 
-Copy the whole block into a terminal (read-only commands work without GitHub auth; use `pip install` instead of `uv tool install` if you prefer—see [Install](#install)):
+Copy the whole block into a terminal (read-only commands work without GitHub auth; see [Install](#install) for HTTPS and pip alternatives):
 
 ```bash
-uv tool install --upgrade git+https://github.com/gravityhub-org/cuhkvoting.git && cuhkvoting --install-completion
+uv tool install --upgrade git+ssh://git@github.com/gravityhub-org/cuhkvoting.git && cuhkvoting --install-completion
 cuhkvoting today # Lists arxiv papers today
 cuhkvoting lastweek gravitational wave # Lists last week's papers with "gravitational" and "wave" in title/abstract
 cuhkvoting topvoted # Shows top voted papers
@@ -19,14 +19,16 @@ cuhkvoting vote remove 2504.12345 # Remove vote for 2504.12345
 ### Install
 
 ```bash
+uv tool install --upgrade git+ssh://git@github.com/gravityhub-org/cuhkvoting.git && cuhkvoting --install-completion
+```
+
+Or via HTTPS:
+
+```bash
 uv tool install --upgrade git+https://github.com/gravityhub-org/cuhkvoting.git && cuhkvoting --install-completion
 ```
 
-Or with pip:
-
-```bash
-pip install --upgrade git+https://github.com/gravityhub-org/cuhkvoting.git && cuhkvoting --install-completion
-```
+Or with pip: replace `uv tool install` with `pip install` — the rest of the command is identical.
 
 Optional Benty-Fields addon (adds `cuhkvoting-benty`):
 
