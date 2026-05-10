@@ -12,9 +12,7 @@ cuhkvoting today
 cuhkvoting today gravitational wave
 cuhkvoting topvoted
 cuhkvoting --help
-# Voting needs a token or SSH; see Quick setup below.
-# export CUHKVOTING_USER=your-github-username
-# cuhkvoting vote 2504.12345
+cuhkvoting vote 2504.12345 # Should work if you have ssh key and are member of gravityhub-org (but if not, see setup below)
 ```
 
 ### Install
