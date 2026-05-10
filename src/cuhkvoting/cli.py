@@ -798,6 +798,19 @@ def _parse_utc(ts: str) -> dt.datetime | None:
         return None
 
 
+def _latest_vote_timestamp(votes: list[dict]) -> float:
+    """Max voted_at among votes as UTC unix time; 0 if none parseable."""
+    best = 0.0
+    for v in votes:
+        d = _parse_utc(str(v.get("voted_at", "")))
+        if d is None:
+            continue
+        ts = d.replace(tzinfo=dt.timezone.utc).timestamp()
+        if ts > best:
+            best = ts
+    return best
+
+
 def _prune_expired_votes(paper: dict) -> int:
     cutoff = dt.datetime.utcnow() - dt.timedelta(days=VOTE_EXPIRY_DAYS)
     votes = paper.get("votes", [])
@@ -1296,6 +1309,31 @@ def cmd_lastweek(args: SimpleNamespace) -> int:
     return 0
 
 
+def _topvoted_rows_from_papers(papers: list[dict], dn_table: dict[str, str]) -> list[dict]:
+    """Build sorted rows for `topvoted`. Mutates each paper via `_prune_expired_votes`."""
+    rows: list[dict] = []
+    for paper in papers:
+        _prune_expired_votes(paper)
+        if paper.get("selected"):
+            continue
+        votes = paper.get("votes", [])
+        vote_count = len(votes)
+        if vote_count == 0:
+            continue
+        rows.append(
+            {
+                "id": _strip_arxiv_version(str(paper.get("id", "(unknown)"))),
+                "title": " ".join(paper.get("title", "(no title)").split()),
+                "abstract": " ".join(paper.get("abstract", "").split()),
+                "votes": vote_count,
+                "voters": _format_voters(votes, dn_table),
+                "latest_vote_ts": _latest_vote_timestamp(votes),
+            }
+        )
+    rows.sort(key=lambda p: (-p["votes"], -p["latest_vote_ts"], p["id"]))
+    return rows
+
+
 def cmd_topvoted(args: SimpleNamespace) -> int:
     cfg = _load_config()
     repo_cfg = _resolve_repo_config(args)
@@ -1314,25 +1352,7 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
             shutil.rmtree(clone_dir, ignore_errors=True)
 
     dn_table = _fetch_display_names(repo_cfg, token)
-    rows = []
-    for paper in papers:
-        _prune_expired_votes(paper)
-        if paper.get("selected"):
-            continue
-        votes = paper.get("votes", [])
-        vote_count = len(votes)
-        if vote_count == 0:
-            continue
-        rows.append(
-            {
-                "id": _strip_arxiv_version(str(paper.get("id", "(unknown)"))),
-                "title": " ".join(paper.get("title", "(no title)").split()),
-                "abstract": " ".join(paper.get("abstract", "").split()),
-                "votes": vote_count,
-                "voters": _format_voters(votes, dn_table),
-            }
-        )
-    rows.sort(key=lambda p: (-p["votes"], p["id"]))
+    rows = _topvoted_rows_from_papers(papers, dn_table)
     topn = rows[: args.N]
     if not topn:
         print("No voted papers yet.")
