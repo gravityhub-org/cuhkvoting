@@ -9,7 +9,7 @@ Copy the whole block into a terminal (read-only commands work without GitHub aut
 ```bash
 uv tool install --upgrade git+https://github.com/gravityhub-org/cuhkvoting.git && cuhkvoting --install-completion
 cuhkvoting today
-cuhkvoting today gravitational wave
+cuhkvoting lastweek gravitational wave
 cuhkvoting topvoted
 cuhkvoting --help
 cuhkvoting vote 2504.12345 # Should work if you have ssh key and are member of gravityhub-org (but if not, see setup below)
