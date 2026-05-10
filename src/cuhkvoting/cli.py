@@ -266,6 +266,20 @@ def _has_github_ssh_access() -> bool:
     return "successfully authenticated" in text
 
 
+def _get_user_from_ssh() -> str | None:
+    """Return GitHub login parsed from the SSH auth banner, or None."""
+    proc = subprocess.run(
+        ["ssh", "-T", "-o", "BatchMode=yes", "git@github.com"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    text = (proc.stdout or "") + (proc.stderr or "")
+    m = re.search(r"Hi ([^!]+)!", text)
+    return m.group(1) if m else None
+
+
 def _github_headers(token: str | None = None) -> dict[str, str]:
     headers = {
         "Accept": "application/vnd.github+json",
@@ -290,6 +304,7 @@ def _get_token() -> str | None:
             text=True,
             check=False,
             timeout=5,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
         )
         for line in proc.stdout.splitlines():
             if line.startswith("password="):
@@ -831,12 +846,12 @@ def _resolve_user(token: str | None) -> str:
     if not user:
         user = _get_user_from_token(token)
     if not user:
-        try:
-            user = _run_git(["config", "--global", "user.name"]).strip()
-        except SystemExit:
-            user = ""
+        user = _get_user_from_ssh()
     if not user:
-        raise SystemExit("Could not identify user. Set CUHKVOTING_USER or configure git user.name.")
+        raise SystemExit(
+            "Could not identify GitHub user. "
+            "Set CUHKVOTING_USER, CUHKVOTING_TOKEN/GITHUB_TOKEN, or configure a GitHub SSH key."
+        )
     return user
 
 

@@ -76,6 +76,7 @@ def _get_credentials() -> tuple[str, str]:
             ["git", "credential", "fill"],
             input="protocol=https\nhost=benty-fields.com\n\n",
             capture_output=True, text=True, timeout=5,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
         )
         creds: dict[str, str] = {}
         for line in proc.stdout.splitlines():
