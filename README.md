@@ -4,11 +4,18 @@ Minimal CLI to browse arXiv and vote on papers, with paper data and votes stored
 
 ### Quickstart
 
-- **Install** — use the one-liners under [Install](#install) (`uv tool install …` or `pip install …`).
-- **Browse** — `cuhkvoting today` needs no GitHub auth. With a keyword: `cuhkvoting today gravitational wave`.
-- **Standings** — `cuhkvoting topvoted` (10 papers by default; pass `--N` for a different limit).
-- **Vote** — `cuhkvoting vote <arxiv-id>` needs write access: set `GITHUB_TOKEN` or `CUHKVOTING_TOKEN`, or use SSH to the records repo. Set `CUHKVOTING_USER` if your GitHub username is not your `git config user.name`.
-- **More** — run `cuhkvoting --help`; see **Quick setup** and **Commands** for auth details and examples.
+Copy the whole block into a terminal (read-only commands work without GitHub auth; use `pip install` instead of `uv tool install` if you prefer—see [Install](#install)):
+
+```bash
+uv tool install --upgrade git+https://github.com/gravityhub-org/cuhkvoting.git && cuhkvoting --install-completion
+cuhkvoting today
+cuhkvoting today gravitational wave
+cuhkvoting topvoted
+cuhkvoting --help
+# Voting needs a token or SSH; see Quick setup below.
+# export CUHKVOTING_USER=your-github-username
+# cuhkvoting vote 2504.12345
+```
 
 ### Install
 
