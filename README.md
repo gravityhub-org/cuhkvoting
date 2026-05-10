@@ -8,12 +8,12 @@ Copy the whole block into a terminal (read-only commands work without GitHub aut
 
 ```bash
 uv tool install --upgrade git+https://github.com/gravityhub-org/cuhkvoting.git && cuhkvoting --install-completion
-cuhkvoting today
-cuhkvoting lastweek gravitational wave
-cuhkvoting topvoted
-cuhkvoting --help
-cuhkvoting vote 2504.12345 # Should work if you have ssh key and are member of gravityhub-org (but if not, see setup below)
-cuhkvoting vote remove 2504.12345 # Should work if you have ssh key and are member of gravityhub-org (but if not, see setup below)
+cuhkvoting today # Lists arxiv papers today
+cuhkvoting lastweek gravitational wave # Lists last week's papers with "gravitational" and "wave" in title/abstract
+cuhkvoting topvoted # Shows top voted papers
+cuhkvoting --help # Help 
+cuhkvoting vote 2504.12345 # Vote for 2504.12345 [requires ssh key; see setup below]
+cuhkvoting vote remove 2504.12345 # Remove vote for 2504.12345
 ```
 
 ### Install
