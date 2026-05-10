@@ -13,6 +13,7 @@ cuhkvoting today gravitational wave
 cuhkvoting topvoted
 cuhkvoting --help
 cuhkvoting vote 2504.12345 # Should work if you have ssh key and are member of gravityhub-org (but if not, see setup below)
+cuhkvoting vote remove 2504.12345 # Should work if you have ssh key and are member of gravityhub-org (but if not, see setup below)
 ```
 
 ### Install
