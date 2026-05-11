@@ -226,7 +226,7 @@ def _org_join_instructions() -> str:
         "Looks like SSH key works, but you do not have write access to gravityhub-org/cuhkvoting-records.\n"
         "Please join GitHub organization 'gravityhub-org' to get repo write permission.\n"
         "Contact one of these maintainers to be added:\n"
-        "- Samson Leong <samson32081@gmail.com>\n"
+        "- Samson Leong <samson.hwleong@gmail.com>\n"
         "- Brian Hiu Yeung Cheng <1155175825@link.cuhk.edu.hk>\n"
         "- Hannuksela Otto Akseli <otto.akseli.hannuksela@gmail.com>"
     )
