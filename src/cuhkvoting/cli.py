@@ -22,6 +22,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from typing import NoReturn
 
 import typer
 
@@ -291,8 +292,28 @@ def _github_headers(token: str | None = None) -> dict[str, str]:
     return headers
 
 
+def _gh_cli_token() -> str | None:
+    try:
+        proc = subprocess.run(
+            ["gh", "auth", "token"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+    except (FileNotFoundError, OSError):
+        pass
+    return None
+
+
 def _get_token() -> str | None:
     token = os.getenv("CUHKVOTING_TOKEN") or os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+    if token:
+        return token
+    token = _gh_cli_token()
     if token:
         return token
     try:
@@ -325,14 +346,87 @@ def _get_user_from_token(token: str | None) -> str | None:
         return None
 
 
+def _github_http_error_read(e: urllib.error.HTTPError) -> tuple[int, str]:
+    try:
+        body = e.read().decode("utf-8", errors="replace")
+    except Exception:
+        body = ""
+    return e.code, body
+
+
+def _exit_github_api_http_from_body(token: str | None, code: int, raw: str) -> NoReturn:
+    """Always raises SystemExit; never leaks GitHub JSON error bodies."""
+    low = raw.lower()
+    if code == 429 or (code == 403 and "rate limit" in low):
+        if token:
+            raise SystemExit("GitHub API rate limit — retry in a few minutes.") from None
+        raise SystemExit(
+            "GitHub needs credentials (anonymous API blocked).\n"
+            "  export GITHUB_TOKEN=…   |   gh auth login   |   SSH key → ssh -T git@github.com"
+        ) from None
+    raise SystemExit(f"GitHub API HTTP {code}. Check GITHUB_TOKEN or repo access.") from None
+
+
+def _load_papers_json_from_dir(papers_dir: Path) -> list[dict]:
+    papers: list[dict] = []
+    if not papers_dir.exists():
+        return papers
+    for path in sorted(papers_dir.glob("*.json")):
+        try:
+            papers.append(json.loads(path.read_text(encoding="utf-8")))
+        except Exception:
+            continue
+    return papers
+
+
+def _list_papers_via_git_clone(cfg: RepoConfig) -> list[dict]:
+    clone_dir = _with_repo_checkout(cfg)
+    try:
+        return _load_papers_json_from_dir(Path(clone_dir) / "papers")
+    finally:
+        shutil.rmtree(clone_dir, ignore_errors=True)
+
+
+def _find_legacy_paper_via_git(cfg: RepoConfig, base_id: str) -> tuple[dict | None, str | None, str | None]:
+    clone_dir = _with_repo_checkout(cfg)
+    try:
+        papers_dir = Path(clone_dir) / "papers"
+        if not papers_dir.exists():
+            return None, None, None
+        for cand in papers_dir.glob("*.json"):
+            try:
+                paper = json.loads(cand.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if _strip_arxiv_version(str(paper.get("id", ""))) == base_id:
+                return paper, None, str(cand.relative_to(clone_dir))
+        return None, None, None
+    finally:
+        shutil.rmtree(clone_dir, ignore_errors=True)
+
+
+def _load_paper_via_git_clone(cfg: RepoConfig, path: str) -> tuple[dict | None, str | None]:
+    clone_dir = _with_repo_checkout(cfg)
+    try:
+        paper_file = Path(clone_dir) / path
+        if not paper_file.exists():
+            return None, None
+        return json.loads(paper_file.read_text(encoding="utf-8")), None
+    finally:
+        shutil.rmtree(clone_dir, ignore_errors=True)
+
+
 def _load_paper_via_api(cfg: RepoConfig, path: str, token: str | None) -> tuple[dict | None, str | None]:
+    if not token and _has_github_ssh_access():
+        return _load_paper_via_git_clone(cfg, path)
     url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/contents/{path}?ref={cfg.branch}"
     try:
         data = _http_json(url, headers=_github_headers(token))
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None, None
-        raise
+        code, body = _github_http_error_read(e)
+        _exit_github_api_http_from_body(token, code, body)
     content = base64.b64decode(data["content"]).decode("utf-8")
     return json.loads(content), data.get("sha")
 
@@ -368,6 +462,17 @@ def _delete_paper_via_api(cfg: RepoConfig, path: str, sha: str, token: str, mess
 
 
 def _load_jc_records(cfg: RepoConfig, token: str | None) -> tuple[list[dict], str | None]:
+    if not token and _has_github_ssh_access():
+        clone_dir = _with_repo_checkout(cfg)
+        try:
+            p = Path(clone_dir) / JC_RECORD_PATH
+            if p.exists():
+                body = json.loads(p.read_text(encoding="utf-8"))
+                records = body.get("records", [])
+                return (records if isinstance(records, list) else []), None
+        finally:
+            shutil.rmtree(clone_dir, ignore_errors=True)
+        return [], None
     data, sha = _load_json_via_api(cfg, JC_RECORD_PATH, token)
     if data is not None:
         records = data.get("records", [])
@@ -447,13 +552,16 @@ def _list_papers_via_api(cfg: RepoConfig, token: str | None) -> list[dict]:
         except (urllib.error.HTTPError, urllib.error.URLError,
                 json.JSONDecodeError, KeyError, RuntimeError):
             pass
+    if not token and _has_github_ssh_access():
+        return _list_papers_via_git_clone(cfg)
     url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/git/trees/{cfg.branch}?recursive=1"
     try:
         data = _http_json(url, headers=_github_headers(token))
     except urllib.error.HTTPError as e:
         if e.code in (404, 409):
             return []
-        raise
+        code, body = _github_http_error_read(e)
+        _exit_github_api_http_from_body(token, code, body)
     papers: list[dict] = []
     for obj in data.get("tree", []):
         path = obj.get("path", "")
@@ -803,13 +911,20 @@ def _entry_in_date_spans(entry: dict, spans: list[tuple[dt.date, dt.date]]) -> b
 
 
 def _find_legacy_paper_via_api(cfg: RepoConfig, base_id: str, token: str | None) -> tuple[dict | None, str | None, str | None]:
+    if not token and _has_github_ssh_access():
+        return _find_legacy_paper_via_git(cfg, base_id)
     url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/git/trees/{cfg.branch}?recursive=1"
     try:
         data = _http_json(url, headers=_github_headers(token))
     except urllib.error.HTTPError as e:
         if e.code in (404, 409):
             return None, None, None
-        raise
+        code, body = _github_http_error_read(e)
+        if not token and _has_github_ssh_access() and (
+            code == 429 or (code == 403 and "rate limit" in body.lower())
+        ):
+            return _find_legacy_paper_via_git(cfg, base_id)
+        _exit_github_api_http_from_body(token, code, body)
     for obj in data.get("tree", []):
         path = obj.get("path", "")
         if obj.get("type") != "blob" or not path.startswith("papers/") or not path.endswith(".json"):
@@ -1368,17 +1483,6 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
     repo_cfg = _resolve_repo_config(args)
     token = _get_token()
     papers = _list_papers_via_api(repo_cfg, token)
-    if not papers and _has_github_ssh_access():
-        clone_dir = _with_repo_checkout(repo_cfg)
-        try:
-            papers_dir = Path(clone_dir) / "papers"
-            for path in sorted(papers_dir.glob("*.json")) if papers_dir.exists() else []:
-                try:
-                    papers.append(json.loads(path.read_text(encoding="utf-8")))
-                except Exception:
-                    continue
-        finally:
-            shutil.rmtree(clone_dir, ignore_errors=True)
 
     dn_table = _fetch_display_names(repo_cfg, token)
     rows = _topvoted_rows_from_papers(papers, dn_table)
