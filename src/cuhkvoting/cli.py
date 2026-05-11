@@ -468,21 +468,31 @@ def _list_papers_via_api(cfg: RepoConfig, token: str | None) -> list[dict]:
 def _arxiv_query(params: dict[str, str]) -> list[dict[str, str]]:
     url = f"{ARXIV_API}?{urllib.parse.urlencode(params)}"
     delays = [10, 20, 60]
+    _retry_label = "arXiv error"
     for attempt, delay in enumerate([-1] + delays):
         if attempt > 0:
             for remaining in range(delay, 0, -1):
-                sys.stderr.write(f"\rarXiv rate limit (attempt {attempt}/{len(delays)}), retrying in {remaining}s… ")
+                sys.stderr.write(f"\r{_retry_label} (attempt {attempt}/{len(delays)}), retrying in {remaining}s… ")
                 sys.stderr.flush()
                 time.sleep(1)
-            sys.stderr.write("\r" + " " * 50 + "\r")
+            sys.stderr.write("\r" + " " * 70 + "\r")
             sys.stderr.flush()
         try:
             xml_str = _http_text(url, headers={"User-Agent": USER_AGENT})
             break
-        except (ConnectionError, urllib.error.HTTPError, http.client.IncompleteRead) as e:
+        except (ConnectionError, TimeoutError, urllib.error.URLError, http.client.IncompleteRead) as e:
             code = getattr(e, "code", None)
             if attempt == len(delays) or (code is not None and code not in (429, 503)):
                 raise
+            if code in (429, 503):
+                _retry_label = "arXiv rate limit"
+            elif isinstance(e, TimeoutError):
+                _retry_label = "arXiv timeout"
+            elif isinstance(e, http.client.IncompleteRead):
+                _retry_label = "arXiv incomplete response"
+            else:
+                reason = getattr(e, "reason", None) or str(e)
+                _retry_label = f"arXiv connection error: {reason}"
     root = ET.fromstring(xml_str)
     ns = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
     entries: list[dict[str, str]] = []
