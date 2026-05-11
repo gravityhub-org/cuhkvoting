@@ -470,8 +470,12 @@ def _arxiv_query(params: dict[str, str]) -> list[dict[str, str]]:
     delays = [10, 20, 60]
     for attempt, delay in enumerate([-1] + delays):
         if attempt > 0:
-            typer.echo(f"arXiv rate limit, retrying in {delay}s…", err=True)
-            time.sleep(delay)
+            for remaining in range(delay, 0, -1):
+                sys.stderr.write(f"\rarXiv rate limit (attempt {attempt}/{len(delays)}), retrying in {remaining}s… ")
+                sys.stderr.flush()
+                time.sleep(1)
+            sys.stderr.write("\r" + " " * 50 + "\r")
+            sys.stderr.flush()
         try:
             xml_str = _http_text(url, headers={"User-Agent": USER_AGENT})
             break
