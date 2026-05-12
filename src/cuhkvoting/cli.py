@@ -737,7 +737,7 @@ def _format_voters(votes: list[dict], table: dict[str, str] | None = None) -> st
 
 
 def _make_vote_entry(user: str) -> dict:
-    return {"user": user, "voted_at": dt.datetime.utcnow().isoformat() + "Z"}
+    return {"user": user, "voted_at": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")}
 
 
 def _filter_entries(entries: list[dict[str, str]], keywords: list[str] | None) -> list[dict[str, str]]:
@@ -822,7 +822,7 @@ def _find_legacy_paper_via_api(cfg: RepoConfig, base_id: str, token: str | None)
 
 def _parse_utc(ts: str) -> dt.datetime | None:
     try:
-        return dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).replace(tzinfo=None)
+        return dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except Exception:
         return None
 
@@ -841,7 +841,7 @@ def _latest_vote_timestamp(votes: list[dict]) -> float:
 
 
 def _prune_expired_votes(paper: dict) -> int:
-    cutoff = dt.datetime.utcnow() - dt.timedelta(days=VOTE_EXPIRY_DAYS)
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=VOTE_EXPIRY_DAYS)
     votes = paper.get("votes", [])
     kept = []
     for v in votes:
@@ -1007,7 +1007,7 @@ def _load_cache_data(key: str) -> dict | None:
 def _save_cache(key: str, categories: list[str], entries: list[dict]) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     data = {
-        "fetched_at": dt.datetime.utcnow().isoformat() + "Z",
+        "fetched_at": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
         "categories": sorted(categories),
         "entries": entries,
     }
@@ -1036,7 +1036,7 @@ def _resolve_cache(
 
     if data is not None:
         fetched_at = _parse_utc(data.get("fetched_at", ""))
-        is_stale = fetched_at is None or (dt.datetime.utcnow() - fetched_at).total_seconds() > max_age_seconds
+        is_stale = fetched_at is None or (dt.datetime.now(dt.timezone.utc) - fetched_at).total_seconds() > max_age_seconds
         cached_cats = data.get("categories")
         if not is_stale and cached_cats:
             cached_set = set(cached_cats)
@@ -1158,20 +1158,29 @@ def _resolve_paper_ids(raw_ids: list[str]) -> list[tuple[str, str | None, int | 
 
 
 def _fetch_today_entries(categories: list[str]) -> list[dict]:
-    now = dt.datetime.utcnow()
-    start = (now - dt.timedelta(days=1)).strftime("%Y%m%d%H%M")
-    end = now.strftime("%Y%m%d%H%M")
-    return _arxiv_query({
-        "search_query": f"{_build_cat_query(categories)} AND submittedDate:[{start} TO {end}]",
+    # arXiv doesn't announce on weekends; a strict 24-hour submittedDate window
+    # would return nothing on Monday morning. Query a 7-day window instead and
+    # keep only papers from the most recent announcement date (published field).
+    end_day = dt.datetime.now(dt.timezone.utc).date()
+    start_day = end_day - dt.timedelta(days=7)
+    all_entries = _arxiv_query({
+        "search_query": f"{_build_cat_query(categories)} AND submittedDate:[{start_day.strftime('%Y%m%d')}0000 TO {end_day.strftime('%Y%m%d')}2359]",
         "start": "0",
-        "max_results": "200",
+        "max_results": "1000",
         "sortBy": "submittedDate",
         "sortOrder": "descending",
     })
+    latest_date = max(
+        (e.get("published", "")[:10] for e in all_entries if e.get("published")),
+        default="",
+    )
+    if not latest_date:
+        return all_entries
+    return [e for e in all_entries if e.get("published", "").startswith(latest_date)]
 
 
 def _fetch_lastweek_entries(categories: list[str]) -> list[dict]:
-    end_day = dt.datetime.utcnow().date()
+    end_day = dt.datetime.now(dt.timezone.utc).date()
     start_day = end_day - dt.timedelta(days=7)
     return _arxiv_query({
         "search_query": f"{_build_cat_query(categories)} AND submittedDate:[{start_day.strftime('%Y%m%d')}0000 TO {end_day.strftime('%Y%m%d')}2359]",
@@ -1267,6 +1276,13 @@ def cmd_today(args: SimpleNamespace) -> int:
     if not entries:
         print("No papers found for today (UTC).")
         return 0
+    batch_date = max(
+        (e.get("published", "")[:10] for e in entries if e.get("published")),
+        default="",
+    )
+    today_utc = dt.datetime.now(dt.timezone.utc).date().isoformat()
+    if batch_date and batch_date != today_utc:
+        print(typer.style(f"Note: no papers announced today (UTC); showing last available batch ({batch_date}).", fg=typer.colors.YELLOW))
     entries = _filter_entries(entries, getattr(args, "keywords", None))
     if not entries:
         print("No papers matched keyword filter.")
@@ -1312,15 +1328,16 @@ def cmd_lastweek(args: SimpleNamespace) -> int:
     today_stale = (
         today_data is None
         or today_fetched_at is None
-        or (dt.datetime.utcnow() - today_fetched_at).total_seconds() > cfg.today_max_age * 60
+        or (dt.datetime.now(dt.timezone.utc) - today_fetched_at).total_seconds() > cfg.today_max_age * 60
         or set(today_data.get("categories", [])) != set(categories)
+        or not today_data.get("entries")
     )
     if today_stale:
-        cutoff = dt.datetime.utcnow() - dt.timedelta(days=1)
-        today_entries = [
-            e for e in entries
-            if (_parse_utc(e.get("published", "")) or dt.datetime.min) >= cutoff
-        ]
+        latest_date = max(
+            (e.get("published", "")[:10] for e in entries if e.get("published")),
+            default="",
+        )
+        today_entries = [e for e in entries if e.get("published", "").startswith(latest_date)] if latest_date else []
         _save_cache("today", categories, today_entries)
     abstract_lines = getattr(args, "abstract", None)
     if abstract_lines is None:
@@ -1535,7 +1552,7 @@ def _batch_vote_papers_ssh(
     try:
         papers_dir = Path(clone_dir) / "papers"
         papers_dir.mkdir(parents=True, exist_ok=True)
-        ts = dt.datetime.utcnow().isoformat() + "Z"
+        ts = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
         for p in papers:
             paper_id = _strip_arxiv_version(p["paper_id"])
             title = p.get("title", "")
@@ -1658,7 +1675,7 @@ def _batch_vote_papers_api(
 
     base_url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}"
     json_headers = {**_github_headers(token), "Content-Type": "application/json"}
-    ts = dt.datetime.utcnow().isoformat() + "Z"
+    ts = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
     # Step 1: fetch all needed paper files + display_names.json in one GraphQL request
     aliases: list[str] = []
@@ -1868,10 +1885,10 @@ def cmd_select(args: SimpleNamespace) -> int:
         }
     _prune_expired_votes(paper)
     vote_count = len(paper.get("votes", []))
-    now = dt.datetime.utcnow()
+    now = dt.datetime.now(dt.timezone.utc)
     year, week, _ = now.isocalendar()
     week_tag = f"{year}-W{week:02d}"
-    selected_at = now.isoformat() + "Z"
+    selected_at = now.isoformat().replace("+00:00", "Z")
     canonical_id = _strip_arxiv_version(str(paper.get("id", paper_id)))
 
     records, record_sha = _load_jc_records(cfg, token)
