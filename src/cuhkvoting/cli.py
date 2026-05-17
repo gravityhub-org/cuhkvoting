@@ -30,6 +30,9 @@ import typer
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0"
 ARXIV_API = "https://export.arxiv.org/api/query"
 ARXIV_ABS = "https://arxiv.org/abs/"
+ARXIV_HTTP_TIMEOUT = 15
+ARXIV_RETRY_DELAYS = (2, 5, 10)
+ARXIV_QUERY_MAX_SECONDS = 60
 ARXIV_FOUNDING_DATE = dt.date(1991, 8, 14)
 INSPIRE_API = "https://inspirehep.net/api/literature"
 DEFAULT_REPO = "gravityhub-org/cuhkvoting-records"
@@ -138,9 +141,9 @@ def _load_config() -> Config:
     )
 
 
-def _http_text(url: str, headers: dict[str, str] | None = None) -> str:
+def _http_text(url: str, headers: dict[str, str] | None = None, *, timeout: float = 30) -> str:
     req = urllib.request.Request(url, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8")
 
 
@@ -573,34 +576,65 @@ def _list_papers_via_api(cfg: RepoConfig, token: str | None) -> list[dict]:
     return papers
 
 
+def _arxiv_retry_label(exc: BaseException) -> str:
+    code = getattr(exc, "code", None)
+    if code in (429, 503):
+        return "arXiv rate limit"
+    if isinstance(exc, TimeoutError):
+        return "arXiv timeout"
+    if isinstance(exc, http.client.IncompleteRead):
+        return "arXiv incomplete response"
+    reason = getattr(exc, "reason", None) or str(exc)
+    return f"arXiv connection error: {reason}"
+
+
 def _arxiv_query(params: dict[str, str]) -> list[dict[str, str]]:
     url = f"{ARXIV_API}?{urllib.parse.urlencode(params)}"
-    delays = [10, 20, 60]
+    delays = ARXIV_RETRY_DELAYS
+    max_attempts = len(delays)
+    deadline = time.monotonic() + ARXIV_QUERY_MAX_SECONDS
     _retry_label = "arXiv error"
-    for attempt, delay in enumerate([-1] + delays):
+    last_error: BaseException | None = None
+    xml_str: str | None = None
+
+    for attempt in range(max_attempts + 1):
         if attempt > 0:
+            delay = min(delays[attempt - 1], max(0, int(deadline - time.monotonic())))
+            if delay <= 0:
+                break
             for remaining in range(delay, 0, -1):
-                sys.stderr.write(f"\r{_retry_label} (attempt {attempt}/{len(delays)}), retrying in {remaining}s… ")
+                sys.stderr.write(
+                    f"\r{_retry_label} (attempt {attempt}/{max_attempts}), retrying in {remaining}s… "
+                )
                 sys.stderr.flush()
                 time.sleep(1)
             sys.stderr.write("\r" + " " * 70 + "\r")
             sys.stderr.flush()
         try:
-            xml_str = _http_text(url, headers={"User-Agent": USER_AGENT})
+            xml_str = _http_text(
+                url,
+                headers={"User-Agent": USER_AGENT},
+                timeout=ARXIV_HTTP_TIMEOUT,
+            )
             break
         except (ConnectionError, TimeoutError, urllib.error.URLError, http.client.IncompleteRead) as e:
+            last_error = e
+            _retry_label = _arxiv_retry_label(e)
             code = getattr(e, "code", None)
-            if attempt == len(delays) or (code is not None and code not in (429, 503)):
-                raise
-            if code in (429, 503):
-                _retry_label = "arXiv rate limit"
-            elif isinstance(e, TimeoutError):
-                _retry_label = "arXiv timeout"
-            elif isinstance(e, http.client.IncompleteRead):
-                _retry_label = "arXiv incomplete response"
-            else:
-                reason = getattr(e, "reason", None) or str(e)
-                _retry_label = f"arXiv connection error: {reason}"
+            if attempt >= max_attempts or time.monotonic() >= deadline:
+                break
+            if code is not None and code not in (429, 503):
+                break
+
+    if xml_str is None:
+        detail = _retry_label
+        if last_error is not None and _retry_label == "arXiv error":
+            detail = _arxiv_retry_label(last_error)
+        raise SystemExit(
+            f"{detail}. arXiv still unavailable after {max_attempts} retries "
+            f"(~{ARXIV_QUERY_MAX_SECONDS}s max); try again later."
+        ) from last_error
+
     root = ET.fromstring(xml_str)
     ns = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
     entries: list[dict[str, str]] = []
@@ -1904,7 +1938,15 @@ def cmd_vote(args: SimpleNamespace) -> int:
 
     if paper is None:
         cached = _lookup_local_cache(paper_id)
-        entry = cached if cached else _validate_arxiv_entry(paper_id)
+        if cached:
+            entry = cached
+        else:
+            entry = {
+                "id": _strip_arxiv_version(paper_id),
+                "title": "",
+                "abstract": "",
+                "url": f"{ARXIV_ABS}{paper_id}",
+            }
         paper = {
             "id": entry["id"],
             "title": entry.get("title", ""),
@@ -2217,16 +2259,13 @@ def vote_command(
     _warn_if_display_name_changed(display_name)
     repo_cfg = _resolve_repo_config(SimpleNamespace(repo=repo, branch=branch))
 
-    # Resolve title/url for each paper from local cache, falling back to arXiv.
+    # Resolve title from last list or local cache only — voting must not block on arXiv.
     papers_meta: list[dict] = []
     for arxiv_id, title, _ in resolved:
         if not title:
             cached = _lookup_local_cache(arxiv_id)
             if cached:
                 title = cached.get("title", "")
-            else:
-                entry = _validate_arxiv_entry(arxiv_id)
-                title = entry.get("title", "")
         papers_meta.append({
             "paper_id": arxiv_id,
             "title": title or "",
