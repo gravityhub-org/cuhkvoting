@@ -35,6 +35,10 @@ ARXIV_RETRY_DELAYS = (2, 5, 10)
 ARXIV_QUERY_MAX_SECONDS = 60
 ARXIV_FOUNDING_DATE = dt.date(1991, 8, 14)
 INSPIRE_API = "https://inspirehep.net/api/literature"
+INSPIRE_ARXIV_RECORD = "https://inspirehep.net/api/arxiv"
+INSPIRE_HTTP_TIMEOUT = 15
+INSPIRE_RETRY_DELAYS = (1, 2, 5)
+INSPIRE_QUERY_MAX_SECONDS = 30
 DEFAULT_REPO = "gravityhub-org/cuhkvoting-records"
 VOTE_EXPIRY_DAYS = 183
 JC_RECORD_PATH = "papers/journal_club_records.json"
@@ -670,7 +674,7 @@ def _inspire_query(query: str, limit: int) -> list[dict[str, str]]:
         "q": query,
         "size": str(limit),
         "sort": "mostrecent",
-        "fields": "titles,abstracts,authors,arxiv_eprints,control_number",
+        "fields": "titles,abstracts,authors,arxiv_eprints,control_number,earliest_date,preprint_date",
     }
     url = f"{INSPIRE_API}?{urllib.parse.urlencode(params)}"
     data = _http_json(url, headers={"User-Agent": USER_AGENT})
@@ -716,6 +720,18 @@ def _inspire_query(query: str, limit: int) -> list[dict[str, str]]:
             continue
         paper_id = arxiv_id
         paper_url = f"{ARXIV_ABS}{arxiv_id}"
+        earliest_date = metadata.get("earliest_date")
+        if not isinstance(earliest_date, str):
+            earliest_date = ""
+        preprint_date = metadata.get("preprint_date")
+        if not isinstance(preprint_date, str):
+            preprint_date = ""
+        cats: list[str] = []
+        if isinstance(arxiv_eprints, list) and arxiv_eprints and isinstance(arxiv_eprints[0], dict):
+            raw_cats = arxiv_eprints[0].get("categories", [])
+            if isinstance(raw_cats, list):
+                cats = [str(c) for c in raw_cats if str(c).strip()]
+        primary_category = cats[0] if cats else ""
         entries.append(
             {
                 "id": paper_id,
@@ -723,9 +739,219 @@ def _inspire_query(query: str, limit: int) -> list[dict[str, str]]:
                 "abstract": abstract,
                 "url": paper_url,
                 "authors": authors,
+                "published": preprint_date or earliest_date,
+                "primary_category": primary_category,
             }
         )
     return entries
+
+
+def _inspire_retry_label(exc: BaseException) -> str:
+    code = getattr(exc, "code", None)
+    if code == 429:
+        return "INSPIRE rate limit"
+    if code in (502, 503, 504):
+        return "INSPIRE unavailable"
+    if isinstance(exc, TimeoutError):
+        return "INSPIRE timeout"
+    if isinstance(exc, http.client.IncompleteRead):
+        return "INSPIRE incomplete response"
+    reason = getattr(exc, "reason", None) or str(exc)
+    return f"INSPIRE connection error: {reason}"
+
+
+def _inspire_query_retry(query: str, limit: int) -> list[dict[str, str]]:
+    delays = INSPIRE_RETRY_DELAYS
+    max_attempts = len(delays)
+    deadline = time.monotonic() + INSPIRE_QUERY_MAX_SECONDS
+    _retry_label = "INSPIRE error"
+    last_error: BaseException | None = None
+
+    for attempt in range(max_attempts + 1):
+        if attempt > 0:
+            delay = min(delays[attempt - 1], max(0, int(deadline - time.monotonic())))
+            if delay <= 0:
+                break
+            time.sleep(delay)
+        try:
+            # _inspire_query uses _http_json which has 30s timeout; avoid that.
+            params = {
+                "q": query,
+                "size": str(limit),
+                "sort": "mostrecent",
+                "fields": "titles,abstracts,authors,arxiv_eprints,control_number,earliest_date,preprint_date",
+            }
+            url = f"{INSPIRE_API}?{urllib.parse.urlencode(params)}"
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=INSPIRE_HTTP_TIMEOUT) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            # Reuse parsing logic by temporarily calling _inspire_query-style parser.
+            hits = data.get("hits", {}).get("hits", [])
+            parsed: list[dict[str, str]] = []
+            for hit in hits if isinstance(hits, list) else []:
+                metadata = hit.get("metadata", {}) if isinstance(hit, dict) else {}
+                if not isinstance(metadata, dict):
+                    continue
+                titles = metadata.get("titles", [])
+                title = ""
+                if isinstance(titles, list):
+                    for t in titles:
+                        if isinstance(t, dict) and isinstance(t.get("title"), str) and t.get("title", "").strip():
+                            title = " ".join(t["title"].split())
+                            break
+                if not title:
+                    continue
+                abstracts = metadata.get("abstracts", [])
+                abstract = ""
+                if isinstance(abstracts, list):
+                    for a in abstracts:
+                        if isinstance(a, dict) and isinstance(a.get("value"), str) and a.get("value", "").strip():
+                            abstract = " ".join(a["value"].split())
+                            break
+                authors_raw = metadata.get("authors", [])
+                authors: list[str] = []
+                if isinstance(authors_raw, list):
+                    for author in authors_raw:
+                        if isinstance(author, dict):
+                            name = author.get("full_name")
+                            if isinstance(name, str) and name.strip():
+                                authors.append(" ".join(name.split()))
+                arxiv_id = ""
+                arxiv_eprints = metadata.get("arxiv_eprints", [])
+                if isinstance(arxiv_eprints, list):
+                    for ep in arxiv_eprints:
+                        if isinstance(ep, dict) and isinstance(ep.get("value"), str) and ep.get("value", "").strip():
+                            arxiv_id = _strip_arxiv_version(ep["value"])
+                            break
+                if not arxiv_id:
+                    continue
+                earliest_date = metadata.get("earliest_date")
+                if not isinstance(earliest_date, str):
+                    earliest_date = ""
+                preprint_date = metadata.get("preprint_date")
+                if not isinstance(preprint_date, str):
+                    preprint_date = ""
+                cats: list[str] = []
+                if isinstance(arxiv_eprints, list) and arxiv_eprints and isinstance(arxiv_eprints[0], dict):
+                    raw_cats = arxiv_eprints[0].get("categories", [])
+                    if isinstance(raw_cats, list):
+                        cats = [str(c) for c in raw_cats if str(c).strip()]
+                primary_category = cats[0] if cats else ""
+                parsed.append(
+                    {
+                        "id": arxiv_id,
+                        "title": title,
+                        "abstract": abstract,
+                        "url": f"{ARXIV_ABS}{arxiv_id}",
+                        "authors": authors,
+                        "published": preprint_date or earliest_date,
+                        "primary_category": primary_category,
+                    }
+                )
+            return parsed
+        except (ConnectionError, TimeoutError, urllib.error.URLError, http.client.IncompleteRead) as e:
+            last_error = e
+            _retry_label = _inspire_retry_label(e)
+            code = getattr(e, "code", None)
+            if attempt >= max_attempts or time.monotonic() >= deadline:
+                break
+            if code is not None and code not in (429, 502, 503, 504):
+                break
+
+    detail = _retry_label
+    if last_error is not None and _retry_label == "INSPIRE error":
+        detail = _inspire_retry_label(last_error)
+    raise SystemExit(
+        f"{detail}. INSPIRE still unavailable after {max_attempts} retries "
+        f"(~{INSPIRE_QUERY_MAX_SECONDS}s max); try again later."
+    ) from last_error
+
+
+def _inspire_get_by_arxiv_id(paper_id: str) -> dict | None:
+    clean = _strip_arxiv_version(paper_id)
+    url = f"{INSPIRE_ARXIV_RECORD}/{urllib.parse.quote(clean)}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=INSPIRE_HTTP_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+    metadata = data.get("metadata", {})
+    if not isinstance(metadata, dict):
+        return None
+    # Reuse _inspire_query parsing style for single record.
+    titles = metadata.get("titles", [])
+    title = ""
+    if isinstance(titles, list):
+        for t in titles:
+            if isinstance(t, dict) and isinstance(t.get("title"), str) and t.get("title", "").strip():
+                title = " ".join(t["title"].split())
+                break
+    abstracts = metadata.get("abstracts", [])
+    abstract = ""
+    if isinstance(abstracts, list):
+        for a in abstracts:
+            if isinstance(a, dict) and isinstance(a.get("value"), str) and a.get("value", "").strip():
+                abstract = " ".join(a["value"].split())
+                break
+    authors_raw = metadata.get("authors", [])
+    authors: list[str] = []
+    if isinstance(authors_raw, list):
+        for author in authors_raw:
+            if isinstance(author, dict):
+                name = author.get("full_name")
+                if isinstance(name, str) and name.strip():
+                    authors.append(" ".join(name.split()))
+    arxiv_eprints = metadata.get("arxiv_eprints", [])
+    cats: list[str] = []
+    if isinstance(arxiv_eprints, list) and arxiv_eprints and isinstance(arxiv_eprints[0], dict):
+        raw_cats = arxiv_eprints[0].get("categories", [])
+        if isinstance(raw_cats, list):
+            cats = [str(c) for c in raw_cats if str(c).strip()]
+    primary_category = cats[0] if cats else ""
+    earliest_date = metadata.get("earliest_date")
+    if not isinstance(earliest_date, str):
+        earliest_date = ""
+    preprint_date = metadata.get("preprint_date")
+    if not isinstance(preprint_date, str):
+        preprint_date = ""
+    return {
+        "id": clean,
+        "title": title,
+        "abstract": abstract,
+        "url": f"{ARXIV_ABS}{clean}",
+        "authors": authors,
+        "published": preprint_date or earliest_date,
+        "primary_category": primary_category,
+    }
+
+
+def _fetch_entries(categories: list[str], start: dt.date, end: dt.date, limit: int) -> list[dict]:
+    # INSPIRE stores arXiv categories in arxiv_eprints.categories and dates in earliest_date.
+    # earliest_date is day-granular; arXiv API supports minutes. Accept slight difference to avoid arXiv timeouts.
+    cats_q = "(" + " or ".join(f"arxiv_eprints.categories:{c}" for c in categories) + ")"
+    q = f"{cats_q} and earliest_date:[{start.isoformat()} to {end.isoformat()}]"
+    try:
+        return _inspire_query_retry(q, limit)
+    except SystemExit:
+        # If INSPIRE itself unavailable, fall back to arXiv API with existing retry logic.
+        # Keep behavior identical when INSPIRE is down.
+        start_dt = dt.datetime.combine(start, dt.time.min)
+        end_dt = dt.datetime.combine(end, dt.time.max).replace(second=0, microsecond=0)
+        return _arxiv_query(
+            {
+                "search_query": (
+                    f"{_build_cat_query(categories)} AND "
+                    f"submittedDate:[{start_dt.strftime('%Y%m%d%H%M')} TO {end_dt.strftime('%Y%m%d%H%M')}]"
+                ),
+                "start": "0",
+                "max_results": str(limit),
+                "sortBy": "submittedDate",
+                "sortOrder": "descending",
+            }
+        )
 
 
 def _build_inspire_title_query(keywords: list[str]) -> str:
@@ -1105,6 +1331,13 @@ def _delete_vote_paper(
 
 
 def _validate_arxiv_entry(paper_id: str) -> dict:
+    # Prefer INSPIRE record-by-id to avoid arXiv API timeouts.
+    try:
+        entry = _inspire_get_by_arxiv_id(paper_id)
+        if entry:
+            return entry
+    except Exception:
+        pass
     entries = _arxiv_query({"search_query": f"id:{paper_id}", "start": "0", "max_results": "1"})
     if not entries:
         raise SystemExit(f"Could not find arXiv entry for id '{paper_id}'.")
@@ -1307,41 +1540,19 @@ def _resolve_paper_ids(raw_ids: list[str]) -> list[tuple[str, str | None, int | 
 
 
 def _fetch_today_entries(categories: list[str]) -> list[dict]:
-    now = dt.datetime.utcnow()
-    start = (now - dt.timedelta(days=1)).strftime("%Y%m%d%H%M")
-    end = now.strftime("%Y%m%d%H%M")
-    return _arxiv_query({
-        "search_query": f"{_build_cat_query(categories)} AND submittedDate:[{start} TO {end}]",
-        "start": "0",
-        "max_results": "200",
-        "sortBy": "submittedDate",
-        "sortOrder": "descending",
-    })
+    end = dt.datetime.utcnow().date()
+    start = end - dt.timedelta(days=1)
+    return _fetch_entries(categories, start, end, limit=200)
 
 
 def _fetch_lastweek_entries(categories: list[str]) -> list[dict]:
-    end_day = dt.datetime.utcnow().date()
-    start_day = end_day - dt.timedelta(days=7)
-    return _arxiv_query({
-        "search_query": f"{_build_cat_query(categories)} AND submittedDate:[{start_day.strftime('%Y%m%d')}0000 TO {end_day.strftime('%Y%m%d')}2359]",
-        "start": "0",
-        "max_results": "1000",
-        "sortBy": "submittedDate",
-        "sortOrder": "descending",
-    })
+    end = dt.datetime.utcnow().date()
+    start = end - dt.timedelta(days=7)
+    return _fetch_entries(categories, start, end, limit=1000)
 
 
 def _fetch_daterange_entries(start: dt.date, end: dt.date, categories: list[str]) -> list[dict]:
-    return _arxiv_query({
-        "search_query": (
-            f"{_build_cat_query(categories)} AND "
-            f"submittedDate:[{start.strftime('%Y%m%d')}0000 TO {end.strftime('%Y%m%d')}2359]"
-        ),
-        "start": "0",
-        "max_results": "500",
-        "sortBy": "submittedDate",
-        "sortOrder": "descending",
-    })
+    return _fetch_entries(categories, start, end, limit=500)
 
 
 def _parse_categories(args_category: list[str] | None, default: list[str]) -> list[str]:

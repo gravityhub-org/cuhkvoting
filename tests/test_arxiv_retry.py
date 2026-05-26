@@ -18,8 +18,9 @@ class ArxivRetryTests(unittest.TestCase):
             raise TimeoutError("timed out")
 
         with mock.patch("cuhkvoting.cli._http_text", side_effect=fail_http_text):
-            with self.assertRaises(SystemExit) as ctx:
-                _arxiv_query({"search_query": "id:2601.09678", "start": "0", "max_results": "1"})
+            with mock.patch("cuhkvoting.cli.time.sleep", return_value=None):
+                with self.assertRaises(SystemExit) as ctx:
+                    _arxiv_query({"search_query": "id:2601.09678", "start": "0", "max_results": "1"})
         self.assertEqual(calls, len(ARXIV_RETRY_DELAYS) + 1)
         self.assertIn("after 3 retries", str(ctx.exception))
 
