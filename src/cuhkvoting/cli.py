@@ -1069,14 +1069,61 @@ def _load_cache_data(key: str) -> dict | None:
         return None
 
 
-def _save_cache(key: str, categories: list[str], entries: list[dict]) -> None:
+def _save_cache(key: str, categories: list[str], entries: list[dict], extra: dict | None = None) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     data = {
         "fetched_at": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
         "categories": sorted(categories),
         "entries": entries,
     }
+    if extra:
+        data.update(extra)
     (CACHE_DIR / f"{key}.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _cache_is_fresh(data: dict | None, categories: list[str], max_age_seconds: int) -> bool:
+    if not data or not data.get("entries"):
+        return False
+    fetched_at = _parse_utc(data.get("fetched_at", ""))
+    if fetched_at is None or (dt.datetime.now(dt.timezone.utc) - fetched_at).total_seconds() > max_age_seconds:
+        return False
+    return set(data.get("categories", [])) == set(categories)
+
+
+def _seed_today_cache(entries: list[dict], categories: list[str]) -> None:
+    """Overwrite the `today` cache with the latest announced batch in `entries`."""
+    latest = max((e.get("published", "")[:10] for e in entries if e.get("published")), default="")
+    batch = [e for e in entries if e.get("published", "").startswith(latest)] if latest else []
+    _save_cache("today", categories, batch)
+
+
+def _seed_lastweek_cache(entries: list[dict], categories: list[str]) -> None:
+    """Overwrite the `lastweek` cache with the last-7-days subset of `entries`."""
+    cutoff = (dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=7)).isoformat()
+    _save_cache("lastweek", categories, [e for e in entries if e.get("published", "")[:10] >= cutoff])
+
+
+def _resolve_last_n_window(days: int, categories: list[str], max_age_seconds: int) -> list[dict]:
+    """Return the shared `last-n` window (a superset covering >= `days`), refetching and
+    overwriting `last-n.json` when it's stale, category-mismatched, or too narrow."""
+    data = _load_cache_data("last-n")
+    if _cache_is_fresh(data, categories, max_age_seconds) and data.get("window_days", 0) >= days:
+        return list(data.get("entries", []))
+    try:
+        entries = _fetch_lastdays_entries(days, categories)
+    except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead) as exc:
+        if data and data.get("entries"):
+            typer.echo(
+                typer.style(
+                    f"Warning: arXiv unreachable ({exc}); serving cached 'last-n' data.",
+                    fg=typer.colors.YELLOW,
+                ),
+                err=True,
+            )
+            return list(data.get("entries", []))
+        raise
+    _save_cache("last-n", categories, entries, {"window_days": days})
+    return entries
 
 
 def _lookup_local_cache(paper_id: str) -> dict | None:
@@ -1257,9 +1304,9 @@ def _fetch_today_entries(categories: list[str]) -> list[dict]:
     return [e for e in all_entries if e.get("published", "").startswith(latest_date)]
 
 
-def _fetch_lastweek_entries(categories: list[str]) -> list[dict]:
+def _fetch_lastdays_entries(days: int, categories: list[str]) -> list[dict]:
     end_day = dt.datetime.now(dt.timezone.utc).date()
-    start_day = end_day - dt.timedelta(days=7)
+    start_day = end_day - dt.timedelta(days=days)
     return _arxiv_query({
         "search_query": f"{_build_cat_query(categories)} AND submittedDate:[{start_day.strftime('%Y%m%d')}0000 TO {end_day.strftime('%Y%m%d')}2359]",
         "start": "0",
@@ -1399,24 +1446,11 @@ def cmd_lastweek(args: SimpleNamespace) -> int:
     categories = _parse_categories(getattr(args, "category", None), cfg.categories)
     max_age_minutes = getattr(args, "max_age", None)
     max_age_seconds = (int(max_age_minutes) if max_age_minutes is not None else cfg.lastweek_max_age) * 60
-    entries = _resolve_cache("lastweek", categories, max_age_seconds, _fetch_lastweek_entries)
-    # Opportunistically seed today's cache from lastweek data if today's is stale
-    today_data = _load_cache_data("today")
-    today_fetched_at = _parse_utc(today_data.get("fetched_at", "")) if today_data else None
-    today_stale = (
-        today_data is None
-        or today_fetched_at is None
-        or (dt.datetime.now(dt.timezone.utc) - today_fetched_at).total_seconds() > cfg.today_max_age * 60
-        or set(today_data.get("categories", [])) != set(categories)
-        or not today_data.get("entries")
+    entries = _resolve_cache(
+        "lastweek", categories, max_age_seconds,
+        lambda cats: _fetch_lastdays_entries(7, cats),
     )
-    if today_stale:
-        latest_date = max(
-            (e.get("published", "")[:10] for e in entries if e.get("published")),
-            default="",
-        )
-        today_entries = [e for e in entries if e.get("published", "").startswith(latest_date)] if latest_date else []
-        _save_cache("today", categories, today_entries)
+    _seed_today_cache(entries, categories)
     abstract_lines = getattr(args, "abstract", None)
     if abstract_lines is None:
         abstract_lines = cfg.abstract_lines
@@ -1426,6 +1460,52 @@ def cmd_lastweek(args: SimpleNamespace) -> int:
         return 0
     displayed = entries[: int(args.limit)]
     _save_last_list(displayed)
+    highlight_kw_count = getattr(args, "highlight_keywords", None)
+    if highlight_kw_count is None:
+        highlight_kw_count = cfg.highlight_keyword_count
+    _print_entry_list(displayed, cfg, abstract_lines, highlight_kw_count)
+    return 0
+
+
+def cmd_last(args: SimpleNamespace) -> int:
+    days = int(args.days)
+    if days == 1:
+        return cmd_today(args)        # last 1 ≡ today
+    if days == 7:
+        return cmd_lastweek(args)     # last 7 ≡ lastweek
+
+    cfg = _load_config()
+    categories = _parse_categories(getattr(args, "category", None), cfg.categories)
+    max_age_minutes = getattr(args, "max_age", None)
+    max_age_seconds = (int(max_age_minutes) if max_age_minutes is not None else cfg.lastweek_max_age) * 60
+
+    # A superset covering >= `days`: a fresh lastweek (for 2..6), else the shared last-n cache.
+    full: list[dict] | None = None
+    if days <= 6:
+        lw = _load_cache_data("lastweek")
+        if _cache_is_fresh(lw, categories, max_age_seconds):
+            full = list(lw.get("entries", []))
+    if full is None:
+        full = _resolve_last_n_window(days, categories, max_age_seconds)
+
+    # En-passant cache warming (unconditional), from the full superset.
+    _seed_today_cache(full, categories)            # n >= 2
+    if days > 7:
+        _seed_lastweek_cache(full, categories)     # n > 7 also warms lastweek
+
+    cutoff = (dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=days)).isoformat()
+    entries = [e for e in full if e.get("published", "")[:10] >= cutoff]
+
+    abstract_lines = getattr(args, "abstract", None)
+    if abstract_lines is None:
+        abstract_lines = cfg.abstract_lines
+    entries = _filter_entries(entries, getattr(args, "keywords", None))
+    if not entries:
+        print(f"No entries matched in the last {days} days (UTC).")
+        return 0
+    displayed = entries[: int(args.limit)]
+    _save_last_list(displayed)
+    print(f"Papers from the last {days} days (since {cutoff}, UTC) — {len(displayed)} entries:")
     highlight_kw_count = getattr(args, "highlight_keywords", None)
     if highlight_kw_count is None:
         highlight_kw_count = cfg.highlight_keyword_count
@@ -2144,6 +2224,25 @@ def lastweek(
     highlight_keywords: int | None = typer.Option(None, "--highlight-keywords", help="Keyword matches to show per entry (0=glyph, -1=all, N=first N). Defaults to config value."),
 ) -> None:
     _run_cmd(cmd_lastweek, limit=limit, keywords=keywords, max_age=max_age, category=category, abstract=abstract, highlight_keywords=highlight_keywords)
+
+
+@app.command("last")
+def last(
+    days: int = typer.Argument(..., help="Number of days back to list (e.g. 3)."),
+    keywords: list[str] | None = typer.Argument(
+        None,
+        help="Optional keyword filters. All keywords must match title/abstract/authors.",
+    ),
+    limit: int = typer.Option(1000, "--limit", help="Max number of entries."),
+    max_age: int | None = typer.Option(None, "--max-age", help="Cache max age in minutes (0 to force refresh). Defaults to config value."),
+    category: list[str] | None = typer.Option(None, "--category", help="arXiv category, e.g. hep-th (overrides config, repeatable)."),
+    abstract: int | None = typer.Option(None, "--abstract", help="Abstract lines to show (0=none, -1=full, N=first N lines). Defaults to config value."),
+    highlight_keywords: int | None = typer.Option(None, "--highlight-keywords", help="Keyword matches to show per entry (0=glyph, -1=all, N=first N). Defaults to config value."),
+) -> None:
+    """List papers submitted in the last <#> days (UTC). `last 1` ≡ `today`, `last 7` ≡ `lastweek`."""
+    if days < 1:
+        raise typer.BadParameter("<#> must be a positive integer.")
+    _run_cmd(cmd_last, days=days, limit=limit, keywords=keywords, max_age=max_age, category=category, abstract=abstract, highlight_keywords=highlight_keywords)
 
 
 @app.command("topvoted")
