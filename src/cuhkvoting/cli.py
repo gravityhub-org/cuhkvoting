@@ -5,6 +5,7 @@ import concurrent.futures
 import http.client
 import datetime as dt
 import fnmatch
+import importlib.metadata
 import json
 import os
 import re
@@ -26,7 +27,11 @@ from types import SimpleNamespace
 import typer
 
 
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0"
+try:
+    _PKG_VERSION = importlib.metadata.version("cuhkvoting")
+except importlib.metadata.PackageNotFoundError:
+    _PKG_VERSION = "dev"
+USER_AGENT = f"cuhkvoting/{_PKG_VERSION} (+https://github.com/gravityhub-org/cuhkvoting)"
 ARXIV_API = "https://export.arxiv.org/api/query"
 ARXIV_ABS = "https://arxiv.org/abs/"
 ARXIV_FOUNDING_DATE = dt.date(1991, 8, 14)
