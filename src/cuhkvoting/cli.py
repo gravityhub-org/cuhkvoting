@@ -1934,30 +1934,34 @@ def cmd_select(args: SimpleNamespace) -> int:
     token = _get_token()
     user = _resolve_user(token)
     paper_id = _normalize_paper_id(args.paper_id)
-    entry = _validate_arxiv_entry(paper_id)
     paper, sha, save_path = _load_vote_paper(cfg, token, paper_id)
-    if paper is None:
-        paper = {
-            "id": entry["id"],
-            "title": entry["title"],
-            "abstract": entry["abstract"],
-            "url": entry["url"],
-            "votes": [],
-        }
-    _prune_expired_votes(paper)
-    vote_count = len(paper.get("votes", []))
+
+    # Resolve a title without forcing an arXiv round-trip: cache > records > arXiv.
+    # arXiv is the last resort; if even it can't confirm the id, the paper has never
+    # been validated anywhere and the command is likely corrupt, so let it abort.
+    cached = _lookup_local_cache(paper_id)
+    if cached and cached.get("title"):
+        title = cached["title"]
+    elif paper and paper.get("title"):
+        title = paper["title"]
+    else:
+        title = _validate_arxiv_entry(paper_id).get("title", "")
+
+    if paper:
+        _prune_expired_votes(paper)
+    vote_count = len(paper.get("votes", [])) if paper else 0
     now = dt.datetime.now(dt.timezone.utc)
     year, week, _ = now.isocalendar()
     week_tag = f"{year}-W{week:02d}"
     selected_at = now.isoformat().replace("+00:00", "Z")
-    canonical_id = _strip_arxiv_version(str(paper.get("id", paper_id)))
+    canonical_id = _strip_arxiv_version(str((paper or {}).get("id", paper_id)))
 
     records, record_sha = _load_jc_records(cfg, token)
     records.append(
         {
             "week": week_tag,
             "arxiv_id": canonical_id,
-            "title": paper.get("title", entry["title"]),
+            "title": title,
             "historical_vote": vote_count,
             "selected_at": selected_at,
             "selected_by": user,
