@@ -4,6 +4,7 @@ import base64
 import concurrent.futures
 import http.client
 import datetime as dt
+import email.utils
 import fnmatch
 import importlib.metadata
 import json
@@ -470,18 +471,43 @@ def _list_papers_via_api(cfg: RepoConfig, token: str | None) -> list[dict]:
     return papers
 
 
+def _parse_retry_after(headers) -> int | None:
+    """Return the Retry-After value in seconds, clamped to [1, 300]; None if absent/unparseable."""
+    if headers is None:
+        return None
+    raw = headers.get("Retry-After")
+    if not raw:
+        return None
+    raw = raw.strip()
+    try:
+        return max(1, min(300, int(raw)))
+    except ValueError:
+        pass
+    try:
+        target = email.utils.parsedate_to_datetime(raw)
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=dt.timezone.utc)
+        seconds = int((target - dt.datetime.now(dt.timezone.utc)).total_seconds())
+        return max(1, min(300, seconds))
+    except (TypeError, ValueError):
+        return None
+
+
 def _arxiv_query(params: dict[str, str]) -> list[dict[str, str]]:
     url = f"{ARXIV_API}?{urllib.parse.urlencode(params)}"
     delays = [10, 20, 60]
     _retry_label = "arXiv error"
+    next_delay: int | None = None
     for attempt, delay in enumerate([-1] + delays):
         if attempt > 0:
-            for remaining in range(delay, 0, -1):
+            sleep_for = next_delay if next_delay is not None else delay
+            for remaining in range(sleep_for, 0, -1):
                 sys.stderr.write(f"\r{_retry_label} (attempt {attempt}/{len(delays)}), retrying in {remaining}s… ")
                 sys.stderr.flush()
                 time.sleep(1)
             sys.stderr.write("\r" + " " * 70 + "\r")
             sys.stderr.flush()
+            next_delay = None
         try:
             xml_str = _http_text(url, headers={"User-Agent": USER_AGENT})
             break
@@ -489,8 +515,10 @@ def _arxiv_query(params: dict[str, str]) -> list[dict[str, str]]:
             code = getattr(e, "code", None)
             if attempt == len(delays) or (code is not None and code not in (429, 503)):
                 raise
-            if code in (429, 503):
+            if code == 429:
                 _retry_label = "arXiv rate limit"
+            elif code == 503:
+                _retry_label = "arXiv overloaded"
             elif isinstance(e, TimeoutError):
                 _retry_label = "arXiv timeout"
             elif isinstance(e, http.client.IncompleteRead):
@@ -498,6 +526,8 @@ def _arxiv_query(params: dict[str, str]) -> list[dict[str, str]]:
             else:
                 reason = getattr(e, "reason", None) or str(e)
                 _retry_label = f"arXiv connection error: {reason}"
+            if code in (429, 503):
+                next_delay = _parse_retry_after(getattr(e, "headers", None))
     root = ET.fromstring(xml_str)
     ns = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
     entries: list[dict[str, str]] = []
