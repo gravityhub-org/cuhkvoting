@@ -10,6 +10,7 @@ Copy the whole block into a terminal (read-only commands work without GitHub aut
 uv tool install --upgrade git+ssh://git@github.com/gravityhub-org/cuhkvoting.git && cuhkvoting --install-completion
 cuhkvoting today # Lists arxiv papers today
 cuhkvoting lastweek gravitational wave # Lists last week's papers with "gravitational" and "wave" in title/abstract
+cuhkvoting last 3 # Lists papers from the last 3 days
 cuhkvoting topvoted # Shows top voted papers
 cuhkvoting --help # Help 
 cuhkvoting vote 2504.12345 # Vote for 2504.12345 [requires ssh key; see setup below]
@@ -82,6 +83,8 @@ cuhkvoting today lensing gravitational waves
 cuhkvoting lastweek
 cuhkvoting lastweek "black hole"
 cuhkvoting lastweek lensing gravitational waves
+cuhkvoting last 3                               # papers from the last 3 days (last 1 = today, last 7 = lastweek)
+cuhkvoting last 14 "black hole"                 # last 14 days, keyword-filtered
 
 # Search (uses Inspire HEP API, outputs arXiv entries only, AND semantics)
 cuhkvoting search "vision language model"
@@ -112,15 +115,18 @@ cuhkvoting show 2026-03-12 --category hep-th    # override arXiv category
 
 # Journal club records
 cuhkvoting record
-cuhkvoting select 2504.12345
+cuhkvoting select 2504.12345                    # mark a paper as selected for journal club
+cuhkvoting select remove 2504.12345             # undo a selection
 cuhkvoting admin trash 2504.12345
-cuhkvoting admin sanitize                       # strip legacy fields, normalize whitespace
+cuhkvoting admin sanitize                       # strip legacy fields, normalize whitespace, de-duplicate records
 cuhkvoting admin sanitize --dry-run             # preview without writing
 ```
 
+Once a paper is selected it should not come back, so the CLI guards against it: re-running `select` on an already-selected paper is a no-op with a notice, and `vote` skips any paper already selected for a past journal club. Use `select remove <id>` to reverse a selection.
+
 ### Category filtering
 
-`today`, `lastweek`, and `show` (date mode) filter by arXiv category. The default categories are `gr-qc` and `astro-ph.*`.
+`today`, `lastweek`, `last <#>`, and `show` (date mode) filter by arXiv category. The default categories are `gr-qc` and `astro-ph.*`.
 
 Override for a single run (comma-separated or repeatable):
 
@@ -135,7 +141,7 @@ To change the default, set `categories` in the config file (see [Configuration f
 
 ### Local cache
 
-`today`, `lastweek`, and `show` (date mode) cache results locally to avoid hitting the arXiv API on every call, and thus avoid exceeding its limit rate.
+`today`, `lastweek`, `last <#>`, and `show` (date mode) cache results locally to avoid hitting the arXiv API on every call, and thus avoid exceeding its limit rate. `last <#>` reuses the `today`/`lastweek` caches when they already cover the requested window.
 
 Cache location by platform:
 
