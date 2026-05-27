@@ -862,6 +862,19 @@ def _parse_utc(ts: str) -> dt.datetime | None:
         return None
 
 
+def _format_age(td: dt.timedelta) -> str:
+    total = int(td.total_seconds())
+    if total < 60:
+        return f"{total}s"
+    if total < 3600:
+        return f"{total // 60}m"
+    if total < 86400:
+        h, m = divmod(total // 60, 60)
+        return f"{h}h {m}m" if m else f"{h}h"
+    d, rem_h = divmod(total // 3600, 24)
+    return f"{d}d {rem_h}h" if rem_h else f"{d}d"
+
+
 def _latest_vote_timestamp(votes: list[dict]) -> float:
     """Max voted_at among votes as UTC unix time; 0 if none parseable."""
     best = 0.0
@@ -1090,7 +1103,20 @@ def _resolve_cache(
             _save_cache(key, categories, entries)
             return entries
 
-    entries = fetch_fn(categories)
+    try:
+        entries = fetch_fn(categories)
+    except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead) as exc:
+        if data is not None and data.get("entries"):
+            age = _format_age(dt.datetime.now(dt.timezone.utc) - fetched_at) if fetched_at else "unknown age"
+            typer.echo(
+                typer.style(
+                    f"Warning: arXiv unreachable ({exc}); serving cached '{key}' data ({age} old).",
+                    fg=typer.colors.YELLOW,
+                ),
+                err=True,
+            )
+            return list(data.get("entries", []))
+        raise
     _save_cache(key, categories, entries)
     return entries
 
