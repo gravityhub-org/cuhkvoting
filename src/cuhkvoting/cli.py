@@ -2459,7 +2459,52 @@ def admin_sanitize(
                 reasons.append(f"legacy display_name removed ({v.get('user', '?')})")
         return reasons
 
-    typer.echo("Sanitizing: whitespace normalization, legacy display_name removal.")
+    def _sanitize_jc_records(body: dict) -> list[str]:
+        """Normalize and de-duplicate journal-club records in-place; return change descriptions."""
+        reasons: list[str] = []
+        records = body.get("records")
+        if not isinstance(records, list):
+            return reasons
+
+        # 1. Normalize fields in place: title whitespace, canonical (version-stripped) arxiv_id.
+        for r in records:
+            if not isinstance(r, dict):
+                continue
+            new_title = " ".join(str(r.get("title", "")).split())
+            if new_title != r.get("title"):
+                r["title"] = new_title
+                reasons.append(f"whitespace in title ({r.get('arxiv_id', '?')})")
+            raw_id = str(r.get("arxiv_id", ""))
+            canon = _strip_arxiv_version(raw_id)
+            if canon != r.get("arxiv_id"):
+                r["arxiv_id"] = canon
+                reasons.append(f"arxiv_id normalized ({raw_id} -> {canon})")
+
+        # 2. De-duplicate by canonical arxiv_id, keeping the earliest selection
+        #    (earliest selected_at; missing dates sort last). Preserve first-seen order.
+        best: dict[str, dict] = {}
+        order: list[str] = []
+        for r in records:
+            if not isinstance(r, dict):
+                continue
+            canon = str(r.get("arxiv_id", ""))
+            if not canon:
+                continue
+            if canon not in best:
+                best[canon] = r
+                order.append(canon)
+            elif (str(r.get("selected_at", "")) or "~") < (str(best[canon].get("selected_at", "")) or "~"):
+                best[canon] = r
+        deduped = [best[c] for c in order]
+        removed = len(records) - len(deduped)
+        if removed:
+            reasons.append(f"{removed} duplicate selection(s) removed")
+        if deduped != records:
+            body["records"] = deduped
+        return reasons
+
+    typer.echo("Sanitizing: whitespace normalization, legacy display_name removal, "
+               "journal-club record de-duplication.")
 
     if _has_github_ssh_access():
         clone_dir = _with_repo_checkout(cfg)
@@ -2467,18 +2512,19 @@ def admin_sanitize(
             papers_dir = Path(clone_dir) / "papers"
             changed = 0
             for path in sorted(papers_dir.glob("*.json")) if papers_dir.exists() else []:
-                if path.name == "journal_club_records.json":
-                    continue
                 try:
-                    paper = json.loads(path.read_text(encoding="utf-8"))
+                    doc = json.loads(path.read_text(encoding="utf-8"))
                 except Exception:
                     continue
-                reasons = _sanitize_paper(paper)
+                if path.name == "journal_club_records.json":
+                    reasons = _sanitize_jc_records(doc)
+                else:
+                    reasons = _sanitize_paper(doc)
                 if not reasons:
                     continue
                 typer.echo(f"  {path.name}  ({'; '.join(reasons)})")
                 if not dry_run:
-                    path.write_text(json.dumps(paper, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                    path.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
                 changed += 1
             if changed == 0:
                 typer.echo("All records already clean.")
@@ -2509,7 +2555,6 @@ def admin_sanitize(
         if obj.get("type") == "blob"
         and obj.get("path", "").startswith("papers/")
         and obj.get("path", "").endswith(".json")
-        and obj["path"] != "papers/journal_club_records.json"
     ]
 
     def _fetch_blob_content(item: dict) -> tuple[str, dict | None]:
@@ -2525,16 +2570,19 @@ def admin_sanitize(
 
     changed = 0
     updates: list[tuple[str, dict]] = []
-    for path, paper in fetched:
-        if paper is None:
+    for path, doc in fetched:
+        if doc is None:
             continue
-        reasons = _sanitize_paper(paper)
+        if path == JC_RECORD_PATH:
+            reasons = _sanitize_jc_records(doc)
+        else:
+            reasons = _sanitize_paper(doc)
         if not reasons:
             continue
         typer.echo(f"  {path}  ({'; '.join(reasons)})")
         changed += 1
         if not dry_run:
-            updates.append((path, paper))
+            updates.append((path, doc))
 
     if changed == 0:
         typer.echo("All records already clean.")
