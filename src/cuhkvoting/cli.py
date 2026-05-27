@@ -184,13 +184,20 @@ def _parse_repo_url(url: str) -> tuple[str, str] | None:
 
 
 def _run_git(args: list[str], cwd: str | None = None) -> str:
+    # Force non-interactive git/ssh: a missing or locked credential should fail
+    # fast with a readable error, never block on a prompt whose text we capture
+    # (stderr is piped) and so would be invisible to the user.
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new")
     proc = subprocess.run(
         ["git", *args],
         cwd=cwd,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         check=False,
+        env=env,
     )
     if proc.returncode != 0:
         err = proc.stderr.strip() or f"git {' '.join(args)} failed"
@@ -409,6 +416,16 @@ def _save_jc_records(cfg: RepoConfig, token: str | None, user: str, records: lis
         _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
     finally:
         shutil.rmtree(clone_dir, ignore_errors=True)
+
+
+def _selected_arxiv_ids(cfg: RepoConfig, token: str | None) -> set[str]:
+    """Canonical arXiv ids already recorded as journal-club selections."""
+    records, _ = _load_jc_records(cfg, token)
+    return {
+        _strip_arxiv_version(str(r.get("arxiv_id", "")))
+        for r in records
+        if r.get("arxiv_id")
+    }
 
 
 def _list_papers_via_graphql(cfg: RepoConfig, token: str) -> list[dict]:
@@ -1934,6 +1951,28 @@ def cmd_select(args: SimpleNamespace) -> int:
     token = _get_token()
     user = _resolve_user(token)
     paper_id = _normalize_paper_id(args.paper_id)
+    canonical_id = _strip_arxiv_version(paper_id)
+
+    # The journal-club records are the source of truth for "already selected".
+    # Checking them first also avoids the _load_vote_paper clone-fallback hang
+    # when the vote file was already deleted by a prior select.
+    records, record_sha = _load_jc_records(cfg, token)
+    existing = next(
+        (r for r in records if _strip_arxiv_version(str(r.get("arxiv_id", ""))) == canonical_id),
+        None,
+    )
+    if existing is not None:
+        typer.echo(
+            typer.style(
+                f"Already selected: {canonical_id} ({existing.get('week', '?')}) "
+                f"by {existing.get('selected_by', '?')} on {existing.get('selected_at', '?')}. "
+                f"Use 'cuhkvoting select remove {canonical_id}' to undo.",
+                fg=typer.colors.YELLOW,
+            ),
+            err=True,
+        )
+        return 0
+
     paper, sha, save_path = _load_vote_paper(cfg, token, paper_id)
 
     # Resolve a title without forcing an arXiv round-trip: cache > records > arXiv.
@@ -1954,9 +1993,7 @@ def cmd_select(args: SimpleNamespace) -> int:
     year, week, _ = now.isocalendar()
     week_tag = f"{year}-W{week:02d}"
     selected_at = now.isoformat().replace("+00:00", "Z")
-    canonical_id = _strip_arxiv_version(str((paper or {}).get("id", paper_id)))
 
-    records, record_sha = _load_jc_records(cfg, token)
     records.append(
         {
             "week": week_tag,
@@ -1976,6 +2013,30 @@ def cmd_select(args: SimpleNamespace) -> int:
         _delete_vote_paper(cfg, None, user, save_path, None, f"select-delete-vote: {user} -> {canonical_id}")
 
     print(f"Selected for presentation: {canonical_id} ({week_tag}) by {user}")
+    return 0
+
+
+def cmd_unselect(args: SimpleNamespace) -> int:
+    cfg = _resolve_repo_config(args)
+    token = _get_token()
+    user = _resolve_user(token)
+    canonical_id = _strip_arxiv_version(_normalize_paper_id(args.paper_id))
+
+    records, record_sha = _load_jc_records(cfg, token)
+    kept = [r for r in records if _strip_arxiv_version(str(r.get("arxiv_id", ""))) != canonical_id]
+    removed = len(records) - len(kept)
+    if removed == 0:
+        typer.echo(
+            typer.style(
+                f"Not selected: {canonical_id} is not in the journal-club records.",
+                fg=typer.colors.YELLOW,
+            ),
+            err=True,
+        )
+        return 0
+    _save_jc_records(cfg, token, user, kept, record_sha, f"record-unselect: {user} -> {canonical_id}")
+    noun = "entry" if removed == 1 else "entries"
+    print(f"Unselected {canonical_id}: removed {removed} record {noun}.")
     return 0
 
 
@@ -2124,7 +2185,9 @@ def record(
 
 @app.command("select")
 def select(
-    paper_id: str = typer.Argument(..., help="arXiv id/url."),
+    action_or_paper: list[str] = typer.Argument(
+        ..., help="arXiv id/url, or `remove <id>` to undo a selection."
+    ),
     repo: str | None = typer.Option(
         None,
         "--repo",
@@ -2136,7 +2199,14 @@ def select(
         help="Git branch to read/write.",
     ),
 ) -> None:
-    _run_cmd(cmd_select, paper_id=paper_id, repo=repo, branch=branch)
+    if action_or_paper[0].strip().lower() == "remove":
+        if len(action_or_paper) != 2:
+            raise typer.BadParameter("Usage: cuhkvoting select remove <id>")
+        _run_cmd(cmd_unselect, paper_id=action_or_paper[1], repo=repo, branch=branch)
+        return
+    if len(action_or_paper) != 1:
+        raise typer.BadParameter("Usage: cuhkvoting select <id>  (or: cuhkvoting select remove <id>)")
+    _run_cmd(cmd_select, paper_id=action_or_paper[0], repo=repo, branch=branch)
 
 
 @app.command("vote")
@@ -2178,6 +2248,29 @@ def vote_command(
         return
     resolved = _resolve_paper_ids(action_or_paper)
     cfg = _load_config()
+    token = _get_token()
+    repo_cfg = _resolve_repo_config(SimpleNamespace(repo=repo, branch=branch))
+
+    # Drop papers already selected for a past journal club — they should not come back.
+    selected = _selected_arxiv_ids(repo_cfg, token)
+    if selected:
+        kept = []
+        for arxiv_id, title, idx in resolved:
+            if _strip_arxiv_version(arxiv_id) in selected:
+                typer.echo(
+                    typer.style(
+                        f"Skipping {arxiv_id}: already selected for a past journal club.",
+                        fg=typer.colors.YELLOW,
+                    ),
+                    err=True,
+                )
+            else:
+                kept.append((arxiv_id, title, idx))
+        resolved = kept
+    if not resolved:
+        typer.echo("Nothing to vote for (all given papers were already selected).", err=True)
+        raise typer.Exit(code=0)
+
     has_index = any(idx is not None for _, _, idx in resolved)
     if has_index and cfg.confirm_by_number:
         max_idx = max(idx for _, _, idx in resolved if idx is not None)
@@ -2189,11 +2282,9 @@ def vote_command(
             else:
                 typer.echo(f"  {' ' * (w + 2)}{arxiv_id}  {title or ''}")
         typer.confirm("Proceed?", abort=True)
-    token = _get_token()
     user = _resolve_user(token)
     display_name = cfg.display_name
     _warn_if_display_name_changed(display_name)
-    repo_cfg = _resolve_repo_config(SimpleNamespace(repo=repo, branch=branch))
 
     # Resolve title/url for each paper from local cache, falling back to arXiv.
     papers_meta: list[dict] = []

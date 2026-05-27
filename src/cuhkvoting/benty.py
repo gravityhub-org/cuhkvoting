@@ -370,7 +370,8 @@ def sync(
         ARXIV_ABS, DEFAULT_REPO, RepoConfig,
         _batch_vote_papers_api, _batch_vote_papers_ssh,
         _get_token, _has_github_ssh_access, _load_config,
-        _resolve_user, _vote_paper_with_metadata,
+        _resolve_user, _selected_arxiv_ids, _strip_arxiv_version,
+        _vote_paper_with_metadata,
     )
     gh_token = _get_token()
     try:
@@ -457,6 +458,24 @@ def sync(
     # Compute what needs to change
     to_add_cuhk = [benty_by_id[i] for i in (benty_voted_ids - synced_ids)]
     to_add_benty = sorted(cuhk_voted_ids - synced_ids)  # any arXiv paper is voteable on Benty
+
+    # Drop papers already selected for a past journal club — re-voting them via the
+    # importer would resurrect a paper that was deliberately retired. Read the records
+    # once and keep the set in memory for the rest of the sync.
+    if to_add_cuhk:
+        owner, repo_name = DEFAULT_REPO.split("/", 1)
+        sync_repo_cfg = RepoConfig(owner=owner, repo=repo_name, branch=os.getenv("CUHKVOTING_BRANCH", "main"))
+        selected = _selected_arxiv_ids(sync_repo_cfg, gh_token)
+        if selected:
+            kept = []
+            for p in to_add_cuhk:
+                if _strip_arxiv_version(p["arxiv_id"]) in selected:
+                    typer.echo(typer.style(
+                        f"Skipping {p['arxiv_id']}: already selected for a past journal club.",
+                        fg=typer.colors.YELLOW), err=True)
+                else:
+                    kept.append(p)
+            to_add_cuhk = kept
 
     removed_from_benty = synced_ids - benty_voted_ids
     removed_from_cuhk = synced_ids - cuhk_voted_ids
