@@ -93,16 +93,16 @@ cuhkvoting search gravitational wave hubble constant --limit 10
 # Voting
 cuhkvoting topvoted --N 10
 cuhkvoting vote 2504.12345
-cuhkvoting vote 2504.12345 2504.67890   # vote for multiple papers at once
+cuhkvoting vote 2504.12345 2504.67890           # vote for multiple papers at once
 cuhkvoting vote remove 2504.12345
 
 # Vote by list index (refers to the last printed list from today/lastweek/search/topvoted/show)
 cuhkvoting vote 3
-cuhkvoting vote 1 5 2504.12345          # mix of indices and arXiv IDs
+cuhkvoting vote 1 5 2504.12345                  # mix of indices and arXiv IDs
 
 # Show full details (title, authors, full abstract) for specific papers
 cuhkvoting show 3
-cuhkvoting show 1 5 2504.12345          # mix of indices and arXiv IDs
+cuhkvoting show 1 5 2504.12345                  # mix of indices and arXiv IDs
 
 # Browse papers by date or date range (results are numbered; indices work with vote)
 cuhkvoting show 2026-03-12                      # all papers for that date
@@ -219,9 +219,9 @@ confirm_by_number = true
 display_name = ""
 
 [highlights]
-authors = []        # ["Surname, Firstname"]
-keywords = []       # regular expressions
-keyword_count = -1  # -1 = all, 0 = glyph, N = first N
+authors = []            # ["Surname, Firstname"]
+keywords = []           # regular expressions
+keyword_count = -1      # -1 = all, 0 = glyph, N = first N
 glyph = "★"
 ```
 
@@ -284,8 +284,8 @@ eval "$(_CUHKVOTING_COMPLETE=bash_source cuhkvoting)"
 - Votes explicitly removed in either system are removed in the other. Natural 6-month expiry in cuhkvoting does not propagate.
 
 ```bash
-cuhkvoting-benty           # fetch + vote for new papers
-cuhkvoting-benty --dry-run # preview without voting
+cuhkvoting-benty                     # fetch + vote for new papers
+cuhkvoting-benty --dry-run           # preview without voting
 cuhkvoting-benty --no-cache-cookies  # skip cookie persistence
 ```
 
