@@ -716,6 +716,62 @@ def _arxiv_query(params: dict[str, str], *, delays: tuple[int, ...] = ARXIV_RETR
     return entries
 
 
+def _first_inspire_value(items: object, key: str) -> str:
+    """First non-empty `key` string across a list of INSPIRE sub-records, whitespace-collapsed."""
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, dict) and isinstance(item.get(key), str) and item.get(key, "").strip():
+                return " ".join(item[key].split())
+    return ""
+
+
+def _parse_inspire_metadata(metadata: object, *, arxiv_id: str | None = None) -> dict | None:
+    """Parse one INSPIRE record's `metadata` into our entry shape, or None if unusable.
+
+    arxiv_id: force the id (single-record lookup by arXiv id). When None, derive it from
+    arxiv_eprints and return None if absent — list hits must stay arXiv-only.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    eprints = metadata.get("arxiv_eprints", [])
+    if arxiv_id is None:
+        if isinstance(eprints, list):
+            for ep in eprints:
+                if isinstance(ep, dict) and isinstance(ep.get("value"), str) and ep.get("value", "").strip():
+                    arxiv_id = _strip_arxiv_version(ep["value"])
+                    break
+        if not arxiv_id:
+            return None
+    authors: list[str] = []
+    authors_raw = metadata.get("authors", [])
+    if isinstance(authors_raw, list):
+        for author in authors_raw:
+            if isinstance(author, dict):
+                name = author.get("full_name")
+                if isinstance(name, str) and name.strip():
+                    authors.append(" ".join(name.split()))
+    cats: list[str] = []
+    if isinstance(eprints, list) and eprints and isinstance(eprints[0], dict):
+        raw_cats = eprints[0].get("categories", [])
+        if isinstance(raw_cats, list):
+            cats = [str(c) for c in raw_cats if str(c).strip()]
+    earliest_date = metadata.get("earliest_date")
+    if not isinstance(earliest_date, str):
+        earliest_date = ""
+    preprint_date = metadata.get("preprint_date")
+    if not isinstance(preprint_date, str):
+        preprint_date = ""
+    return {
+        "id": arxiv_id,
+        "title": _first_inspire_value(metadata.get("titles"), "title"),
+        "abstract": _first_inspire_value(metadata.get("abstracts"), "value"),
+        "url": f"{ARXIV_ABS}{arxiv_id}",
+        "authors": authors,
+        "published": preprint_date or earliest_date,
+        "primary_category": cats[0] if cats else "",
+    }
+
+
 def _inspire_query(query: str, limit: int) -> list[dict[str, str]]:
     params = {
         "q": query,
@@ -729,67 +785,10 @@ def _inspire_query(query: str, limit: int) -> list[dict[str, str]]:
     entries: list[dict[str, str]] = []
     for hit in hits if isinstance(hits, list) else []:
         metadata = hit.get("metadata", {}) if isinstance(hit, dict) else {}
-        if not isinstance(metadata, dict):
+        entry = _parse_inspire_metadata(metadata)
+        if entry is None or not entry["title"]:
             continue
-        titles = metadata.get("titles", [])
-        title = ""
-        if isinstance(titles, list):
-            for t in titles:
-                if isinstance(t, dict) and isinstance(t.get("title"), str) and t.get("title", "").strip():
-                    title = " ".join(t["title"].split())
-                    break
-        if not title:
-            continue
-        abstracts = metadata.get("abstracts", [])
-        abstract = ""
-        if isinstance(abstracts, list):
-            for a in abstracts:
-                if isinstance(a, dict) and isinstance(a.get("value"), str) and a.get("value", "").strip():
-                    abstract = " ".join(a["value"].split())
-                    break
-        authors_raw = metadata.get("authors", [])
-        authors: list[str] = []
-        if isinstance(authors_raw, list):
-            for author in authors_raw:
-                if isinstance(author, dict):
-                    name = author.get("full_name")
-                    if isinstance(name, str) and name.strip():
-                        authors.append(" ".join(name.split()))
-        arxiv_id = ""
-        arxiv_eprints = metadata.get("arxiv_eprints", [])
-        if isinstance(arxiv_eprints, list):
-            for ep in arxiv_eprints:
-                if isinstance(ep, dict) and isinstance(ep.get("value"), str) and ep.get("value", "").strip():
-                    arxiv_id = _strip_arxiv_version(ep["value"])
-                    break
-        if not arxiv_id:
-            # Search output should stay arXiv-only.
-            continue
-        paper_id = arxiv_id
-        paper_url = f"{ARXIV_ABS}{arxiv_id}"
-        earliest_date = metadata.get("earliest_date")
-        if not isinstance(earliest_date, str):
-            earliest_date = ""
-        preprint_date = metadata.get("preprint_date")
-        if not isinstance(preprint_date, str):
-            preprint_date = ""
-        cats: list[str] = []
-        if isinstance(arxiv_eprints, list) and arxiv_eprints and isinstance(arxiv_eprints[0], dict):
-            raw_cats = arxiv_eprints[0].get("categories", [])
-            if isinstance(raw_cats, list):
-                cats = [str(c) for c in raw_cats if str(c).strip()]
-        primary_category = cats[0] if cats else ""
-        entries.append(
-            {
-                "id": paper_id,
-                "title": title,
-                "abstract": abstract,
-                "url": paper_url,
-                "authors": authors,
-                "published": preprint_date or earliest_date,
-                "primary_category": primary_category,
-            }
-        )
+        entries.append(entry)
     return entries
 
 
@@ -832,69 +831,14 @@ def _inspire_query_retry(query: str, limit: int) -> list[dict[str, str]]:
             req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
             with urllib.request.urlopen(req, timeout=INSPIRE_HTTP_TIMEOUT) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-            # Reuse parsing logic by temporarily calling _inspire_query-style parser.
             hits = data.get("hits", {}).get("hits", [])
             parsed: list[dict[str, str]] = []
             for hit in hits if isinstance(hits, list) else []:
                 metadata = hit.get("metadata", {}) if isinstance(hit, dict) else {}
-                if not isinstance(metadata, dict):
+                entry = _parse_inspire_metadata(metadata)
+                if entry is None or not entry["title"]:
                     continue
-                titles = metadata.get("titles", [])
-                title = ""
-                if isinstance(titles, list):
-                    for t in titles:
-                        if isinstance(t, dict) and isinstance(t.get("title"), str) and t.get("title", "").strip():
-                            title = " ".join(t["title"].split())
-                            break
-                if not title:
-                    continue
-                abstracts = metadata.get("abstracts", [])
-                abstract = ""
-                if isinstance(abstracts, list):
-                    for a in abstracts:
-                        if isinstance(a, dict) and isinstance(a.get("value"), str) and a.get("value", "").strip():
-                            abstract = " ".join(a["value"].split())
-                            break
-                authors_raw = metadata.get("authors", [])
-                authors: list[str] = []
-                if isinstance(authors_raw, list):
-                    for author in authors_raw:
-                        if isinstance(author, dict):
-                            name = author.get("full_name")
-                            if isinstance(name, str) and name.strip():
-                                authors.append(" ".join(name.split()))
-                arxiv_id = ""
-                arxiv_eprints = metadata.get("arxiv_eprints", [])
-                if isinstance(arxiv_eprints, list):
-                    for ep in arxiv_eprints:
-                        if isinstance(ep, dict) and isinstance(ep.get("value"), str) and ep.get("value", "").strip():
-                            arxiv_id = _strip_arxiv_version(ep["value"])
-                            break
-                if not arxiv_id:
-                    continue
-                earliest_date = metadata.get("earliest_date")
-                if not isinstance(earliest_date, str):
-                    earliest_date = ""
-                preprint_date = metadata.get("preprint_date")
-                if not isinstance(preprint_date, str):
-                    preprint_date = ""
-                cats: list[str] = []
-                if isinstance(arxiv_eprints, list) and arxiv_eprints and isinstance(arxiv_eprints[0], dict):
-                    raw_cats = arxiv_eprints[0].get("categories", [])
-                    if isinstance(raw_cats, list):
-                        cats = [str(c) for c in raw_cats if str(c).strip()]
-                primary_category = cats[0] if cats else ""
-                parsed.append(
-                    {
-                        "id": arxiv_id,
-                        "title": title,
-                        "abstract": abstract,
-                        "url": f"{ARXIV_ABS}{arxiv_id}",
-                        "authors": authors,
-                        "published": preprint_date or earliest_date,
-                        "primary_category": primary_category,
-                    }
-                )
+                parsed.append(entry)
             return parsed
         except (ConnectionError, TimeoutError, urllib.error.URLError, http.client.IncompleteRead) as e:
             last_error = e
@@ -922,53 +866,7 @@ def _inspire_get_by_arxiv_id(paper_id: str) -> dict | None:
             return None
         raise
     metadata = data.get("metadata", {})
-    if not isinstance(metadata, dict):
-        return None
-    # Reuse _inspire_query parsing style for single record.
-    titles = metadata.get("titles", [])
-    title = ""
-    if isinstance(titles, list):
-        for t in titles:
-            if isinstance(t, dict) and isinstance(t.get("title"), str) and t.get("title", "").strip():
-                title = " ".join(t["title"].split())
-                break
-    abstracts = metadata.get("abstracts", [])
-    abstract = ""
-    if isinstance(abstracts, list):
-        for a in abstracts:
-            if isinstance(a, dict) and isinstance(a.get("value"), str) and a.get("value", "").strip():
-                abstract = " ".join(a["value"].split())
-                break
-    authors_raw = metadata.get("authors", [])
-    authors: list[str] = []
-    if isinstance(authors_raw, list):
-        for author in authors_raw:
-            if isinstance(author, dict):
-                name = author.get("full_name")
-                if isinstance(name, str) and name.strip():
-                    authors.append(" ".join(name.split()))
-    arxiv_eprints = metadata.get("arxiv_eprints", [])
-    cats: list[str] = []
-    if isinstance(arxiv_eprints, list) and arxiv_eprints and isinstance(arxiv_eprints[0], dict):
-        raw_cats = arxiv_eprints[0].get("categories", [])
-        if isinstance(raw_cats, list):
-            cats = [str(c) for c in raw_cats if str(c).strip()]
-    primary_category = cats[0] if cats else ""
-    earliest_date = metadata.get("earliest_date")
-    if not isinstance(earliest_date, str):
-        earliest_date = ""
-    preprint_date = metadata.get("preprint_date")
-    if not isinstance(preprint_date, str):
-        preprint_date = ""
-    return {
-        "id": clean,
-        "title": title,
-        "abstract": abstract,
-        "url": f"{ARXIV_ABS}{clean}",
-        "authors": authors,
-        "published": preprint_date or earliest_date,
-        "primary_category": primary_category,
-    }
+    return _parse_inspire_metadata(metadata, arxiv_id=clean)
 
 
 def _notify_inspire_fallback() -> None:
