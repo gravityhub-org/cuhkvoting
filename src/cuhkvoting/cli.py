@@ -24,6 +24,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from typing import NoReturn
 
 import typer
 
@@ -35,8 +36,15 @@ except importlib.metadata.PackageNotFoundError:
 USER_AGENT = f"cuhkvoting/{_PKG_VERSION} (+https://github.com/gravityhub-org/cuhkvoting)"
 ARXIV_API = "https://export.arxiv.org/api/query"
 ARXIV_ABS = "https://arxiv.org/abs/"
+ARXIV_HTTP_TIMEOUT = 15
+ARXIV_RETRY_DELAYS = (2, 5, 10)
+ARXIV_QUERY_MAX_SECONDS = 60
 ARXIV_FOUNDING_DATE = dt.date(1991, 8, 14)
 INSPIRE_API = "https://inspirehep.net/api/literature"
+INSPIRE_ARXIV_RECORD = "https://inspirehep.net/api/arxiv"
+INSPIRE_HTTP_TIMEOUT = 15
+INSPIRE_RETRY_DELAYS = (1, 2, 5)
+INSPIRE_QUERY_MAX_SECONDS = 30
 DEFAULT_REPO = "gravityhub-org/cuhkvoting-records"
 VOTE_EXPIRY_DAYS = 183
 JC_RECORD_PATH = "papers/journal_club_records.json"
@@ -143,9 +151,9 @@ def _load_config() -> Config:
     )
 
 
-def _http_text(url: str, headers: dict[str, str] | None = None) -> str:
+def _http_text(url: str, headers: dict[str, str] | None = None, *, timeout: float = 30) -> str:
     req = urllib.request.Request(url, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8")
 
 
@@ -239,7 +247,7 @@ def _org_join_instructions() -> str:
         "Looks like SSH key works, but you do not have write access to gravityhub-org/cuhkvoting-records.\n"
         "Please join GitHub organization 'gravityhub-org' to get repo write permission.\n"
         "Contact one of these maintainers to be added:\n"
-        "- Samson Leong <samson32081@gmail.com>\n"
+        "- Samson Leong <samson.hwleong@gmail.com>\n"
         "- Brian Hiu Yeung Cheng <1155175825@link.cuhk.edu.hk>\n"
         "- Hannuksela Otto Akseli <otto.akseli.hannuksela@gmail.com>"
     )
@@ -304,8 +312,28 @@ def _github_headers(token: str | None = None) -> dict[str, str]:
     return headers
 
 
+def _gh_cli_token() -> str | None:
+    try:
+        proc = subprocess.run(
+            ["gh", "auth", "token"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+    except (FileNotFoundError, OSError):
+        pass
+    return None
+
+
 def _get_token() -> str | None:
     token = os.getenv("CUHKVOTING_TOKEN") or os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+    if token:
+        return token
+    token = _gh_cli_token()
     if token:
         return token
     try:
@@ -338,14 +366,87 @@ def _get_user_from_token(token: str | None) -> str | None:
         return None
 
 
+def _github_http_error_read(e: urllib.error.HTTPError) -> tuple[int, str]:
+    try:
+        body = e.read().decode("utf-8", errors="replace")
+    except Exception:
+        body = ""
+    return e.code, body
+
+
+def _exit_github_api_http_from_body(token: str | None, code: int, raw: str) -> NoReturn:
+    """Always raises SystemExit; never leaks GitHub JSON error bodies."""
+    low = raw.lower()
+    if code == 429 or (code == 403 and "rate limit" in low):
+        if token:
+            raise SystemExit("GitHub API rate limit — retry in a few minutes.") from None
+        raise SystemExit(
+            "GitHub needs credentials (anonymous API blocked).\n"
+            "  export GITHUB_TOKEN=…   |   gh auth login   |   SSH key → ssh -T git@github.com"
+        ) from None
+    raise SystemExit(f"GitHub API HTTP {code}. Check GITHUB_TOKEN or repo access.") from None
+
+
+def _load_papers_json_from_dir(papers_dir: Path) -> list[dict]:
+    papers: list[dict] = []
+    if not papers_dir.exists():
+        return papers
+    for path in sorted(papers_dir.glob("*.json")):
+        try:
+            papers.append(json.loads(path.read_text(encoding="utf-8")))
+        except Exception:
+            continue
+    return papers
+
+
+def _list_papers_via_git_clone(cfg: RepoConfig) -> list[dict]:
+    clone_dir = _with_repo_checkout(cfg)
+    try:
+        return _load_papers_json_from_dir(Path(clone_dir) / "papers")
+    finally:
+        shutil.rmtree(clone_dir, ignore_errors=True)
+
+
+def _find_legacy_paper_via_git(cfg: RepoConfig, base_id: str) -> tuple[dict | None, str | None, str | None]:
+    clone_dir = _with_repo_checkout(cfg)
+    try:
+        papers_dir = Path(clone_dir) / "papers"
+        if not papers_dir.exists():
+            return None, None, None
+        for cand in papers_dir.glob("*.json"):
+            try:
+                paper = json.loads(cand.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if _strip_arxiv_version(str(paper.get("id", ""))) == base_id:
+                return paper, None, str(cand.relative_to(clone_dir))
+        return None, None, None
+    finally:
+        shutil.rmtree(clone_dir, ignore_errors=True)
+
+
+def _load_paper_via_git_clone(cfg: RepoConfig, path: str) -> tuple[dict | None, str | None]:
+    clone_dir = _with_repo_checkout(cfg)
+    try:
+        paper_file = Path(clone_dir) / path
+        if not paper_file.exists():
+            return None, None
+        return json.loads(paper_file.read_text(encoding="utf-8")), None
+    finally:
+        shutil.rmtree(clone_dir, ignore_errors=True)
+
+
 def _load_paper_via_api(cfg: RepoConfig, path: str, token: str | None) -> tuple[dict | None, str | None]:
+    if not token and _has_github_ssh_access():
+        return _load_paper_via_git_clone(cfg, path)
     url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/contents/{path}?ref={cfg.branch}"
     try:
         data = _http_json(url, headers=_github_headers(token))
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None, None
-        raise
+        code, body = _github_http_error_read(e)
+        _exit_github_api_http_from_body(token, code, body)
     content = base64.b64decode(data["content"]).decode("utf-8")
     return json.loads(content), data.get("sha")
 
@@ -381,6 +482,17 @@ def _delete_paper_via_api(cfg: RepoConfig, path: str, sha: str, token: str, mess
 
 
 def _load_jc_records(cfg: RepoConfig, token: str | None) -> tuple[list[dict], str | None]:
+    if not token and _has_github_ssh_access():
+        clone_dir = _with_repo_checkout(cfg)
+        try:
+            p = Path(clone_dir) / JC_RECORD_PATH
+            if p.exists():
+                body = json.loads(p.read_text(encoding="utf-8"))
+                records = body.get("records", [])
+                return (records if isinstance(records, list) else []), None
+        finally:
+            shutil.rmtree(clone_dir, ignore_errors=True)
+        return [], None
     data, sha = _load_json_via_api(cfg, JC_RECORD_PATH, token)
     if data is not None:
         records = data.get("records", [])
@@ -470,13 +582,16 @@ def _list_papers_via_api(cfg: RepoConfig, token: str | None) -> list[dict]:
         except (urllib.error.HTTPError, urllib.error.URLError,
                 json.JSONDecodeError, KeyError, RuntimeError):
             pass
+    if not token and _has_github_ssh_access():
+        return _list_papers_via_git_clone(cfg)
     url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/git/trees/{cfg.branch}?recursive=1"
     try:
         data = _http_json(url, headers=_github_headers(token))
     except urllib.error.HTTPError as e:
         if e.code in (404, 409):
             return []
-        raise
+        code, body = _github_http_error_read(e)
+        _exit_github_api_http_from_body(token, code, body)
     papers: list[dict] = []
     for obj in data.get("tree", []):
         path = obj.get("path", "")
@@ -510,41 +625,67 @@ def _parse_retry_after(headers) -> int | None:
         return None
 
 
-def _arxiv_query(params: dict[str, str]) -> list[dict[str, str]]:
+def _arxiv_retry_label(exc: BaseException) -> str:
+    code = getattr(exc, "code", None)
+    if code == 503:
+        return "arXiv overloaded"
+    if code == 429:
+        return "arXiv rate limit"
+    if isinstance(exc, TimeoutError):
+        return "arXiv timeout"
+    if isinstance(exc, http.client.IncompleteRead):
+        return "arXiv incomplete response"
+    reason = getattr(exc, "reason", None) or str(exc)
+    return f"arXiv connection error: {reason}"
+
+
+def _arxiv_query(params: dict[str, str], *, delays: tuple[int, ...] = ARXIV_RETRY_DELAYS) -> list[dict[str, str]]:
     url = f"{ARXIV_API}?{urllib.parse.urlencode(params)}"
-    delays = [10, 20, 60]
+    max_attempts = len(delays)
+    deadline = time.monotonic() + ARXIV_QUERY_MAX_SECONDS
     _retry_label = "arXiv error"
     next_delay: int | None = None
-    for attempt, delay in enumerate([-1] + delays):
+    last_error: BaseException | None = None
+    xml_str: str | None = None
+
+    for attempt in range(max_attempts + 1):
         if attempt > 0:
-            sleep_for = next_delay if next_delay is not None else delay
+            base_delay = next_delay if next_delay is not None else delays[attempt - 1]
+            sleep_for = min(base_delay, max(0, int(deadline - time.monotonic())))
+            if sleep_for <= 0:
+                break
             for remaining in range(sleep_for, 0, -1):
-                sys.stderr.write(f"\r{_retry_label} (attempt {attempt}/{len(delays)}), retrying in {remaining}s… ")
+                sys.stderr.write(
+                    f"\r{_retry_label} (attempt {attempt}/{max_attempts}), retrying in {remaining}s… "
+                )
                 sys.stderr.flush()
                 time.sleep(1)
             sys.stderr.write("\r" + " " * 70 + "\r")
             sys.stderr.flush()
             next_delay = None
         try:
-            xml_str = _http_text(url, headers={"User-Agent": USER_AGENT})
+            xml_str = _http_text(
+                url,
+                headers={"User-Agent": USER_AGENT},
+                timeout=ARXIV_HTTP_TIMEOUT,
+            )
             break
         except (ConnectionError, TimeoutError, urllib.error.URLError, http.client.IncompleteRead) as e:
+            last_error = e
+            _retry_label = _arxiv_retry_label(e)
             code = getattr(e, "code", None)
-            if attempt == len(delays) or (code is not None and code not in (429, 503)):
-                raise
-            if code == 429:
-                _retry_label = "arXiv rate limit"
-            elif code == 503:
-                _retry_label = "arXiv overloaded"
-            elif isinstance(e, TimeoutError):
-                _retry_label = "arXiv timeout"
-            elif isinstance(e, http.client.IncompleteRead):
-                _retry_label = "arXiv incomplete response"
-            else:
-                reason = getattr(e, "reason", None) or str(e)
-                _retry_label = f"arXiv connection error: {reason}"
+            if attempt >= max_attempts or time.monotonic() >= deadline:
+                break
+            if code is not None and code not in (429, 503):
+                break
             if code in (429, 503):
                 next_delay = _parse_retry_after(getattr(e, "headers", None))
+
+    if xml_str is None:
+        # Exhausted/non-retryable: re-raise the original network error (not SystemExit) so
+        # callers' INSPIRE and stale-cache fallbacks (which catch the URLError family) trigger.
+        raise last_error if last_error is not None else RuntimeError("arXiv query failed")
+
     root = ET.fromstring(xml_str)
     ns = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
     entries: list[dict[str, str]] = []
@@ -580,7 +721,7 @@ def _inspire_query(query: str, limit: int) -> list[dict[str, str]]:
         "q": query,
         "size": str(limit),
         "sort": "mostrecent",
-        "fields": "titles,abstracts,authors,arxiv_eprints,control_number",
+        "fields": "titles,abstracts,authors,arxiv_eprints,control_number,earliest_date,preprint_date",
     }
     url = f"{INSPIRE_API}?{urllib.parse.urlencode(params)}"
     data = _http_json(url, headers={"User-Agent": USER_AGENT})
@@ -626,6 +767,18 @@ def _inspire_query(query: str, limit: int) -> list[dict[str, str]]:
             continue
         paper_id = arxiv_id
         paper_url = f"{ARXIV_ABS}{arxiv_id}"
+        earliest_date = metadata.get("earliest_date")
+        if not isinstance(earliest_date, str):
+            earliest_date = ""
+        preprint_date = metadata.get("preprint_date")
+        if not isinstance(preprint_date, str):
+            preprint_date = ""
+        cats: list[str] = []
+        if isinstance(arxiv_eprints, list) and arxiv_eprints and isinstance(arxiv_eprints[0], dict):
+            raw_cats = arxiv_eprints[0].get("categories", [])
+            if isinstance(raw_cats, list):
+                cats = [str(c) for c in raw_cats if str(c).strip()]
+        primary_category = cats[0] if cats else ""
         entries.append(
             {
                 "id": paper_id,
@@ -633,9 +786,226 @@ def _inspire_query(query: str, limit: int) -> list[dict[str, str]]:
                 "abstract": abstract,
                 "url": paper_url,
                 "authors": authors,
+                "published": preprint_date or earliest_date,
+                "primary_category": primary_category,
             }
         )
     return entries
+
+
+def _inspire_retry_label(exc: BaseException) -> str:
+    code = getattr(exc, "code", None)
+    if code == 429:
+        return "INSPIRE rate limit"
+    if code in (502, 503, 504):
+        return "INSPIRE unavailable"
+    if isinstance(exc, TimeoutError):
+        return "INSPIRE timeout"
+    if isinstance(exc, http.client.IncompleteRead):
+        return "INSPIRE incomplete response"
+    reason = getattr(exc, "reason", None) or str(exc)
+    return f"INSPIRE connection error: {reason}"
+
+
+def _inspire_query_retry(query: str, limit: int) -> list[dict[str, str]]:
+    delays = INSPIRE_RETRY_DELAYS
+    max_attempts = len(delays)
+    deadline = time.monotonic() + INSPIRE_QUERY_MAX_SECONDS
+    _retry_label = "INSPIRE error"
+    last_error: BaseException | None = None
+
+    for attempt in range(max_attempts + 1):
+        if attempt > 0:
+            delay = min(delays[attempt - 1], max(0, int(deadline - time.monotonic())))
+            if delay <= 0:
+                break
+            time.sleep(delay)
+        try:
+            # _inspire_query uses _http_json which has 30s timeout; avoid that.
+            params = {
+                "q": query,
+                "size": str(limit),
+                "sort": "mostrecent",
+                "fields": "titles,abstracts,authors,arxiv_eprints,control_number,earliest_date,preprint_date",
+            }
+            url = f"{INSPIRE_API}?{urllib.parse.urlencode(params)}"
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=INSPIRE_HTTP_TIMEOUT) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            # Reuse parsing logic by temporarily calling _inspire_query-style parser.
+            hits = data.get("hits", {}).get("hits", [])
+            parsed: list[dict[str, str]] = []
+            for hit in hits if isinstance(hits, list) else []:
+                metadata = hit.get("metadata", {}) if isinstance(hit, dict) else {}
+                if not isinstance(metadata, dict):
+                    continue
+                titles = metadata.get("titles", [])
+                title = ""
+                if isinstance(titles, list):
+                    for t in titles:
+                        if isinstance(t, dict) and isinstance(t.get("title"), str) and t.get("title", "").strip():
+                            title = " ".join(t["title"].split())
+                            break
+                if not title:
+                    continue
+                abstracts = metadata.get("abstracts", [])
+                abstract = ""
+                if isinstance(abstracts, list):
+                    for a in abstracts:
+                        if isinstance(a, dict) and isinstance(a.get("value"), str) and a.get("value", "").strip():
+                            abstract = " ".join(a["value"].split())
+                            break
+                authors_raw = metadata.get("authors", [])
+                authors: list[str] = []
+                if isinstance(authors_raw, list):
+                    for author in authors_raw:
+                        if isinstance(author, dict):
+                            name = author.get("full_name")
+                            if isinstance(name, str) and name.strip():
+                                authors.append(" ".join(name.split()))
+                arxiv_id = ""
+                arxiv_eprints = metadata.get("arxiv_eprints", [])
+                if isinstance(arxiv_eprints, list):
+                    for ep in arxiv_eprints:
+                        if isinstance(ep, dict) and isinstance(ep.get("value"), str) and ep.get("value", "").strip():
+                            arxiv_id = _strip_arxiv_version(ep["value"])
+                            break
+                if not arxiv_id:
+                    continue
+                earliest_date = metadata.get("earliest_date")
+                if not isinstance(earliest_date, str):
+                    earliest_date = ""
+                preprint_date = metadata.get("preprint_date")
+                if not isinstance(preprint_date, str):
+                    preprint_date = ""
+                cats: list[str] = []
+                if isinstance(arxiv_eprints, list) and arxiv_eprints and isinstance(arxiv_eprints[0], dict):
+                    raw_cats = arxiv_eprints[0].get("categories", [])
+                    if isinstance(raw_cats, list):
+                        cats = [str(c) for c in raw_cats if str(c).strip()]
+                primary_category = cats[0] if cats else ""
+                parsed.append(
+                    {
+                        "id": arxiv_id,
+                        "title": title,
+                        "abstract": abstract,
+                        "url": f"{ARXIV_ABS}{arxiv_id}",
+                        "authors": authors,
+                        "published": preprint_date or earliest_date,
+                        "primary_category": primary_category,
+                    }
+                )
+            return parsed
+        except (ConnectionError, TimeoutError, urllib.error.URLError, http.client.IncompleteRead) as e:
+            last_error = e
+            _retry_label = _inspire_retry_label(e)
+            code = getattr(e, "code", None)
+            if attempt >= max_attempts or time.monotonic() >= deadline:
+                break
+            if code is not None and code not in (429, 502, 503, 504):
+                break
+
+    # Exhausted/non-retryable: re-raise the original network error (not SystemExit) so the
+    # caller's stale-cache fallback (which catches the URLError family) can trigger.
+    raise last_error if last_error is not None else RuntimeError("INSPIRE query failed")
+
+
+def _inspire_get_by_arxiv_id(paper_id: str) -> dict | None:
+    clean = _strip_arxiv_version(paper_id)
+    url = f"{INSPIRE_ARXIV_RECORD}/{urllib.parse.quote(clean)}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=INSPIRE_HTTP_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+    metadata = data.get("metadata", {})
+    if not isinstance(metadata, dict):
+        return None
+    # Reuse _inspire_query parsing style for single record.
+    titles = metadata.get("titles", [])
+    title = ""
+    if isinstance(titles, list):
+        for t in titles:
+            if isinstance(t, dict) and isinstance(t.get("title"), str) and t.get("title", "").strip():
+                title = " ".join(t["title"].split())
+                break
+    abstracts = metadata.get("abstracts", [])
+    abstract = ""
+    if isinstance(abstracts, list):
+        for a in abstracts:
+            if isinstance(a, dict) and isinstance(a.get("value"), str) and a.get("value", "").strip():
+                abstract = " ".join(a["value"].split())
+                break
+    authors_raw = metadata.get("authors", [])
+    authors: list[str] = []
+    if isinstance(authors_raw, list):
+        for author in authors_raw:
+            if isinstance(author, dict):
+                name = author.get("full_name")
+                if isinstance(name, str) and name.strip():
+                    authors.append(" ".join(name.split()))
+    arxiv_eprints = metadata.get("arxiv_eprints", [])
+    cats: list[str] = []
+    if isinstance(arxiv_eprints, list) and arxiv_eprints and isinstance(arxiv_eprints[0], dict):
+        raw_cats = arxiv_eprints[0].get("categories", [])
+        if isinstance(raw_cats, list):
+            cats = [str(c) for c in raw_cats if str(c).strip()]
+    primary_category = cats[0] if cats else ""
+    earliest_date = metadata.get("earliest_date")
+    if not isinstance(earliest_date, str):
+        earliest_date = ""
+    preprint_date = metadata.get("preprint_date")
+    if not isinstance(preprint_date, str):
+        preprint_date = ""
+    return {
+        "id": clean,
+        "title": title,
+        "abstract": abstract,
+        "url": f"{ARXIV_ABS}{clean}",
+        "authors": authors,
+        "published": preprint_date or earliest_date,
+        "primary_category": primary_category,
+    }
+
+
+def _notify_inspire_fallback() -> None:
+    """One-line notice that arXiv is unreachable and INSPIRE-HEP is being used instead."""
+    typer.echo(
+        typer.style("Note: arXiv unavailable — falling back to INSPIRE-HEP.", fg=typer.colors.YELLOW),
+        err=True,
+    )
+
+
+def _fetch_entries(categories: list[str], start: dt.date, end: dt.date, limit: int) -> list[dict]:
+    # arXiv is primary; INSPIRE is the fallback when arXiv is unreachable. The arXiv attempt
+    # is single and timer-less (delays=()), so the failover to INSPIRE is invisible (no retry
+    # countdown). If INSPIRE also fails it re-raises → caller's stale-cache fallback handles it.
+    start_dt = dt.datetime.combine(start, dt.time.min)
+    end_dt = dt.datetime.combine(end, dt.time.max).replace(second=0, microsecond=0)
+    try:
+        return _arxiv_query(
+            {
+                "search_query": (
+                    f"{_build_cat_query(categories)} AND "
+                    f"submittedDate:[{start_dt.strftime('%Y%m%d%H%M')} TO {end_dt.strftime('%Y%m%d%H%M')}]"
+                ),
+                "start": "0",
+                "max_results": str(limit),
+                "sortBy": "submittedDate",
+                "sortOrder": "descending",
+            },
+            delays=(),
+        )
+    except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead):
+        # INSPIRE stores arXiv categories in arxiv_eprints.categories and dates in earliest_date
+        # (day-granular). Fallback only — INSPIRE indexing lags arXiv for the newest papers.
+        _notify_inspire_fallback()
+        cats_q = "(" + " or ".join(f"arxiv_eprints.categories:{c}" for c in categories) + ")"
+        q = f"{cats_q} and earliest_date:[{start.isoformat()} to {end.isoformat()}]"
+        return _inspire_query_retry(q, limit)
 
 
 def _build_inspire_title_query(keywords: list[str]) -> str:
@@ -855,13 +1225,20 @@ def _entry_in_date_spans(entry: dict, spans: list[tuple[dt.date, dt.date]]) -> b
 
 
 def _find_legacy_paper_via_api(cfg: RepoConfig, base_id: str, token: str | None) -> tuple[dict | None, str | None, str | None]:
+    if not token and _has_github_ssh_access():
+        return _find_legacy_paper_via_git(cfg, base_id)
     url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/git/trees/{cfg.branch}?recursive=1"
     try:
         data = _http_json(url, headers=_github_headers(token))
     except urllib.error.HTTPError as e:
         if e.code in (404, 409):
             return None, None, None
-        raise
+        code, body = _github_http_error_read(e)
+        if not token and _has_github_ssh_access() and (
+            code == 429 or (code == 403 and "rate limit" in body.lower())
+        ):
+            return _find_legacy_paper_via_git(cfg, base_id)
+        _exit_github_api_http_from_body(token, code, body)
     for obj in data.get("tree", []):
         path = obj.get("path", "")
         if obj.get("type") != "blob" or not path.startswith("papers/") or not path.endswith(".json"):
@@ -1021,7 +1398,20 @@ def _delete_vote_paper(
 
 
 def _validate_arxiv_entry(paper_id: str) -> dict:
-    entries = _arxiv_query({"search_query": f"id:{paper_id}", "start": "0", "max_results": "1"})
+    # arXiv is primary (single, timer-less attempt). INSPIRE is the fallback only when arXiv
+    # is unreachable — keeps the invisible-failover behaviour and avoids INSPIRE's indexing lag
+    # for brand-new ids. arXiv reachable-but-empty stays a hard "not found" (typo guard).
+    try:
+        entries = _arxiv_query({"search_query": f"id:{paper_id}", "start": "0", "max_results": "1"}, delays=())
+    except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead):
+        _notify_inspire_fallback()
+        try:
+            entry = _inspire_get_by_arxiv_id(paper_id)
+        except Exception:
+            entry = None
+        if entry:
+            return entry
+        raise  # re-raise the arXiv network error → friendly top-level handler
     if not entries:
         raise SystemExit(f"Could not find arXiv entry for id '{paper_id}'.")
     return entries[0]
@@ -1283,18 +1673,12 @@ def _resolve_paper_ids(raw_ids: list[str]) -> list[tuple[str, str | None, int | 
 
 
 def _fetch_today_entries(categories: list[str]) -> list[dict]:
-    # arXiv doesn't announce on weekends; a strict 24-hour submittedDate window
-    # would return nothing on Monday morning. Query a 7-day window instead and
-    # keep only papers from the most recent announcement date (published field).
+    # arXiv doesn't announce on weekends; a strict 24-hour window would return nothing
+    # on Monday morning. Query a 7-day window and keep only the most recent announcement
+    # date (published field). Sourced via _fetch_entries (arXiv primary, INSPIRE fallback).
     end_day = dt.datetime.now(dt.timezone.utc).date()
     start_day = end_day - dt.timedelta(days=7)
-    all_entries = _arxiv_query({
-        "search_query": f"{_build_cat_query(categories)} AND submittedDate:[{start_day.strftime('%Y%m%d')}0000 TO {end_day.strftime('%Y%m%d')}2359]",
-        "start": "0",
-        "max_results": "1000",
-        "sortBy": "submittedDate",
-        "sortOrder": "descending",
-    })
+    all_entries = _fetch_entries(categories, start_day, end_day, limit=1000)
     latest_date = max(
         (e.get("published", "")[:10] for e in all_entries if e.get("published")),
         default="",
@@ -1307,26 +1691,11 @@ def _fetch_today_entries(categories: list[str]) -> list[dict]:
 def _fetch_lastdays_entries(days: int, categories: list[str]) -> list[dict]:
     end_day = dt.datetime.now(dt.timezone.utc).date()
     start_day = end_day - dt.timedelta(days=days)
-    return _arxiv_query({
-        "search_query": f"{_build_cat_query(categories)} AND submittedDate:[{start_day.strftime('%Y%m%d')}0000 TO {end_day.strftime('%Y%m%d')}2359]",
-        "start": "0",
-        "max_results": "1000",
-        "sortBy": "submittedDate",
-        "sortOrder": "descending",
-    })
+    return _fetch_entries(categories, start_day, end_day, limit=1000)
 
 
 def _fetch_daterange_entries(start: dt.date, end: dt.date, categories: list[str]) -> list[dict]:
-    return _arxiv_query({
-        "search_query": (
-            f"{_build_cat_query(categories)} AND "
-            f"submittedDate:[{start.strftime('%Y%m%d')}0000 TO {end.strftime('%Y%m%d')}2359]"
-        ),
-        "start": "0",
-        "max_results": "500",
-        "sortBy": "submittedDate",
-        "sortOrder": "descending",
-    })
+    return _fetch_entries(categories, start, end, limit=500)
 
 
 def _parse_categories(args_category: list[str] | None, default: list[str]) -> list[str]:
@@ -1543,17 +1912,6 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
     repo_cfg = _resolve_repo_config(args)
     token = _get_token()
     papers = _list_papers_via_api(repo_cfg, token)
-    if not papers and _has_github_ssh_access():
-        clone_dir = _with_repo_checkout(repo_cfg)
-        try:
-            papers_dir = Path(clone_dir) / "papers"
-            for path in sorted(papers_dir.glob("*.json")) if papers_dir.exists() else []:
-                try:
-                    papers.append(json.loads(path.read_text(encoding="utf-8")))
-                except Exception:
-                    continue
-        finally:
-            shutil.rmtree(clone_dir, ignore_errors=True)
 
     dn_table = _fetch_display_names(repo_cfg, token)
     rows = _topvoted_rows_from_papers(papers, dn_table)
@@ -1975,7 +2333,15 @@ def cmd_vote(args: SimpleNamespace) -> int:
 
     if paper is None:
         cached = _lookup_local_cache(paper_id)
-        entry = cached if cached else _validate_arxiv_entry(paper_id)
+        if cached:
+            entry = cached
+        else:
+            entry = {
+                "id": _strip_arxiv_version(paper_id),
+                "title": "",
+                "abstract": "",
+                "url": f"{ARXIV_ABS}{paper_id}",
+            }
         paper = {
             "id": entry["id"],
             "title": entry.get("title", ""),
@@ -2175,6 +2541,14 @@ def _invoke_cmd(func, **kwargs: object) -> int:
         typer.echo(
             f"arXiv closed the connection ({e}). "
             "This is usually a temporary rate limit — retry in a moment, "
+            "or use --max-age to serve results from the local cache.",
+            err=True,
+        )
+        return 1
+    except (TimeoutError, http.client.IncompleteRead) as e:
+        typer.echo(
+            f"arXiv request failed ({type(e).__name__}: {e}). "
+            "This is usually a temporary issue — retry in a moment, "
             "or use --max-age to serve results from the local cache.",
             err=True,
         )
@@ -2385,16 +2759,13 @@ def vote_command(
     display_name = cfg.display_name
     _warn_if_display_name_changed(display_name)
 
-    # Resolve title/url for each paper from local cache, falling back to arXiv.
+    # Resolve title from last list or local cache only — voting must not block on arXiv.
     papers_meta: list[dict] = []
     for arxiv_id, title, _ in resolved:
         if not title:
             cached = _lookup_local_cache(arxiv_id)
             if cached:
                 title = cached.get("title", "")
-            else:
-                entry = _validate_arxiv_entry(arxiv_id)
-                title = entry.get("title", "")
         papers_meta.append({
             "paper_id": arxiv_id,
             "title": title or "",
