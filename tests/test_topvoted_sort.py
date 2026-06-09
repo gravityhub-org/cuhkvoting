@@ -1,4 +1,4 @@
-"""Tests for topvoted ordering: vote count, then most recent vote, then id."""
+"""Tests for topvoted ordering: vote count, voter diversity, then date, then id."""
 
 from __future__ import annotations
 
@@ -83,6 +83,33 @@ class TestTopvotedRowsSort(unittest.TestCase):
         ]
         rows = _topvoted_rows_from_papers(copy.deepcopy(papers), {})
         self.assertEqual([r["id"] for r in rows], ["3333.0001", "3333.0002"])
+
+    def test_equal_votes_prefers_different_voters_before_date(self) -> None:
+        papers = [
+            _paper(
+                "1111.0002",
+                [_vote("Paul", "2030-12-01T00:00:00Z"), _vote("ohannuks", "2030-01-01T00:00:00Z")],
+            ),
+            _paper(
+                "1111.0001",
+                [_vote("Paul", "2030-06-01T00:00:00Z"), _vote("liiyung", "2030-05-01T00:00:00Z")],
+            ),
+            _paper(
+                "1111.0003",
+                [_vote("diceandcats", "2030-01-01T00:00:00Z"), _vote("souvik", "2030-02-01T00:00:00Z")],
+            ),
+        ]
+        rows = _topvoted_rows_from_papers(copy.deepcopy(papers), {})
+        self.assertEqual([r["id"] for r in rows], ["1111.0002", "1111.0003", "1111.0001"])
+
+    def test_equal_votes_spreads_same_single_voter(self) -> None:
+        papers = [
+            _paper("4444.0001", [_vote("Paul", "2030-03-01T00:00:00Z")]),
+            _paper("4444.0002", [_vote("ohannuks", "2030-01-01T00:00:00Z")]),
+            _paper("4444.0003", [_vote("Paul", "2030-06-01T00:00:00Z")]),
+        ]
+        rows = _topvoted_rows_from_papers(copy.deepcopy(papers), {})
+        self.assertEqual([r["id"] for r in rows], ["4444.0003", "4444.0002", "4444.0001"])
 
     def test_skips_selected_and_zero_votes(self) -> None:
         papers = [

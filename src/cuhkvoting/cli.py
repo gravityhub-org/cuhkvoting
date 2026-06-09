@@ -1180,6 +1180,40 @@ def _latest_vote_timestamp(votes: list[dict]) -> float:
     return best
 
 
+def _vote_user_set(votes: list[dict]) -> frozenset[str]:
+    return frozenset(
+        str(v.get("user", "")).strip().lower()
+        for v in votes
+        if str(v.get("user", "")).strip()
+    )
+
+
+def _diversify_topvoted_rows(rows: list[dict]) -> list[dict]:
+    """Order rows by vote count, spreading distinct voters within ties before date."""
+    if len(rows) <= 1:
+        return rows
+    by_votes: dict[int, list[dict]] = {}
+    for row in rows:
+        by_votes.setdefault(row["votes"], []).append(row)
+    ordered: list[dict] = []
+    for vote_count in sorted(by_votes.keys(), reverse=True):
+        remaining = list(by_votes[vote_count])
+        seen_voters: set[str] = set()
+        while remaining:
+            best = min(
+                remaining,
+                key=lambda r: (
+                    len(r["voter_users"] & seen_voters),
+                    -r["latest_vote_ts"],
+                    r["id"],
+                ),
+            )
+            remaining.remove(best)
+            ordered.append(best)
+            seen_voters |= best["voter_users"]
+    return ordered
+
+
 def _prune_expired_votes(paper: dict) -> int:
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=VOTE_EXPIRY_DAYS)
     votes = paper.get("votes", [])
@@ -1865,11 +1899,11 @@ def _topvoted_rows_from_papers(papers: list[dict], dn_table: dict[str, str]) -> 
                 "abstract": " ".join(paper.get("abstract", "").split()),
                 "votes": vote_count,
                 "voters": _format_voters(votes, dn_table),
+                "voter_users": _vote_user_set(votes),
                 "latest_vote_ts": _latest_vote_timestamp(votes),
             }
         )
-    rows.sort(key=lambda p: (-p["votes"], -p["latest_vote_ts"], p["id"]))
-    return rows
+    return _diversify_topvoted_rows(rows)
 
 
 def cmd_topvoted(args: SimpleNamespace) -> int:
