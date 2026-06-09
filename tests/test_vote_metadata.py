@@ -56,6 +56,23 @@ class VoteMetadataTests(unittest.TestCase):
         cli._apply_paper_metadata(paper, {"title": "New", "url": "other", "abstract": "abs"})
         self.assertEqual(paper["title"], "Existing")
 
+    def test_backfill_paper_metadata_fetches_missing_title(self) -> None:
+        paper = {"id": "2605.11269", "title": "", "abstract": "", "url": "", "votes": [{"user": "u"}]}
+        entry = {
+            "id": "2605.11269",
+            "title": "Fetched",
+            "abstract": "abs",
+            "url": f"{cli.ARXIV_ABS}2605.11269",
+        }
+        with mock.patch("cuhkvoting.cli._resolve_vote_metadata", return_value=entry):
+            reasons = cli._backfill_paper_metadata(paper)
+        self.assertEqual(paper["title"], "Fetched")
+        self.assertIn("title backfilled", reasons)
+
+    def test_backfill_paper_metadata_skips_when_complete(self) -> None:
+        paper = {"id": "2601.09678", "title": "T", "abstract": "a", "url": "u", "votes": []}
+        self.assertEqual(cli._backfill_paper_metadata(paper), [])
+
 
 if __name__ == "__main__":
     unittest.main()

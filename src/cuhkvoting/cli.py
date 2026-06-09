@@ -1464,6 +1464,34 @@ def _apply_paper_metadata(paper: dict, meta: dict) -> None:
         paper["abstract"] = abstract
 
 
+def _backfill_paper_metadata(paper: dict) -> list[str]:
+    """Fetch and apply missing title/url/abstract. Returns change descriptions."""
+    reasons: list[str] = []
+    paper_id = _strip_arxiv_version(str(paper.get("id", "")))
+    if not paper_id:
+        return reasons
+    needs_title = not (paper.get("title") or "").strip()
+    needs_abstract = not (paper.get("abstract") or "").strip()
+    needs_url = not (paper.get("url") or "").strip()
+    if not (needs_title or needs_abstract or needs_url):
+        return reasons
+    try:
+        meta = _resolve_vote_metadata(paper_id, None if needs_title else paper.get("title"))
+    except SystemExit:
+        if needs_title:
+            reasons.append(f"title backfill failed ({paper_id})")
+        return reasons
+    before = (paper.get("title"), paper.get("abstract"), paper.get("url"))
+    _apply_paper_metadata(paper, meta)
+    if needs_title and paper.get("title") != before[0]:
+        reasons.append("title backfilled")
+    if needs_abstract and paper.get("abstract") != before[1]:
+        reasons.append("abstract backfilled")
+    if needs_url and paper.get("url") != before[2]:
+        reasons.append("url backfilled")
+    return reasons
+
+
 def _resolve_cache(
     key: str,
     categories: list[str],
@@ -2835,7 +2863,7 @@ def admin_sanitize(
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview without writing."),
 ) -> None:
-    """Normalize whitespace in title/abstract and strip legacy display_name fields from vote entries."""
+    """Normalize records, backfill missing titles, and strip legacy display_name fields."""
     args = SimpleNamespace(repo=repo, branch=branch)
     cfg = _resolve_repo_config(args)
     token = _get_token()
@@ -2856,6 +2884,7 @@ def admin_sanitize(
             if "display_name" in v:
                 del v["display_name"]
                 reasons.append(f"legacy display_name removed ({v.get('user', '?')})")
+        reasons.extend(_backfill_paper_metadata(paper))
         return reasons
 
     def _sanitize_jc_records(body: dict) -> list[str]:
@@ -2878,6 +2907,16 @@ def admin_sanitize(
             if canon != r.get("arxiv_id"):
                 r["arxiv_id"] = canon
                 reasons.append(f"arxiv_id normalized ({raw_id} -> {canon})")
+            if not (r.get("title") or "").strip() and canon:
+                try:
+                    meta = _resolve_vote_metadata(canon)
+                except SystemExit:
+                    reasons.append(f"title backfill failed ({canon})")
+                else:
+                    new_title = meta.get("title", "")
+                    if new_title:
+                        r["title"] = new_title
+                        reasons.append(f"title backfilled ({canon})")
 
         # 2. De-duplicate by canonical arxiv_id, keeping the earliest selection
         #    (earliest selected_at; missing dates sort last). Preserve first-seen order.
@@ -2902,8 +2941,8 @@ def admin_sanitize(
             body["records"] = deduped
         return reasons
 
-    typer.echo("Sanitizing: whitespace normalization, legacy display_name removal, "
-               "journal-club record de-duplication.")
+    typer.echo("Sanitizing: whitespace normalization, missing title backfill, "
+               "legacy display_name removal, journal-club record de-duplication.")
 
     if _has_github_ssh_access():
         clone_dir = _with_repo_checkout(cfg)
