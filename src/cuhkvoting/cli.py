@@ -1425,6 +1425,45 @@ def _lookup_local_cache(paper_id: str) -> dict | None:
     return None
 
 
+def _resolve_vote_metadata(arxiv_id: str, title: str | None = None) -> dict:
+    """Return vote metadata with a non-empty title when the paper exists on arXiv/INSPIRE."""
+    clean_id = _strip_arxiv_version(arxiv_id)
+    resolved_title = (title or "").strip()
+    cached = _lookup_local_cache(clean_id)
+    if not resolved_title and cached:
+        resolved_title = (cached.get("title") or "").strip()
+    if not resolved_title:
+        entry = _validate_arxiv_entry(clean_id)
+        resolved_title = (entry.get("title") or "").strip()
+        if not resolved_title:
+            raise SystemExit(f"Could not resolve title for '{clean_id}'.")
+        return {
+            "paper_id": clean_id,
+            "title": resolved_title,
+            "url": entry.get("url", f"{ARXIV_ABS}{clean_id}"),
+            "abstract": entry.get("abstract", ""),
+        }
+    return {
+        "paper_id": clean_id,
+        "title": resolved_title,
+        "url": (cached or {}).get("url", f"{ARXIV_ABS}{clean_id}"),
+        "abstract": (cached or {}).get("abstract", ""),
+    }
+
+
+def _apply_paper_metadata(paper: dict, meta: dict) -> None:
+    """Backfill missing title/url/abstract on an existing paper record."""
+    title = (meta.get("title") or "").strip()
+    if title and not (paper.get("title") or "").strip():
+        paper["title"] = title
+    url = meta.get("url")
+    if url and not paper.get("url"):
+        paper["url"] = url
+    abstract = meta.get("abstract", "")
+    if abstract and not paper.get("abstract"):
+        paper["abstract"] = abstract
+
+
 def _resolve_cache(
     key: str,
     categories: list[str],
@@ -1974,13 +2013,15 @@ def _batch_vote_papers_ssh(
             paper_file = papers_dir / f"{_safe_filename(paper_id)}.json"
             # No individual API GET — files are read directly from the local checkout,
             # preserving any existing votes from other users without extra round-trips.
+            abstract = p.get("abstract", "")
             if paper_file.exists():
                 try:
                     paper = json.loads(paper_file.read_text(encoding="utf-8"))
                 except Exception:
-                    paper = {"id": paper_id, "title": title, "abstract": "", "url": url, "votes": []}
+                    paper = {"id": paper_id, "title": title, "abstract": abstract, "url": url, "votes": []}
             else:
-                paper = {"id": paper_id, "title": title, "abstract": "", "url": url, "votes": []}
+                paper = {"id": paper_id, "title": title, "abstract": abstract, "url": url, "votes": []}
+            _apply_paper_metadata(paper, p)
             _prune_expired_votes(paper)
             votes = paper.setdefault("votes", [])
             if any(v.get("user") == user for v in votes):
@@ -2132,10 +2173,11 @@ def _batch_vote_papers_api(
             try:
                 paper = json.loads(text)
             except Exception:
-                paper = {"id": paper_id, "title": title, "abstract": "", "url": url, "votes": []}
+                paper = {"id": paper_id, "title": title, "abstract": p.get("abstract", ""), "url": url, "votes": []}
         else:
-            paper = {"id": paper_id, "title": title, "abstract": "", "url": url, "votes": []}
+            paper = {"id": paper_id, "title": title, "abstract": p.get("abstract", ""), "url": url, "votes": []}
 
+        _apply_paper_metadata(paper, p)
         _prune_expired_votes(paper)
         votes = paper.setdefault("votes", [])
         if any(v.get("user") == user for v in votes):
@@ -2206,8 +2248,19 @@ def _vote_paper_with_metadata(
 ) -> int:
     """Vote for a paper using pre-known metadata, skipping arXiv validation."""
     paper, sha, save_path = _load_vote_paper(cfg, token, paper_id)
+    meta = {"paper_id": paper_id, "title": title, "url": url}
+    if not (title or "").strip():
+        meta = _resolve_vote_metadata(paper_id)
     if paper is None:
-        paper = {"id": paper_id, "title": title, "abstract": "", "url": url, "votes": []}
+        paper = {
+            "id": paper_id,
+            "title": meta["title"],
+            "abstract": meta.get("abstract", ""),
+            "url": meta["url"],
+            "votes": [],
+        }
+    else:
+        _apply_paper_metadata(paper, meta)
     _prune_expired_votes(paper)
     votes = paper.setdefault("votes", [])
     if any(v.get("user") == user for v in votes):
@@ -2230,30 +2283,17 @@ def cmd_vote(args: SimpleNamespace) -> int:
     paper, sha, save_path = _load_vote_paper(cfg, token, paper_id)
 
     if paper is None:
-        cached = _lookup_local_cache(paper_id)
-        if cached:
-            entry = cached
-        else:
-            entry = {
-                "id": _strip_arxiv_version(paper_id),
-                "title": "",
-                "abstract": "",
-                "url": f"{ARXIV_ABS}{paper_id}",
-            }
+        meta = _resolve_vote_metadata(paper_id)
         paper = {
-            "id": entry["id"],
-            "title": entry.get("title", ""),
-            "abstract": entry.get("abstract", ""),
-            "url": entry.get("url", f"{ARXIV_ABS}{paper_id}"),
+            "id": meta["paper_id"],
+            "title": meta["title"],
+            "abstract": meta.get("abstract", ""),
+            "url": meta["url"],
             "votes": [],
         }
-    elif not paper.get("abstract"):
-        cached = _lookup_local_cache(paper_id)
-        if cached and cached.get("abstract"):
-            paper["abstract"] = cached["abstract"]
-        elif not cached:
-            entry = _validate_arxiv_entry(paper_id)
-            paper["abstract"] = entry.get("abstract", "")
+    else:
+        meta = _resolve_vote_metadata(paper_id, paper.get("title"))
+        _apply_paper_metadata(paper, meta)
 
     _prune_expired_votes(paper)
     votes = paper.setdefault("votes", [])
@@ -2657,18 +2697,9 @@ def vote_command(
     display_name = cfg.display_name
     _warn_if_display_name_changed(display_name)
 
-    # Resolve title from last list or local cache only — voting must not block on arXiv.
     papers_meta: list[dict] = []
     for arxiv_id, title, _ in resolved:
-        if not title:
-            cached = _lookup_local_cache(arxiv_id)
-            if cached:
-                title = cached.get("title", "")
-        papers_meta.append({
-            "paper_id": arxiv_id,
-            "title": title or "",
-            "url": f"{ARXIV_ABS}{arxiv_id}",
-        })
+        papers_meta.append(_resolve_vote_metadata(arxiv_id, title))
 
     try:
         if _has_github_ssh_access():
