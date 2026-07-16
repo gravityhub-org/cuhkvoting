@@ -102,6 +102,7 @@ class Config:
     abstract_wrap: int
     confirm_by_number: bool
     display_name: str
+    display_name_overrides: dict[str, str]
     highlight_authors: list[str]
     highlight_keywords: list[str]
     highlight_keyword_count: int
@@ -118,6 +119,8 @@ def _load_config() -> Config:
             display_cfg = raw.get("display", {})
             vote_cfg = raw.get("vote", {})
             hl_cfg = raw.get("highlights", {})
+            dn_overrides = vote_cfg.get("display_names", {})
+            dn_overrides = {str(k): str(v) for k, v in dn_overrides.items()} if isinstance(dn_overrides, dict) else {}
             return Config(
                 categories=cats if isinstance(cats, list) and cats else DEFAULT_CATEGORIES,
                 today_max_age=int(cache_cfg.get("today_max_age", DEFAULT_TODAY_MAX_AGE)),
@@ -126,6 +129,7 @@ def _load_config() -> Config:
                 abstract_wrap=int(display_cfg.get("abstract_wrap", DEFAULT_ABSTRACT_WRAP)),
                 confirm_by_number=bool(vote_cfg.get("confirm_by_number", True)),
                 display_name=str(vote_cfg.get("display_name", "")),
+                display_name_overrides=dn_overrides,
                 highlight_authors=list(hl_cfg.get("authors", DEFAULT_HIGHLIGHT_AUTHORS)),
                 highlight_keywords=list(hl_cfg.get("keywords", DEFAULT_HIGHLIGHT_KEYWORDS)),
                 highlight_keyword_count=int(hl_cfg.get("keyword_count", DEFAULT_HIGHLIGHT_KEYWORD_COUNT)),
@@ -144,6 +148,7 @@ def _load_config() -> Config:
         abstract_wrap=DEFAULT_ABSTRACT_WRAP,
         confirm_by_number=True,
         display_name="",
+        display_name_overrides={},
         highlight_authors=DEFAULT_HIGHLIGHT_AUTHORS,
         highlight_keywords=DEFAULT_HIGHLIGHT_KEYWORDS,
         highlight_keyword_count=DEFAULT_HIGHLIGHT_KEYWORD_COUNT,
@@ -508,6 +513,76 @@ def _load_jc_records(cfg: RepoConfig, token: str | None) -> tuple[list[dict], st
         finally:
             shutil.rmtree(clone_dir, ignore_errors=True)
     return [], None
+
+
+def _load_jc_records_and_display_names(
+    cfg: RepoConfig, token: str | None
+) -> tuple[list[dict], str | None, dict[str, str]]:
+    """JC records (+sha) and the shared display-name table in one round-trip.
+
+    Bundles the two reads `record`/`select` would otherwise do separately, so adding name
+    resolution costs no extra request: the SSH path reads both files from one clone; the token
+    path fetches both blobs in a single GraphQL query (the records `oid` doubles as the
+    Contents-API sha used by later writes). Falls back to two plain reads on GraphQL failure.
+    """
+    if not token and _has_github_ssh_access():
+        clone_dir = _with_repo_checkout(cfg)
+        try:
+            records: list[dict] = []
+            rec_path = Path(clone_dir) / JC_RECORD_PATH
+            if rec_path.exists():
+                body = json.loads(rec_path.read_text(encoding="utf-8"))
+                recs = body.get("records", []) if isinstance(body, dict) else []
+                records = recs if isinstance(recs, list) else []
+            dn_table: dict[str, str] = {}
+            dn_path = Path(clone_dir) / DISPLAY_NAMES_PATH
+            if dn_path.exists():
+                parsed = json.loads(dn_path.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    dn_table = {str(k): str(v) for k, v in parsed.items()}
+            return records, None, dn_table
+        finally:
+            shutil.rmtree(clone_dir, ignore_errors=True)
+    if token:
+        try:
+            query = '{ repository(owner: "%s", name: "%s") { %s %s } }' % (
+                cfg.owner,
+                cfg.repo,
+                f'rec: object(expression: "{cfg.branch}:{JC_RECORD_PATH}") {{ ... on Blob {{ text oid }} }}',
+                f'dn: object(expression: "{cfg.branch}:{DISPLAY_NAMES_PATH}") {{ ... on Blob {{ text }} }}',
+            )
+            req = urllib.request.Request(
+                "https://api.github.com/graphql",
+                data=json.dumps({"query": query}).encode("utf-8"),
+                headers={**_github_headers(token), "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            if "errors" in data:
+                raise RuntimeError(f"GraphQL errors: {data['errors']}")
+            repo_node = (data.get("data") or {}).get("repository") or {}
+            rec_node = repo_node.get("rec") or {}
+            records = []
+            rec_text = rec_node.get("text")
+            if rec_text:
+                body = json.loads(rec_text)
+                recs = body.get("records", []) if isinstance(body, dict) else []
+                records = recs if isinstance(recs, list) else []
+            sha = rec_node.get("oid")
+            dn_table = {}
+            dn_text = (repo_node.get("dn") or {}).get("text")
+            if dn_text:
+                parsed = json.loads(dn_text)
+                if isinstance(parsed, dict):
+                    dn_table = {str(k): str(v) for k, v in parsed.items()}
+            return records, sha, dn_table
+        except (urllib.error.URLError, json.JSONDecodeError, RuntimeError, KeyError,
+                TimeoutError, http.client.IncompleteRead):
+            pass
+    # Fallback: two plain reads (preserves today's behavior on GraphQL failure / no SSH).
+    records, sha = _load_jc_records(cfg, token)
+    return records, sha, _fetch_display_names(cfg, token)
 
 
 def _save_jc_records(cfg: RepoConfig, token: str | None, user: str, records: list[dict], sha: str | None, message: str) -> None:
@@ -1811,7 +1886,7 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
     token = _get_token()
     papers = _list_papers_via_api(repo_cfg, token)
 
-    dn_table = _fetch_display_names(repo_cfg, token)
+    dn_table = {**_fetch_display_names(repo_cfg, token), **cfg.display_name_overrides}
     rows = _topvoted_rows_from_papers(papers, dn_table)
     topn = rows[: args.N]
     if not topn:
@@ -2292,6 +2367,7 @@ def cmd_vote_remove(args: SimpleNamespace) -> int:
 
 def cmd_select(args: SimpleNamespace) -> int:
     cfg = _resolve_repo_config(args)
+    app_cfg = _load_config()
     token = _get_token()
     user = _resolve_user(token)
     paper_id = _normalize_paper_id(args.paper_id)
@@ -2300,7 +2376,8 @@ def cmd_select(args: SimpleNamespace) -> int:
     # The journal-club records are the source of truth for "already selected".
     # Checking them first also avoids the _load_vote_paper clone-fallback hang
     # when the vote file was already deleted by a prior select.
-    records, record_sha = _load_jc_records(cfg, token)
+    records, record_sha, dn_table = _load_jc_records_and_display_names(cfg, token)
+    name_table = {**dn_table, **app_cfg.display_name_overrides}
     existing = next(
         (r for r in records if _strip_arxiv_version(str(r.get("arxiv_id", ""))) == canonical_id),
         None,
@@ -2309,7 +2386,7 @@ def cmd_select(args: SimpleNamespace) -> int:
         typer.echo(
             typer.style(
                 f"Already selected: {canonical_id} ({existing.get('week', '?')}) "
-                f"by {existing.get('selected_by', '?')} on {existing.get('selected_at', '?')}. "
+                f"by {_resolve_display_name(str(existing.get('selected_by', '?')), name_table)} on {existing.get('selected_at', '?')}. "
                 f"Use 'cuhkvoting select remove {canonical_id}' to undo.",
                 fg=typer.colors.YELLOW,
             ),
@@ -2356,7 +2433,7 @@ def cmd_select(args: SimpleNamespace) -> int:
         # If loaded via git fallback without sha, still delete through git path.
         _delete_vote_paper(cfg, None, user, save_path, None, f"select-delete-vote: {user} -> {canonical_id}")
 
-    print(f"Selected for presentation: {canonical_id} ({week_tag}) by {user}")
+    print(f"Selected for presentation: {canonical_id} ({week_tag}) by {_resolve_display_name(user, name_table)}")
     return 0
 
 
@@ -2399,18 +2476,20 @@ def cmd_admin_trash(args: SimpleNamespace) -> int:
 
 def cmd_record(args: SimpleNamespace) -> int:
     cfg = _resolve_repo_config(args)
+    app_cfg = _load_config()
     token = _get_token()
-    records, _sha = _load_jc_records(cfg, token)
+    records, _sha, dn_table = _load_jc_records_and_display_names(cfg, token)
     if not records:
         print("No journal club records yet.")
         return 0
+    name_table = {**dn_table, **app_cfg.display_name_overrides}
     rows = sorted(records, key=lambda r: str(r.get("selected_at", "")), reverse=True)
     for i, r in enumerate(rows, 1):
         week = str(r.get("week", "?"))
         arxiv_id = str(r.get("arxiv_id", "?"))
         title = str(r.get("title", "(no title)"))
         hist = int(r.get("historical_vote", 0))
-        selected_by = str(r.get("selected_by", "?"))
+        selected_by = _resolve_display_name(str(r.get("selected_by", "?")), name_table)
         print(f"{i:>2}. {week}  {_format_clickable_id(arxiv_id)}  votes:{hist}  by:{selected_by}  {title}")
     return 0
 
@@ -2749,6 +2828,11 @@ def init_config(
         'confirm_by_number = true\n'
         '# Human-readable name stored in the shared display_names.json table. GitHub username is used if empty.\n'
         'display_name = ""\n'
+        '\n'
+        '# Local-only overrides for how OTHER people\'s names show on YOUR screen (never uploaded).\n'
+        '# Keys are GitHub usernames; values are what to display instead.\n'
+        '# [vote.display_names]\n'
+        '# octocat = "Mona Lisa"\n'
         '\n'
         '[highlights]\n'
         '# Authors to highlight. Format: "Surname, Firstname" (case-insensitive).\n'
