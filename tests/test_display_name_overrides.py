@@ -110,10 +110,37 @@ class BundledFetchTests(unittest.TestCase):
         with mock.patch("cuhkvoting.cli.urllib.request.urlopen", side_effect=urllib.error.URLError("boom")):
             with mock.patch("cuhkvoting.cli._load_jc_records", return_value=([{"x": 1}], "sha9")) as lj:
                 with mock.patch("cuhkvoting.cli._fetch_display_names", return_value={"u": "U"}) as fd:
-                    records, sha, table = cli._load_jc_records_and_display_names(self._cfg(), token="x")
+                    with mock.patch("cuhkvoting.cli._warn_if_client_outdated") as warn:
+                        records, sha, table = cli._load_jc_records_and_display_names(self._cfg(), token="x")
         self.assertEqual((records, sha, table), ([{"x": 1}], "sha9", {"u": "U"}))
         lj.assert_called_once()
         fd.assert_called_once()
+        # The degraded two-read path must not attempt a (non-free) meta check.
+        warn.assert_not_called()
+
+    def test_meta_warn_rides_bundled_read_without_changing_signature(self) -> None:
+        records_payload = {"records": [{"arxiv_id": "2601.1"}]}
+        gql = {
+            "data": {
+                "repository": {
+                    "rec": {"text": json.dumps(records_payload), "oid": "abc123"},
+                    "dn": {"text": json.dumps({})},
+                    "meta": {"text": json.dumps({"schema": 1, "client": {"latest_version": "9.9.9"}})},
+                }
+            }
+        }
+        resp = mock.MagicMock()
+        resp.read.return_value = json.dumps(gql).encode("utf-8")
+        cm = mock.MagicMock()
+        cm.__enter__.return_value = resp
+        with mock.patch("cuhkvoting.cli.urllib.request.urlopen", return_value=cm):
+            with mock.patch("cuhkvoting.cli._warn_if_client_outdated") as warn:
+                result = cli._load_jc_records_and_display_names(self._cfg(), token="x")
+        # Signature is unchanged: still a 3-tuple, and the meta node drove the warn.
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result[0], records_payload["records"])
+        warn.assert_called_once()
+        self.assertEqual(warn.call_args[0][0], {"schema": 1, "client": {"latest_version": "9.9.9"}})
 
 
 if __name__ == "__main__":

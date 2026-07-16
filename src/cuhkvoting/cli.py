@@ -70,6 +70,9 @@ CACHE_DIR = _user_cache_dir()
 LAST_LIST_PATH = CACHE_DIR / "last_list.json"
 DISPLAY_NAME_CACHE = CACHE_DIR / "display_name.txt"
 DISPLAY_NAMES_PATH = "display_names.json"
+META_PATH = "meta.json"
+META_SCHEMA_VERSION = 1
+UPGRADE_COMMAND = "uv tool install --upgrade git+ssh://git@github.com/gravityhub-org/cuhkvoting.git"
 CONFIG_PATH = _user_config_dir() / "config.toml"
 DEFAULT_CATEGORIES = ["gr-qc", "astro-ph.*"]
 DEFAULT_TODAY_MAX_AGE = 60
@@ -540,16 +543,21 @@ def _load_jc_records_and_display_names(
                 parsed = json.loads(dn_path.read_text(encoding="utf-8"))
                 if isinstance(parsed, dict):
                     dn_table = {str(k): str(v) for k, v in parsed.items()}
+            meta_path = Path(clone_dir) / META_PATH
+            _warn_if_client_outdated(
+                _parse_meta_text(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+            )
             return records, None, dn_table
         finally:
             shutil.rmtree(clone_dir, ignore_errors=True)
     if token:
         try:
-            query = '{ repository(owner: "%s", name: "%s") { %s %s } }' % (
+            query = '{ repository(owner: "%s", name: "%s") { %s %s %s } }' % (
                 cfg.owner,
                 cfg.repo,
                 f'rec: object(expression: "{cfg.branch}:{JC_RECORD_PATH}") {{ ... on Blob {{ text oid }} }}',
                 f'dn: object(expression: "{cfg.branch}:{DISPLAY_NAMES_PATH}") {{ ... on Blob {{ text }} }}',
+                f'meta: object(expression: "{cfg.branch}:{META_PATH}") {{ ... on Blob {{ text }} }}',
             )
             req = urllib.request.Request(
                 "https://api.github.com/graphql",
@@ -576,6 +584,7 @@ def _load_jc_records_and_display_names(
                 parsed = json.loads(dn_text)
                 if isinstance(parsed, dict):
                     dn_table = {str(k): str(v) for k, v in parsed.items()}
+            _warn_if_client_outdated(_parse_meta_text((repo_node.get("meta") or {}).get("text")))
             return records, sha, dn_table
         except (urllib.error.URLError, json.JSONDecodeError, RuntimeError, KeyError,
                 TimeoutError, http.client.IncompleteRead):
@@ -599,6 +608,25 @@ def _save_jc_records(cfg: RepoConfig, token: str | None, user: str, records: lis
         p.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         _ensure_commit_identity(clone_dir, user)
         _run_git(["add", JC_RECORD_PATH], cwd=clone_dir)
+        _run_git(["commit", "-m", message], cwd=clone_dir)
+        _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
+    finally:
+        shutil.rmtree(clone_dir, ignore_errors=True)
+
+
+def _save_meta(cfg: RepoConfig, token: str | None, user: str, body: dict, sha: str | None, message: str) -> None:
+    """Write root meta.json, branching token (Contents API) vs SSH clone, like _save_jc_records."""
+    if token:
+        _save_json_via_api(cfg, META_PATH, body, sha, token, message)
+        return
+    if not _has_github_ssh_access():
+        raise SystemExit(f"Writing meta needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure SSH key.\n\n{_ssh_setup_instructions()}")
+    clone_dir = _with_repo_checkout(cfg)
+    try:
+        p = Path(clone_dir) / META_PATH
+        p.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        _ensure_commit_identity(clone_dir, user)
+        _run_git(["add", META_PATH], cwd=clone_dir)
         _run_git(["commit", "-m", message], cwd=clone_dir)
         _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
     finally:
@@ -1708,6 +1736,148 @@ def _update_dn_table(dn_table: dict, user: str, display_name: str) -> bool:
     return False
 
 
+# --- Client-version high-water-mark (root meta.json) --------------------------
+# A passive, backward-compatible "your client is out of date" notice. The records
+# repo carries a root meta.json holding the highest client version seen in the
+# wild; clients read it only where a fetch is already happening (piggybacking a
+# GraphQL query or an existing clone), warn when behind, and raise the value when
+# ahead. Every helper below is total: it never raises, so a missing/garbled file
+# or a network hiccup can never turn a vote into a failure. None means "no usable
+# information" everywhere — the single fail-open value.
+
+_RELEASE_RE = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})$")
+
+
+def _parse_release_version(value: object) -> tuple[int, int, int] | None:
+    """Strict ``X.Y.Z`` -> (major, minor, patch); None for anything else.
+
+    Deliberately stricter than PEP 440: ``packaging`` is unavailable, and a bare
+    triple is exactly the set of versions this project releases. Any suffix
+    (``rc``/``.dev``/``+local``), the ``"dev"`` not-installed fallback, and
+    malformed input all yield None, which silences both warning and publishing.
+    """
+    if not isinstance(value, str):
+        return None
+    m = _RELEASE_RE.match(value.strip())
+    return (int(m[1]), int(m[2]), int(m[3])) if m else None
+
+
+def _install_provenance() -> str | None:
+    """"index"/"vcs"/"url" when this install's version is obtainable by others; else None.
+
+    PEP 610: pip/uv write ``direct_url.json`` for direct installs only. A
+    ``dir_info`` key marks a local-directory install (``pip install -e .`` or
+    ``pip install .``), where the version in pyproject is a plan for a future
+    release rather than a fact — such clients must never raise the shared
+    high-water-mark. This project ships from git (README), so ``vcs_info`` is the
+    normal publishing case; absent means a package index.
+    """
+    try:
+        raw = importlib.metadata.distribution("cuhkvoting").read_text("direct_url.json")
+    except Exception:
+        return None
+    if raw is None:
+        return "index"
+    try:
+        info = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(info, dict) or "dir_info" in info:
+        return None
+    return "vcs" if "vcs_info" in info else "url"
+
+
+def _parse_meta_text(text: str | None) -> dict | None:
+    """Parsed meta.json. ``{}`` = absent (safe to seed). None = present-but-unusable.
+
+    The None state is deliberate: seeding over a file we failed to parse would
+    destroy whatever a future client wrote. Only ``admin set-version`` may
+    overwrite that state.
+    """
+    if text is None:
+        return {}
+    try:
+        doc = json.loads(text)
+    except Exception:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _warn_if_client_outdated(meta_doc: dict | None) -> None:
+    """Passive note when a newer client version is recorded. Never raises/blocks."""
+    local = _parse_release_version(_PKG_VERSION)
+    if local is None:
+        return
+    client = meta_doc.get("client") if isinstance(meta_doc, dict) else None
+    recorded = _parse_release_version(client.get("latest_version")) if isinstance(client, dict) else None
+    if recorded is None or recorded <= local:
+        return
+    # Render from the parsed ints, never the raw string: meta.json is world-writable
+    # and echoing its bytes to a TTY would allow terminal escape injection.
+    typer.echo(
+        typer.style(
+            f"Note: cuhkvoting {recorded[0]}.{recorded[1]}.{recorded[2]} is available "
+            f"(you have {_PKG_VERSION}).\n"
+            f"      Upgrade: {UPGRADE_COMMAND}",
+            fg=typer.colors.YELLOW,
+        ),
+        err=True,
+    )
+
+
+def _stamp_client_node(node: dict, version: str, user: str, source: str) -> None:
+    """Set the client high-water-mark fields in place, preserving any unknown sub-keys.
+
+    Single source of truth for the ``client`` block's schema, shared by the vote-path
+    ratchet and the ``admin set-version`` repair command.
+    """
+    node["latest_version"] = version
+    node["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    node["updated_by"] = user
+    node["source"] = source
+
+
+def _bump_meta_client_version(meta_doc: dict | None, user: str) -> dict | None:
+    """Mutated copy of ``meta_doc`` raising the client high-water-mark, or None = do not write.
+
+    Returns None (no write) unless the local version is a clean release, strictly
+    higher than the recorded one, and this install is one others can obtain (see
+    ``_install_provenance``). Mutates rather than replaces: keys this function does
+    not own survive a round-trip, so meta.json can host unrelated namespaces later.
+    """
+    if not isinstance(meta_doc, dict):
+        return None
+    schema = meta_doc.get("schema", META_SCHEMA_VERSION)
+    if not isinstance(schema, int) or schema > META_SCHEMA_VERSION:
+        return None
+    local = _parse_release_version(_PKG_VERSION)
+    if local is None:
+        return None
+    source = _install_provenance()
+    if source is None:
+        return None
+    client = meta_doc.get("client")
+    recorded = _parse_release_version(client.get("latest_version")) if isinstance(client, dict) else None
+    if recorded is not None and local <= recorded:
+        return None
+
+    new_doc = dict(meta_doc)  # shallow: unknown top-level keys preserved by reference
+    node = dict(client) if isinstance(client, dict) else {}  # unknown client sub-keys preserved
+    _stamp_client_node(node, _PKG_VERSION.strip(), user, source)
+    new_doc["client"] = node
+    new_doc["schema"] = META_SCHEMA_VERSION
+    return new_doc
+
+
+def _sanitize_for_terminal(text: str) -> str:
+    """Drop control characters (incl. ANSI escapes) from untrusted text before echoing.
+
+    meta.json is world-writable, so its free-text fields must never reach a TTY raw.
+    isprintable() is already False for ESC and every other control character.
+    """
+    return "".join(ch for ch in text if ch == "\t" or ch.isprintable())
+
+
 def _print_entry_list(
     entries: list[dict],
     cfg: Config,
@@ -2079,12 +2249,26 @@ def _batch_vote_papers_ssh(
         if dn_changed:
             dn_file.write_text(json.dumps(dn_table, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+        # Client-version high-water-mark, read for free from the checkout. Warn
+        # (behind) or self-update (ahead) — never both. The write only rides the
+        # commit that new votes / display-name changes are already making; it never
+        # forces one on its own (the gate stays `new_votes or dn_changed`).
+        meta_file = Path(clone_dir) / META_PATH
+        meta_doc = _parse_meta_text(meta_file.read_text(encoding="utf-8")) if meta_file.exists() else {}
+        _warn_if_client_outdated(meta_doc)
+
         if new_votes or dn_changed:
+            new_meta = _bump_meta_client_version(meta_doc, user)
+            meta_changed = new_meta is not None
+            if meta_changed:
+                meta_file.write_text(json.dumps(new_meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             _ensure_commit_identity(clone_dir, user)
             if new_votes:
                 _run_git(["add", "papers/"], cwd=clone_dir)
             if dn_changed:
                 _run_git(["add", DISPLAY_NAMES_PATH], cwd=clone_dir)
+            if meta_changed:
+                _run_git(["add", META_PATH], cwd=clone_dir)
             if new_votes:
                 ids_str = ", ".join(new_votes[:3]) + ("…" if len(new_votes) > 3 else "")
                 msg = f"vote: {user} -> [{ids_str}] ({len(new_votes)} papers)"
@@ -2180,6 +2364,9 @@ def _batch_vote_papers_api(
     aliases.append(
         f'dn: object(expression: "{cfg.branch}:{DISPLAY_NAMES_PATH}") {{ ... on Blob {{ text }} }}'
     )
+    aliases.append(
+        f'meta: object(expression: "{cfg.branch}:{META_PATH}") {{ ... on Blob {{ text }} }}'
+    )
 
     query = '{ repository(owner: "%s", name: "%s") { %s } }' % (
         cfg.owner, cfg.repo, " ".join(aliases)
@@ -2235,8 +2422,19 @@ def _batch_vote_papers_api(
     if dn_changed:
         updates.append((DISPLAY_NAMES_PATH, "__dn__", dn_table))
 
+    # Client-version high-water-mark, read for free from the same query. On this
+    # invocation we either warn (behind) or self-update (ahead) — never both.
+    meta_doc = _parse_meta_text((repo_node.get("meta") or {}).get("text"))
+    _warn_if_client_outdated(meta_doc)
+
     if not updates:
         return voted
+
+    # Ride the existing commit only — appended after the empty-updates guard so a
+    # bump can never manufacture a standalone commit.
+    new_meta = _bump_meta_client_version(meta_doc, user)
+    if new_meta is not None:
+        updates.append((META_PATH, "__meta__", new_meta))
 
     # Step 3: POST blobs concurrently (one per updated file)
     def _post_blob(path_paper: tuple[str, str, dict]) -> tuple[str, str]:
@@ -2255,7 +2453,7 @@ def _batch_vote_papers_api(
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(updates))) as ex:
         blob_results = list(ex.map(_post_blob, updates))
 
-    new_ids = [pid for _, pid, _ in updates if pid != "__dn__"]
+    new_ids = [pid for _, pid, _ in updates if pid not in ("__dn__", "__meta__")]
     ids_str = ", ".join(new_ids[:3]) + ("…" if len(new_ids) > 3 else "")
     commit_msg = (
         f"vote: {user} -> [{ids_str}] ({len(new_ids)} papers)"
@@ -2471,6 +2669,75 @@ def cmd_admin_trash(args: SimpleNamespace) -> int:
         raise SystemExit(f"No vote record found for '{paper_id}'.")
     _delete_vote_paper(cfg, token, user, save_path, sha, f"admin-trash: {user} -> {paper_id}")
     print(f"Trashed and deleted vote record: {paper_id}")
+    return 0
+
+
+def cmd_admin_meta(args: SimpleNamespace) -> int:
+    """Show the recorded client-version high-water-mark and its provenance."""
+    cfg = _resolve_repo_config(args)
+    token = _get_token()
+    data, _sha = _load_json_via_api(cfg, META_PATH, token)
+    client = data.get("client") if isinstance(data, dict) else None
+    if not isinstance(client, dict) or not client.get("latest_version"):
+        print("No client version recorded in meta.json yet.")
+        return 0
+    raw_version = str(client.get("latest_version", ""))
+    version = _parse_release_version(raw_version)
+    # Show a bad value (sanitized) rather than hiding it — this is the tool an admin
+    # uses to find and fix a poisoned entry.
+    version_str = (
+        f"{version[0]}.{version[1]}.{version[2]}" if version
+        else f"{_sanitize_for_terminal(raw_version)} (unparseable)"
+    )
+    # Render provenance defensively: meta.json is world-writable, so strip control
+    # characters from free-text fields before echoing them to a terminal.
+    by = _sanitize_for_terminal(str(client.get("updated_by", "?")))
+    at = _sanitize_for_terminal(str(client.get("updated_at", "?")))
+    source = _sanitize_for_terminal(str(client.get("source", "?")))
+    print(f"Recorded client version: {version_str}")
+    print(f"  updated by: {by}")
+    print(f"  updated at: {at}")
+    print(f"  source:     {source}")
+    return 0
+
+
+def cmd_admin_set_version(args: SimpleNamespace) -> int:
+    """Unconditionally set or clear the client-version high-water-mark (repair/reset)."""
+    cfg = _resolve_repo_config(args)
+    token = _get_token()
+    user = _resolve_user(token)
+    clear = bool(getattr(args, "clear", False))
+    new_version = getattr(args, "version", None)
+
+    if not clear:
+        if not new_version:
+            raise SystemExit("Provide a version (X.Y.Z) or use --clear.")
+        if _parse_release_version(new_version) is None:
+            raise SystemExit(f"Not a valid release version: '{new_version}'. Expected X.Y.Z.")
+
+    data, sha = _load_json_via_api(cfg, META_PATH, token)
+    doc = dict(data) if isinstance(data, dict) else {}
+    doc.setdefault("schema", META_SCHEMA_VERSION)  # seed a fresh file; never downgrade a future envelope
+
+    if clear:
+        if "client" not in doc:
+            print("meta.json has no client version to clear.")
+            return 0
+        del doc["client"]
+        message = f"meta: clear client version ({user})"
+    else:
+        node = dict(doc.get("client")) if isinstance(doc.get("client"), dict) else {}
+        _stamp_client_node(node, new_version.strip(), user, "admin")
+        doc["client"] = node
+        message = f"meta: set client version {new_version.strip()} ({user})"
+
+    if getattr(args, "dry_run", False):
+        print("[dry-run] would write meta.json:")
+        print(json.dumps(doc, indent=2, sort_keys=True))
+        return 0
+
+    _save_meta(cfg, token, user, doc, sha, message)
+    print("Cleared client version in meta.json." if clear else f"Set client version to {new_version.strip()} in meta.json.")
     return 0
 
 
@@ -3065,6 +3332,44 @@ def admin_sanitize(
         f"sanitize: {changed} paper record(s)",
     )
     typer.echo(f"Sanitized {changed} record(s).")
+
+
+@admin_app.command("meta")
+def admin_meta(
+    repo: str | None = typer.Option(
+        None, "--repo",
+        help=f"GitHub repo owner/name. Only {DEFAULT_REPO} is accepted.",
+    ),
+    branch: str = typer.Option(
+        os.getenv("CUHKVOTING_BRANCH", "main"),
+        "--branch",
+        help="Git branch to read/write.",
+    ),
+) -> None:
+    """Show the recorded client-version high-water-mark and its provenance."""
+    _run_cmd(cmd_admin_meta, repo=repo, branch=branch)
+
+
+@admin_app.command("set-version")
+def admin_set_version(
+    version: str | None = typer.Argument(
+        None,
+        help="Release version X.Y.Z to record. Omit with --clear.",
+    ),
+    clear: bool = typer.Option(False, "--clear", help="Remove the client version entry."),
+    repo: str | None = typer.Option(
+        None, "--repo",
+        help=f"GitHub repo owner/name. Only {DEFAULT_REPO} is accepted.",
+    ),
+    branch: str = typer.Option(
+        os.getenv("CUHKVOTING_BRANCH", "main"),
+        "--branch",
+        help="Git branch to read/write.",
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without writing."),
+) -> None:
+    """Unconditionally set or clear the client-version high-water-mark (repair/reset)."""
+    _run_cmd(cmd_admin_set_version, version=version, clear=clear, repo=repo, branch=branch, dry_run=dry_run)
 
 
 app.add_typer(admin_app, name="admin")
