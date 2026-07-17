@@ -553,13 +553,13 @@ def sync(
         voted_ids: list[str] = []
         if _has_github_ssh_access():
             try:
-                voted_ids = _batch_vote_papers_ssh(repo_cfg, cuhk_user, papers_meta, display_name)
+                voted_ids = _batch_vote_papers_ssh(repo_cfg, cuhk_user, papers_meta, display_name).voted
             except Exception as exc:
                 typer.echo(f"Batch SSH vote failed: {exc}", err=True)
                 ok = False
         elif gh_token and len(to_add_cuhk) > 1:
             try:
-                voted_ids = _batch_vote_papers_api(repo_cfg, gh_token, cuhk_user, papers_meta, display_name)
+                voted_ids = _batch_vote_papers_api(repo_cfg, gh_token, cuhk_user, papers_meta, display_name).voted
             except Exception as exc:
                 typer.echo(f"Batch API vote failed: {exc}", err=True)
                 ok = False

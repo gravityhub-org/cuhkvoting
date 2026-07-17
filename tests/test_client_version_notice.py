@@ -125,6 +125,29 @@ class WarnIfClientOutdatedTests(unittest.TestCase):
         self._warn({"client": {"latest_version": "0.9.0\x1b[2J"}}).assert_not_called()
 
 
+class ClientOutdatedMessageTests(unittest.TestCase):
+    """The message builder extracted for the interactive mode's sticky warning."""
+
+    def _msg(self, meta_doc, pkg="0.2.2"):
+        with mock.patch("cuhkvoting.cli._PKG_VERSION", pkg):
+            return cli._client_outdated_message(meta_doc)
+
+    def test_message_when_behind(self) -> None:
+        msg = self._msg({"client": {"latest_version": "0.9.0"}})
+        self.assertIn("0.9.0", msg)
+        self.assertIn("0.2.2", msg)
+        self.assertIn(cli.UPGRADE_COMMAND, msg)
+
+    def test_none_when_equal_ahead_or_dev(self) -> None:
+        self.assertIsNone(self._msg({"client": {"latest_version": "0.2.2"}}))
+        self.assertIsNone(self._msg({"client": {"latest_version": "0.1.0"}}))
+        self.assertIsNone(self._msg({"client": {"latest_version": "9.9.9"}}, pkg="dev"))
+
+    def test_rendered_from_parsed_ints_not_raw_bytes(self) -> None:
+        # Escape-carrying versions fail the strict parse; nothing reaches the message.
+        self.assertIsNone(self._msg({"client": {"latest_version": "0.9.0\x1b[2J"}}))
+
+
 class BumpMetaClientVersionTests(unittest.TestCase):
     def _bump(self, meta_doc, user="octocat", pkg="0.2.2", provenance="vcs"):
         with mock.patch("cuhkvoting.cli._PKG_VERSION", pkg):
@@ -197,7 +220,7 @@ class BatchVoteApiMetaTests(unittest.TestCase):
                 mock.patch("cuhkvoting.cli._git_batch_commit", side_effect=fake_commit) as gbc, \
                 mock.patch("cuhkvoting.cli._install_provenance", return_value=provenance), \
                 mock.patch("cuhkvoting.cli._PKG_VERSION", pkg):
-            voted = cli._batch_vote_papers_api(self._cfg(), "tok", user, papers)
+            voted = cli._batch_vote_papers_api(self._cfg(), "tok", user, papers).voted
         return voted, captured, up, hjr, gbc
 
     def _paper_blob(self, votes):

@@ -13,6 +13,8 @@ dependencies = [
 
 [project.optional-dependencies]
 benty = ["beautifulsoup4"]
+interactive = ["prompt_toolkit"]
+full = ["beautifulsoup4", "prompt_toolkit"]
 
 [project.scripts]
 cuhkvoting = "cuhkvoting:main"

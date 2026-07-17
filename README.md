@@ -31,10 +31,22 @@ uv tool install --upgrade git+https://github.com/gravityhub-org/cuhkvoting.git &
 
 Or with pip: replace `uv tool install` with `pip install` — the rest of the command is identical.
 
-Optional Benty-Fields addon (adds `cuhkvoting-benty`):
+Optional Benty-Fields addon (adds `cuhkvoting-benty`; see [docs/benty.md](docs/benty.md)):
 
 ```bash
 uv tool install --upgrade "git+https://github.com/gravityhub-org/cuhkvoting.git[benty]"
+```
+
+Optional interactive TUI (enables `cuhkvoting interactive`; see [docs/interactive.md](docs/interactive.md)):
+
+```bash
+uv tool install --upgrade "git+https://github.com/gravityhub-org/cuhkvoting.git[interactive]"
+```
+
+Or everything at once with the `full` extra:
+
+```bash
+uv tool install --upgrade "git+https://github.com/gravityhub-org/cuhkvoting.git[full]"
 ```
 
 
@@ -112,6 +124,10 @@ cuhkvoting show 2026-03-12 2026-03-15           # union: 12th AND 15th only (not
 cuhkvoting show 3-12..3-15 "gravitational wave" # range + keyword filter
 cuhkvoting show 2026-03-12 --abstract -1        # with full abstracts
 cuhkvoting show 2026-03-12 --category hep-th    # override arXiv category
+
+# Interactive full-screen voting session (needs the `interactive` extra)
+cuhkvoting interactive                          # browse today's papers, vim-style
+cuhkvoting interactive lastweek                 # any listing command works: last <#>, topvoted, search, show <date>
 
 # Journal club records
 cuhkvoting record
@@ -223,6 +239,12 @@ authors = []            # ["Surname, Firstname"]
 keywords = []           # regular expressions
 keyword_count = -1      # -1 = all, 0 = glyph, N = first N
 glyph = "★"
+
+[interactive]
+# Interactive-mode settings (see docs/interactive.md).
+theme = "default"       # default, onedark, gruvbox, catppuccin-mocha, solarized-dark, nord
+key_hints = true        # show key hints on the idle input line
+follow = false          # start with zi follow mode (selected abstract always open)
 ```
 
 If the file is absent, all settings fall back to the defaults shown above.
@@ -275,32 +297,20 @@ If you prefer manual setup:
 eval "$(_CUHKVOTING_COMPLETE=bash_source cuhkvoting)"
 ```
 
+### Interactive mode (optional addon)
+
+`cuhkvoting interactive` opens the paper list in a vim-style, full-screen TUI:
+move with `j`/`k`, fold abstracts with `za`, stage papers with `v`, then cast
+all votes at once with `:w` — with search, color themes, and configurable keys.
+It needs the `interactive` extra (see [Install](#install)). Full manual:
+[docs/interactive.md](docs/interactive.md).
+
 ### Benty-Fields sync (optional addon)
 
-`cuhkvoting-benty` performs a two-way sync between your Benty-Fields journal-club page and cuhkvoting records:
-
-- **Benty-Fields → cuhkvoting**: papers you voted for on Benty-Fields are voted for in cuhkvoting.
-- **cuhkvoting → Benty-Fields**: papers you voted for in cuhkvoting are voted for on Benty-Fields.
-- Votes explicitly removed in either system are removed in the other. Natural 6-month expiry in cuhkvoting does not propagate.
-
-```bash
-cuhkvoting-benty                     # fetch + vote for new papers
-cuhkvoting-benty --dry-run           # preview without voting
-cuhkvoting-benty --no-cache-cookies  # skip cookie persistence
-```
-
-Credentials are read from your git credential helper (e.g. libsecret / GNOME keyring) using `host=benty-fields.com`. If no stored credential is found, you are prompted interactively.
-
-Already-synced papers are tracked in `benty_synced.json` inside the cache directory (see [Local cache](#local-cache)) so they are not voted on twice.
-
-Session cookies are cached by default to avoid re-logging-in on every run. Disable this per-run with `--no-cache-cookies`, or permanently via config:
-
-```toml
-[benty]
-cache_cookies = false
-```
-
-If a paper on the Benty-Fields page has no arXiv link, a warning is printed and the paper is skipped.
+`cuhkvoting-benty` performs a two-way sync between your Benty-Fields
+journal-club page and cuhkvoting: votes cast on either side are propagated to
+the other, and explicit removals sync too. It needs the `benty` extra (see
+[Install](#install)). Full manual: [docs/benty.md](docs/benty.md).
 
 ### Data format
 

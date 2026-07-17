@@ -1803,26 +1803,29 @@ def _parse_meta_text(text: str | None) -> dict | None:
     return doc if isinstance(doc, dict) else None
 
 
-def _warn_if_client_outdated(meta_doc: dict | None) -> None:
-    """Passive note when a newer client version is recorded. Never raises/blocks."""
+def _client_outdated_message(meta_doc: dict | None) -> str | None:
+    """Note text when a newer client version is recorded, else None. Never raises."""
     local = _parse_release_version(_PKG_VERSION)
     if local is None:
-        return
+        return None
     client = meta_doc.get("client") if isinstance(meta_doc, dict) else None
     recorded = _parse_release_version(client.get("latest_version")) if isinstance(client, dict) else None
     if recorded is None or recorded <= local:
-        return
+        return None
     # Render from the parsed ints, never the raw string: meta.json is world-writable
     # and echoing its bytes to a TTY would allow terminal escape injection.
-    typer.echo(
-        typer.style(
-            f"Note: cuhkvoting {recorded[0]}.{recorded[1]}.{recorded[2]} is available "
-            f"(you have {_PKG_VERSION}).\n"
-            f"      Upgrade: {UPGRADE_COMMAND}",
-            fg=typer.colors.YELLOW,
-        ),
-        err=True,
+    return (
+        f"Note: cuhkvoting {recorded[0]}.{recorded[1]}.{recorded[2]} is available "
+        f"(you have {_PKG_VERSION}).\n"
+        f"      Upgrade: {UPGRADE_COMMAND}"
     )
+
+
+def _warn_if_client_outdated(meta_doc: dict | None) -> None:
+    """Passive note when a newer client version is recorded. Never raises/blocks."""
+    msg = _client_outdated_message(meta_doc)
+    if msg is not None:
+        typer.echo(typer.style(msg, fg=typer.colors.YELLOW), err=True)
 
 
 def _stamp_client_node(node: dict, version: str, user: str, source: str) -> None:
@@ -1901,39 +1904,56 @@ def _print_entry_list(
             print(abstract)
 
 
-def cmd_today(args: SimpleNamespace) -> int:
-    cfg = _load_config()
+@dataclass
+class ListData:
+    """A browse pipeline's result: the list to display, decoupled from printing."""
+    entries: list[dict]           # keyword-filtered and limit-truncated
+    notes: list[str]              # advisory notes; the CLI styles them yellow
+    header: str | None = None     # header line printed above a non-empty list
+    empty_msg: str | None = None  # set iff entries is empty
+
+
+def _today_list(args: SimpleNamespace, cfg: Config) -> ListData:
     categories = _parse_categories(getattr(args, "category", None), cfg.categories)
     max_age_minutes = getattr(args, "max_age", None)
     max_age_seconds = (int(max_age_minutes) if max_age_minutes is not None else cfg.today_max_age) * 60
-    abstract_lines = getattr(args, "abstract", None)
-    if abstract_lines is None:
-        abstract_lines = cfg.abstract_lines
     entries = _resolve_cache("today", categories, max_age_seconds, _fetch_today_entries)
     if not entries:
-        print("No papers found for today (UTC).")
-        return 0
+        return ListData([], [], empty_msg="No papers found for today (UTC).")
     batch_date = max(
         (e.get("published", "")[:10] for e in entries if e.get("published")),
         default="",
     )
     today_utc = dt.datetime.now(dt.timezone.utc).date().isoformat()
+    notes = []
     if batch_date and batch_date != today_utc:
-        print(typer.style(f"Note: no papers announced today (UTC); showing last available batch ({batch_date}).", fg=typer.colors.YELLOW))
+        notes.append(f"Note: no papers announced today (UTC); showing last available batch ({batch_date}).")
     entries = _filter_entries(entries, getattr(args, "keywords", None))
     if not entries:
-        print("No papers matched keyword filter.")
+        return ListData([], notes, empty_msg="No papers matched keyword filter.")
+    return ListData(entries[: int(args.limit)], notes)
+
+
+def cmd_today(args: SimpleNamespace) -> int:
+    cfg = _load_config()
+    data = _today_list(args, cfg)
+    for note in data.notes:
+        print(typer.style(note, fg=typer.colors.YELLOW))
+    if data.empty_msg:
+        print(data.empty_msg)
         return 0
-    displayed = entries[: int(args.limit)]
-    _save_last_list(displayed)
+    _save_last_list(data.entries)
+    abstract_lines = getattr(args, "abstract", None)
+    if abstract_lines is None:
+        abstract_lines = cfg.abstract_lines
     highlight_kw_count = getattr(args, "highlight_keywords", None)
     if highlight_kw_count is None:
         highlight_kw_count = cfg.highlight_keyword_count
-    _print_entry_list(displayed, cfg, abstract_lines, highlight_kw_count)
+    _print_entry_list(data.entries, cfg, abstract_lines, highlight_kw_count)
     return 0
 
 
-def cmd_search(args: SimpleNamespace) -> int:
+def _search_list(args: SimpleNamespace) -> ListData:
     query_parts = [str(q).strip() for q in (args.query or []) if str(q).strip()]
     if not query_parts:
         raise SystemExit("Search query cannot be empty.")
@@ -1943,18 +1963,23 @@ def cmd_search(args: SimpleNamespace) -> int:
     entries = _inspire_query(query, fetch_limit)
     entries = _filter_entries(entries, query_parts)
     if not entries:
-        print("No matches.")
+        return ListData([], [], empty_msg="No matches.")
+    return ListData(entries[:requested_limit], [])
+
+
+def cmd_search(args: SimpleNamespace) -> int:
+    data = _search_list(args)
+    if data.empty_msg:
+        print(data.empty_msg)
         return 0
-    displayed = entries[:requested_limit]
-    _save_last_list(displayed)
-    for idx, p in enumerate(displayed, 1):
+    _save_last_list(data.entries)
+    for idx, p in enumerate(data.entries, 1):
         pid = str(p.get("id", ""))
         print(f"{idx:>2}. {_format_clickable_id(pid)}  {p['title']}")
     return 0
 
 
-def cmd_lastweek(args: SimpleNamespace) -> int:
-    cfg = _load_config()
+def _lastweek_list(args: SimpleNamespace, cfg: Config) -> ListData:
     categories = _parse_categories(getattr(args, "category", None), cfg.categories)
     max_age_minutes = getattr(args, "max_age", None)
     max_age_seconds = (int(max_age_minutes) if max_age_minutes is not None else cfg.lastweek_max_age) * 60
@@ -1963,30 +1988,32 @@ def cmd_lastweek(args: SimpleNamespace) -> int:
         lambda cats: _fetch_lastdays_entries(7, cats),
     )
     _seed_today_cache(entries, categories)
+    entries = _filter_entries(entries, getattr(args, "keywords", None))
+    if not entries:
+        return ListData([], [], empty_msg="No entries matched in last week (UTC).")
+    return ListData(entries[: int(args.limit)], [])
+
+
+def cmd_lastweek(args: SimpleNamespace) -> int:
+    cfg = _load_config()
+    data = _lastweek_list(args, cfg)
+    if data.empty_msg:
+        print(data.empty_msg)
+        return 0
+    _save_last_list(data.entries)
     abstract_lines = getattr(args, "abstract", None)
     if abstract_lines is None:
         abstract_lines = cfg.abstract_lines
-    entries = _filter_entries(entries, getattr(args, "keywords", None))
-    if not entries:
-        print("No entries matched in last week (UTC).")
-        return 0
-    displayed = entries[: int(args.limit)]
-    _save_last_list(displayed)
     highlight_kw_count = getattr(args, "highlight_keywords", None)
     if highlight_kw_count is None:
         highlight_kw_count = cfg.highlight_keyword_count
-    _print_entry_list(displayed, cfg, abstract_lines, highlight_kw_count)
+    _print_entry_list(data.entries, cfg, abstract_lines, highlight_kw_count)
     return 0
 
 
-def cmd_last(args: SimpleNamespace) -> int:
+def _lastdays_list(args: SimpleNamespace, cfg: Config) -> ListData:
+    """List for `last <#>` with days not in {1, 7} (those delegate to today/lastweek)."""
     days = int(args.days)
-    if days == 1:
-        return cmd_today(args)        # last 1 ≡ today
-    if days == 7:
-        return cmd_lastweek(args)     # last 7 ≡ lastweek
-
-    cfg = _load_config()
     categories = _parse_categories(getattr(args, "category", None), cfg.categories)
     max_age_minutes = getattr(args, "max_age", None)
     max_age_seconds = (int(max_age_minutes) if max_age_minutes is not None else cfg.lastweek_max_age) * 60
@@ -2007,21 +2034,37 @@ def cmd_last(args: SimpleNamespace) -> int:
 
     cutoff = (dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=days)).isoformat()
     entries = [e for e in full if e.get("published", "")[:10] >= cutoff]
+    entries = _filter_entries(entries, getattr(args, "keywords", None))
+    if not entries:
+        return ListData([], [], empty_msg=f"No entries matched in the last {days} days (UTC).")
+    displayed = entries[: int(args.limit)]
+    return ListData(
+        displayed, [],
+        header=f"Papers from the last {days} days (since {cutoff}, UTC) — {len(displayed)} entries:",
+    )
 
+
+def cmd_last(args: SimpleNamespace) -> int:
+    days = int(args.days)
+    if days == 1:
+        return cmd_today(args)        # last 1 ≡ today
+    if days == 7:
+        return cmd_lastweek(args)     # last 7 ≡ lastweek
+
+    cfg = _load_config()
+    data = _lastdays_list(args, cfg)
+    if data.empty_msg:
+        print(data.empty_msg)
+        return 0
+    _save_last_list(data.entries)
+    print(data.header)
     abstract_lines = getattr(args, "abstract", None)
     if abstract_lines is None:
         abstract_lines = cfg.abstract_lines
-    entries = _filter_entries(entries, getattr(args, "keywords", None))
-    if not entries:
-        print(f"No entries matched in the last {days} days (UTC).")
-        return 0
-    displayed = entries[: int(args.limit)]
-    _save_last_list(displayed)
-    print(f"Papers from the last {days} days (since {cutoff}, UTC) — {len(displayed)} entries:")
     highlight_kw_count = getattr(args, "highlight_keywords", None)
     if highlight_kw_count is None:
         highlight_kw_count = cfg.highlight_keyword_count
-    _print_entry_list(displayed, cfg, abstract_lines, highlight_kw_count)
+    _print_entry_list(data.entries, cfg, abstract_lines, highlight_kw_count)
     return 0
 
 
@@ -2050,18 +2093,28 @@ def _topvoted_rows_from_papers(papers: list[dict], dn_table: dict[str, str]) -> 
     return rows
 
 
-def cmd_topvoted(args: SimpleNamespace) -> int:
-    cfg = _load_config()
+def _topvoted_list(args: SimpleNamespace, cfg: Config) -> ListData:
     repo_cfg = _resolve_repo_config(args)
     token = _get_token()
     papers = _list_papers_via_api(repo_cfg, token)
 
     dn_table = {**_fetch_display_names(repo_cfg, token), **cfg.display_name_overrides}
     rows = _topvoted_rows_from_papers(papers, dn_table)
-    topn = rows[: args.N]
-    if not topn:
-        print("No voted papers yet.")
+    n = getattr(args, "N", None)
+    if n is not None:  # None = no cutoff (interactive mode)
+        rows = rows[: int(n)]
+    if not rows:
+        return ListData([], [], empty_msg="No voted papers yet.")
+    return ListData(rows, [])
+
+
+def cmd_topvoted(args: SimpleNamespace) -> int:
+    cfg = _load_config()
+    data = _topvoted_list(args, cfg)
+    if data.empty_msg:
+        print(data.empty_msg)
         return 0
+    topn = data.entries
     _save_last_list(topn)
 
     abstract_lines = getattr(args, "abstract", None)
@@ -2145,8 +2198,7 @@ def cmd_show(args: SimpleNamespace) -> int:
     return 0
 
 
-def cmd_show_date(args: SimpleNamespace) -> int:
-    """Show papers for a specific date or date range, numbered for index-based vote."""
+def _show_date_list(args: SimpleNamespace, cfg: Config) -> ListData:
     date_spans: list[tuple[dt.date, dt.date]] = args.date_spans
     start = min(s for s, _ in date_spans)
     end   = max(e for _, e in date_spans)
@@ -2157,12 +2209,7 @@ def cmd_show_date(args: SimpleNamespace) -> int:
     if start < ARXIV_FOUNDING_DATE:
         raise SystemExit("arXiv was founded on 1991-08-14.")
 
-    cfg = _load_config()
     categories = _parse_categories(getattr(args, "categories", None), cfg.categories)
-    abstract_lines = getattr(args, "abstract", None)
-    if abstract_lines is None:
-        abstract_lines = cfg.abstract_lines
-
     cache_key = f"date-{start.strftime('%Y%m%d')}-{end.strftime('%Y%m%d')}"
     all_entries = _resolve_cache(
         cache_key, categories, 999_999_999,
@@ -2173,23 +2220,41 @@ def cmd_show_date(args: SimpleNamespace) -> int:
     entries = _filter_entries(entries, getattr(args, "keywords", None) or [])
 
     if not entries:
-        print("No papers found for the requested date(s).")
-        return 0
+        return ListData([], [], empty_msg="No papers found for the requested date(s).")
 
     displayed = entries[: int(getattr(args, "limit", 200))]
-    _save_last_list(displayed)
 
-    # Header
     def _span_label(s: dt.date, e: dt.date) -> str:
         return s.isoformat() if s == e else f"{s.isoformat()}..{e.isoformat()}"
     header_label = ", ".join(_span_label(s, e) for s, e in date_spans)
-    print(f"Papers for {header_label} ({len(displayed)} entries):")
+    return ListData(displayed, [], header=f"Papers for {header_label} ({len(displayed)} entries):")
 
+
+def cmd_show_date(args: SimpleNamespace) -> int:
+    """Show papers for a specific date or date range, numbered for index-based vote."""
+    cfg = _load_config()
+    data = _show_date_list(args, cfg)
+    if data.empty_msg:
+        print(data.empty_msg)
+        return 0
+    _save_last_list(data.entries)
+    print(data.header)
+    abstract_lines = getattr(args, "abstract", None)
+    if abstract_lines is None:
+        abstract_lines = cfg.abstract_lines
     highlight_kw_count = getattr(args, "highlight_keywords", None)
     if highlight_kw_count is None:
         highlight_kw_count = cfg.highlight_keyword_count
-    _print_entry_list(displayed, cfg, abstract_lines, highlight_kw_count)
+    _print_entry_list(data.entries, cfg, abstract_lines, highlight_kw_count)
     return 0
+
+
+@dataclass
+class VoteResult:
+    """Outcome of a batch vote."""
+    voted: list[str]           # every processed paper_id, including already-voted
+    new: list[str]             # only the paper_ids whose vote is genuinely new
+    outdated_msg: str | None   # client out-of-date notice; None when current
 
 
 def _batch_vote_papers_ssh(
@@ -2197,17 +2262,17 @@ def _batch_vote_papers_ssh(
     user: str,
     papers: list[dict],
     display_name: str = "",
-) -> list[str]:
+) -> VoteResult:
     """Vote for multiple papers in a single clone/commit/push cycle.
 
     Each dict in `papers` must have: paper_id, title, url.
-    Returns the list of paper_ids for which a vote was recorded.
     """
     if not papers:
-        return []
+        return VoteResult([], [], None)
     clone_dir = _with_repo_checkout(cfg)
     voted: list[str] = []
     new_votes: list[str] = []
+    outdated_msg: str | None = None
     try:
         papers_dir = Path(clone_dir) / "papers"
         papers_dir.mkdir(parents=True, exist_ok=True)
@@ -2255,6 +2320,7 @@ def _batch_vote_papers_ssh(
         # forces one on its own (the gate stays `new_votes or dn_changed`).
         meta_file = Path(clone_dir) / META_PATH
         meta_doc = _parse_meta_text(meta_file.read_text(encoding="utf-8")) if meta_file.exists() else {}
+        outdated_msg = _client_outdated_message(meta_doc)
         _warn_if_client_outdated(meta_doc)
 
         if new_votes or dn_changed:
@@ -2278,7 +2344,7 @@ def _batch_vote_papers_ssh(
             _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
     finally:
         shutil.rmtree(clone_dir, ignore_errors=True)
-    return voted
+    return VoteResult(voted, new_votes, outdated_msg)
 
 
 def _git_batch_commit(
@@ -2336,15 +2402,14 @@ def _batch_vote_papers_api(
     user: str,
     papers: list[dict],
     display_name: str = "",
-) -> list[str]:
+) -> VoteResult:
     """Vote for multiple papers in a single Git commit via the GitHub Git Data API.
 
     Each dict in `papers` must have: paper_id, title, url.
-    Returns the list of paper_ids for which a vote was recorded (including already-voted).
     Reduces API calls from 2N sequential to N parallel blob POSTs + 5 overhead calls.
     """
     if not papers:
-        return []
+        return VoteResult([], [], None)
 
     base_url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}"
     json_headers = {**_github_headers(token), "Content-Type": "application/json"}
@@ -2425,10 +2490,11 @@ def _batch_vote_papers_api(
     # Client-version high-water-mark, read for free from the same query. On this
     # invocation we either warn (behind) or self-update (ahead) — never both.
     meta_doc = _parse_meta_text((repo_node.get("meta") or {}).get("text"))
+    outdated_msg = _client_outdated_message(meta_doc)
     _warn_if_client_outdated(meta_doc)
 
     if not updates:
-        return voted
+        return VoteResult(voted, [], outdated_msg)
 
     # Ride the existing commit only — appended after the empty-updates guard so a
     # bump can never manufacture a standalone commit.
@@ -2465,7 +2531,7 @@ def _batch_vote_papers_api(
         for path, blob_sha in blob_results
     ]
     _git_batch_commit(base_url, json_headers, token, cfg.branch, tree_entries, commit_msg)
-    return voted
+    return VoteResult(voted, new_ids, outdated_msg)
 
 
 def _vote_paper_with_metadata(
@@ -3066,6 +3132,25 @@ def show_command(
         _run_cmd(cmd_show, paper_ids=paper_ids)
 
 
+@app.command("interactive")
+def interactive_command(
+    tokens: list[str] | None = typer.Argument(
+        None,
+        help="today (default) | lastweek | last <#> | topvoted | search <kw...> | show <date> | <date> | <keywords>",
+    ),
+) -> None:
+    """Vim-style full-screen voting session (needs the 'interactive' extra)."""
+    from cuhkvoting import interactive as tui
+    if not tui.PROMPT_TOOLKIT_OK:
+        typer.echo(
+            "Interactive mode needs prompt_toolkit. Install with:\n"
+            '  pip install "cuhkvoting[interactive]"',
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    raise typer.Exit(code=tui.run(tokens or []))
+
+
 @app.command("init-config")
 def init_config(
     force: bool = typer.Option(False, "--force", help="Overwrite existing config file."),
@@ -3110,7 +3195,13 @@ def init_config(
         '# 0 = glyph only, -1 = all matches, N = first N distinct matches.\n'
         'keyword_count = -1\n'
         '# Glyph shown when keyword_count = 0.\n'
-        'glyph = "★"\n',
+        'glyph = "★"\n'
+        '\n'
+        '[interactive]\n'
+        '# Interactive-mode (cuhkvoting interactive) settings; see docs/interactive.md.\n'
+        'theme = "default"       # default, onedark, gruvbox, catppuccin-mocha, solarized-dark, nord\n'
+        'key_hints = true        # show key hints on the idle input line\n'
+        'follow = false          # start with zi follow mode (selected abstract always open)\n',
         encoding="utf-8",
     )
     typer.echo(f"Config written to {CONFIG_PATH}")
