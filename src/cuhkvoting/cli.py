@@ -2100,15 +2100,22 @@ def _today_list(args: SimpleNamespace, cfg: Config) -> ListData:
     return ListData(entries[: int(args.limit)], notes)
 
 
-def cmd_today(args: SimpleNamespace) -> int:
-    cfg = _load_config()
-    data = _today_list(args, cfg)
+def _render_list(data: ListData, cfg: Config, args: SimpleNamespace) -> int:
+    """Render a browse ListData: advisory notes, empty guard, save-for-`vote <#>`,
+    optional header, then the numbered entry list.
+
+    Abstract-line count and keyword-highlight count come from `args` when set, else
+    from config. Empty notes / a None header are no-ops, so this fits every list
+    command (today prints notes; last/show print a header; lastweek does neither).
+    """
     for note in data.notes:
         print(typer.style(note, fg=typer.colors.YELLOW))
     if data.empty_msg:
         print(data.empty_msg)
         return 0
     _save_last_list(data.entries)
+    if data.header:
+        print(data.header)
     abstract_lines = getattr(args, "abstract", None)
     if abstract_lines is None:
         abstract_lines = cfg.abstract_lines
@@ -2117,6 +2124,11 @@ def cmd_today(args: SimpleNamespace) -> int:
         highlight_kw_count = cfg.highlight_keyword_count
     _print_entry_list(data.entries, cfg, abstract_lines, highlight_kw_count)
     return 0
+
+
+def cmd_today(args: SimpleNamespace) -> int:
+    cfg = _load_config()
+    return _render_list(_today_list(args, cfg), cfg, args)
 
 
 def _search_list(args: SimpleNamespace) -> ListData:
@@ -2162,19 +2174,7 @@ def _lastweek_list(args: SimpleNamespace, cfg: Config) -> ListData:
 
 def cmd_lastweek(args: SimpleNamespace) -> int:
     cfg = _load_config()
-    data = _lastweek_list(args, cfg)
-    if data.empty_msg:
-        print(data.empty_msg)
-        return 0
-    _save_last_list(data.entries)
-    abstract_lines = getattr(args, "abstract", None)
-    if abstract_lines is None:
-        abstract_lines = cfg.abstract_lines
-    highlight_kw_count = getattr(args, "highlight_keywords", None)
-    if highlight_kw_count is None:
-        highlight_kw_count = cfg.highlight_keyword_count
-    _print_entry_list(data.entries, cfg, abstract_lines, highlight_kw_count)
-    return 0
+    return _render_list(_lastweek_list(args, cfg), cfg, args)
 
 
 def _lastdays_list(args: SimpleNamespace, cfg: Config) -> ListData:
@@ -2218,20 +2218,7 @@ def cmd_last(args: SimpleNamespace) -> int:
         return cmd_lastweek(args)     # last 7 ≡ lastweek
 
     cfg = _load_config()
-    data = _lastdays_list(args, cfg)
-    if data.empty_msg:
-        print(data.empty_msg)
-        return 0
-    _save_last_list(data.entries)
-    print(data.header)
-    abstract_lines = getattr(args, "abstract", None)
-    if abstract_lines is None:
-        abstract_lines = cfg.abstract_lines
-    highlight_kw_count = getattr(args, "highlight_keywords", None)
-    if highlight_kw_count is None:
-        highlight_kw_count = cfg.highlight_keyword_count
-    _print_entry_list(data.entries, cfg, abstract_lines, highlight_kw_count)
-    return 0
+    return _render_list(_lastdays_list(args, cfg), cfg, args)
 
 
 def _topvoted_rows_from_papers(papers: list[dict], dn_table: dict[str, str]) -> list[dict]:
@@ -2399,20 +2386,7 @@ def _show_date_list(args: SimpleNamespace, cfg: Config) -> ListData:
 def cmd_show_date(args: SimpleNamespace) -> int:
     """Show papers for a specific date or date range, numbered for index-based vote."""
     cfg = _load_config()
-    data = _show_date_list(args, cfg)
-    if data.empty_msg:
-        print(data.empty_msg)
-        return 0
-    _save_last_list(data.entries)
-    print(data.header)
-    abstract_lines = getattr(args, "abstract", None)
-    if abstract_lines is None:
-        abstract_lines = cfg.abstract_lines
-    highlight_kw_count = getattr(args, "highlight_keywords", None)
-    if highlight_kw_count is None:
-        highlight_kw_count = cfg.highlight_keyword_count
-    _print_entry_list(data.entries, cfg, abstract_lines, highlight_kw_count)
-    return 0
+    return _render_list(_show_date_list(args, cfg), cfg, args)
 
 
 @dataclass
@@ -2421,6 +2395,41 @@ class VoteResult:
     voted: list[str]           # every processed paper_id, including already-voted
     new: list[str]             # only the paper_ids whose vote is genuinely new
     outdated_msg: str | None   # client out-of-date notice; None when current
+
+
+def _new_paper_record(paper_id: str, meta: dict) -> dict:
+    """Fresh paper-file contents for an id not yet in the repo, from vote metadata."""
+    return {
+        "id": paper_id,
+        "title": meta.get("title", ""),
+        "abstract": meta.get("abstract", ""),
+        "url": meta.get("url", f"{ARXIV_ABS}{paper_id}"),
+        "votes": [],
+    }
+
+
+def _register_vote(paper: dict, paper_id: str, user: str, meta: dict) -> bool:
+    """Backfill metadata, prune expired votes, and record `user`'s vote on `paper`.
+
+    Returns True when a new vote was added, False when the user had already voted.
+    Shared by both batch transports; the caller persists `paper` only when True.
+    """
+    _apply_paper_metadata(paper, meta)
+    _prune_expired_votes(paper)
+    votes = paper.setdefault("votes", [])
+    if any(v.get("user") == user for v in votes):
+        return False
+    paper["id"] = paper_id
+    votes.append(_make_vote_entry(user))
+    return True
+
+
+def _vote_commit_message(user: str, new_ids: list[str]) -> str:
+    """Commit message for a batch: a vote summary, or a display-name-only update."""
+    if not new_ids:
+        return f"display-name: update {user}"
+    ids_str = ", ".join(new_ids[:3]) + ("…" if len(new_ids) > 3 else "")
+    return f"vote: {user} -> [{ids_str}] ({len(new_ids)} papers)"
 
 
 def _batch_vote_papers_ssh(
@@ -2443,31 +2452,22 @@ def _batch_vote_papers_ssh(
         papers_dir.mkdir(parents=True, exist_ok=True)
         for p in papers:
             paper_id = _strip_arxiv_version(p["paper_id"])
-            title = p.get("title", "")
-            url = p.get("url", f"{ARXIV_ABS}{paper_id}")
             paper_file = papers_dir / f"{_safe_filename(paper_id)}.json"
             # No individual API GET — files are read directly from the local checkout,
             # preserving any existing votes from other users without extra round-trips.
-            abstract = p.get("abstract", "")
             if paper_file.exists():
                 try:
                     paper = json.loads(paper_file.read_text(encoding="utf-8"))
                 except Exception:
-                    paper = {"id": paper_id, "title": title, "abstract": abstract, "url": url, "votes": []}
+                    paper = _new_paper_record(paper_id, p)
             else:
-                paper = {"id": paper_id, "title": title, "abstract": abstract, "url": url, "votes": []}
-            _apply_paper_metadata(paper, p)
-            _prune_expired_votes(paper)
-            votes = paper.setdefault("votes", [])
-            if any(v.get("user") == user for v in votes):
+                paper = _new_paper_record(paper_id, p)
+            if _register_vote(paper, paper_id, user, p):
+                paper_file.write_text(json.dumps(paper, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                new_votes.append(paper_id)
+            else:
                 print(f"Already voted: {user} -> {paper_id}")
-                voted.append(paper_id)
-                continue
-            paper["id"] = paper_id
-            votes.append(_make_vote_entry(user))
-            paper_file.write_text(json.dumps(paper, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             voted.append(paper_id)
-            new_votes.append(paper_id)
         # Update display_names.json if the user's entry has changed
         dn_file = Path(clone_dir) / DISPLAY_NAMES_PATH
         dn_table: dict = {}
@@ -2501,12 +2501,7 @@ def _batch_vote_papers_ssh(
                 _run_git(["add", DISPLAY_NAMES_PATH], cwd=clone_dir)
             if meta_changed:
                 _run_git(["add", META_PATH], cwd=clone_dir)
-            if new_votes:
-                ids_str = ", ".join(new_votes[:3]) + ("…" if len(new_votes) > 3 else "")
-                msg = f"vote: {user} -> [{ids_str}] ({len(new_votes)} papers)"
-            else:
-                msg = f"display-name: update {user}"
-            _run_git(["commit", "-m", msg], cwd=clone_dir)
+            _run_git(["commit", "-m", _vote_commit_message(user, new_votes)], cwd=clone_dir)
             _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
     return VoteResult(voted, new_votes, outdated_msg)
 
@@ -2614,28 +2609,18 @@ def _batch_vote_papers_api(
     voted: list[str] = []
 
     for alias, (paper_id, path, p) in alias_map.items():
-        title = p.get("title", "")
-        url = p.get("url", f"{ARXIV_ABS}{paper_id}")
         text = (repo_node.get(alias) or {}).get("text")
         if text:
             try:
                 paper = json.loads(text)
             except Exception:
-                paper = {"id": paper_id, "title": title, "abstract": p.get("abstract", ""), "url": url, "votes": []}
+                paper = _new_paper_record(paper_id, p)
         else:
-            paper = {"id": paper_id, "title": title, "abstract": p.get("abstract", ""), "url": url, "votes": []}
-
-        _apply_paper_metadata(paper, p)
-        _prune_expired_votes(paper)
-        votes = paper.setdefault("votes", [])
-        if any(v.get("user") == user for v in votes):
+            paper = _new_paper_record(paper_id, p)
+        if _register_vote(paper, paper_id, user, p):
+            updates.append((path, paper_id, paper))
+        else:
             print(f"Already voted: {user} -> {paper_id}")
-            voted.append(paper_id)
-            continue
-
-        paper["id"] = paper_id
-        votes.append(_make_vote_entry(user))
-        updates.append((path, paper_id, paper))
         voted.append(paper_id)
 
     # Check if display_names.json needs updating
@@ -2683,12 +2668,7 @@ def _batch_vote_papers_api(
         blob_results = list(ex.map(_post_blob, updates))
 
     new_ids = [pid for _, pid, _ in updates if pid not in ("__dn__", "__meta__")]
-    ids_str = ", ".join(new_ids[:3]) + ("…" if len(new_ids) > 3 else "")
-    commit_msg = (
-        f"vote: {user} -> [{ids_str}] ({len(new_ids)} papers)"
-        if new_ids
-        else f"display-name: update {user}"
-    )
+    commit_msg = _vote_commit_message(user, new_ids)
     tree_entries = [
         {"path": path, "mode": "100644", "type": "blob", "sha": blob_sha}
         for path, blob_sha in blob_results
