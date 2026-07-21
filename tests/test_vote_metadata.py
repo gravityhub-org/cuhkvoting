@@ -68,14 +68,30 @@ class VoteMetadataTests(unittest.TestCase):
             "abstract": "abs",
             "url": f"{cli.ARXIV_ABS}2605.11269",
         }
-        with mock.patch("cuhkvoting.cli._resolve_vote_metadata", return_value=entry):
+        with mock.patch("cuhkvoting.cli._validate_arxiv_entry", return_value=entry):
             reasons = cli._backfill_paper_metadata(paper)
         self.assertEqual(paper["title"], "Fetched")
+        self.assertEqual(paper["abstract"], "abs")
         self.assertIn("title backfilled", reasons)
 
+    def test_backfill_paper_metadata_fetches_abstract_when_title_present(self) -> None:
+        # The gap this fixes: a record with a title but no abstract must still fetch
+        # the abstract from arXiv rather than leaving it empty.
+        paper = {"id": "2601.09678", "title": "Kept Title", "abstract": "", "url": "u", "votes": []}
+        entry = {"id": "2601.09678", "title": "Kept Title", "abstract": "Fetched abstract", "url": "u"}
+        with mock.patch("cuhkvoting.cli._validate_arxiv_entry", return_value=entry) as validate:
+            reasons = cli._backfill_paper_metadata(paper)
+        self.assertEqual(validate.call_count, 1)          # network was hit despite the title
+        self.assertEqual(paper["title"], "Kept Title")    # existing title untouched
+        self.assertEqual(paper["abstract"], "Fetched abstract")
+        self.assertIn("abstract backfilled", reasons)
+
     def test_backfill_paper_metadata_skips_when_complete(self) -> None:
+        # Fully-populated record makes no network call and reports no changes.
         paper = {"id": "2601.09678", "title": "T", "abstract": "a", "url": "u", "votes": []}
-        self.assertEqual(cli._backfill_paper_metadata(paper), [])
+        with mock.patch("cuhkvoting.cli._validate_arxiv_entry") as validate:
+            self.assertEqual(cli._backfill_paper_metadata(paper), [])
+        validate.assert_not_called()
 
     def test_resolve_vote_metadata_raises_titleunresolved_on_not_found(self) -> None:
         # arXiv reachable but id absent: _validate_arxiv_entry raises SystemExit,
@@ -125,7 +141,7 @@ class VoteMetadataTests(unittest.TestCase):
 
     def test_backfill_paper_metadata_survives_network_error(self) -> None:
         paper = {"id": "2605.11269", "title": "", "abstract": "", "url": "", "votes": []}
-        with mock.patch("cuhkvoting.cli._resolve_vote_metadata",
+        with mock.patch("cuhkvoting.cli._validate_arxiv_entry",
                         side_effect=urllib.error.URLError("down")):
             reasons = cli._backfill_paper_metadata(paper)
         self.assertEqual(paper["title"], "")  # unchanged; no crash

@@ -1572,29 +1572,43 @@ def _lookup_local_cache(paper_id: str) -> dict | None:
     return None
 
 
+def _fetch_paper_metadata(paper_id: str) -> dict:
+    """Fetch authoritative title/url/abstract from arXiv (INSPIRE fallback), whitespace-normalized.
+
+    Raises TitleUnresolved when arXiv answers but has no such id (a typo). Network
+    failures re-raise their native types from _validate_arxiv_entry so callers can
+    decide whether to block.
+    """
+    clean_id = _strip_arxiv_version(paper_id)
+    try:
+        entry = _validate_arxiv_entry(clean_id)
+    except SystemExit:
+        raise TitleUnresolved(clean_id) from None
+    title = " ".join((entry.get("title") or "").split())
+    if not title:
+        raise TitleUnresolved(clean_id)
+    return {
+        "paper_id": clean_id,
+        "title": title,
+        "url": entry.get("url", f"{ARXIV_ABS}{clean_id}"),
+        "abstract": " ".join((entry.get("abstract") or "").split()),
+    }
+
+
 def _resolve_vote_metadata(arxiv_id: str, title: str | None = None) -> dict:
-    """Return vote metadata with a non-empty title when the paper exists on arXiv/INSPIRE."""
+    """Return vote metadata with a non-empty title when the paper exists on arXiv/INSPIRE.
+
+    Voting fast path: a provided or cached title is used without touching the network;
+    a lookup happens only when no title is known locally. (Contrast _backfill_paper_metadata,
+    which fetches whenever any field is missing.)
+    """
     clean_id = _strip_arxiv_version(arxiv_id)
     resolved_title = (title or "").strip()
     cached = _lookup_local_cache(clean_id)
     if not resolved_title and cached:
         resolved_title = (cached.get("title") or "").strip()
     if not resolved_title:
-        try:
-            entry = _validate_arxiv_entry(clean_id)
-        except SystemExit:
-            # arXiv answered but has no such id — a typo, not a network outage.
-            # Network failures re-raise their native types from _validate_arxiv_entry.
-            raise TitleUnresolved(clean_id) from None
-        resolved_title = (entry.get("title") or "").strip()
-        if not resolved_title:
-            raise TitleUnresolved(clean_id)
-        return {
-            "paper_id": clean_id,
-            "title": resolved_title,
-            "url": entry.get("url", f"{ARXIV_ABS}{clean_id}"),
-            "abstract": entry.get("abstract", ""),
-        }
+        return _fetch_paper_metadata(clean_id)
     return {
         "paper_id": clean_id,
         "title": resolved_title,
@@ -1656,7 +1670,13 @@ def _apply_paper_metadata(paper: dict, meta: dict) -> None:
 
 
 def _backfill_paper_metadata(paper: dict) -> list[str]:
-    """Fetch and apply missing title/url/abstract. Returns change descriptions."""
+    """Complete a record's missing title/url/abstract from arXiv. Returns change descriptions.
+
+    Fetches the authoritative arXiv/INSPIRE entry whenever ANY field is missing — so a
+    record that already has a title but lacks an abstract still gets the abstract filled.
+    (The vote-time resolver deliberately skips the network when a title is present, which
+    is why it cannot be reused here.)
+    """
     reasons: list[str] = []
     paper_id = _strip_arxiv_version(str(paper.get("id", "")))
     if not paper_id:
@@ -1667,10 +1687,10 @@ def _backfill_paper_metadata(paper: dict) -> list[str]:
     if not (needs_title or needs_abstract or needs_url):
         return reasons
     try:
-        meta = _resolve_vote_metadata(paper_id, None if needs_title else paper.get("title"))
+        meta = _fetch_paper_metadata(paper_id)
     except TitleUnresolved:
         if needs_title:
-            reasons.append(f"title backfill failed ({paper_id})")
+            reasons.append(f"title backfill failed, no such arXiv id ({paper_id})")
         return reasons
     except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead):
         reasons.append(f"metadata backfill skipped, arXiv unreachable ({paper_id})")
