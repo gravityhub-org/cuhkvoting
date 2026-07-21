@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+import contextlib
 import http.client
 import datetime as dt
 import email.utils
@@ -418,16 +419,12 @@ def _load_papers_json_from_dir(papers_dir: Path) -> list[dict]:
 
 
 def _list_papers_via_git_clone(cfg: RepoConfig) -> list[dict]:
-    clone_dir = _with_repo_checkout(cfg)
-    try:
+    with _repo_checkout(cfg) as clone_dir:
         return _load_papers_json_from_dir(Path(clone_dir) / "papers")
-    finally:
-        shutil.rmtree(clone_dir, ignore_errors=True)
 
 
 def _find_legacy_paper_via_git(cfg: RepoConfig, base_id: str) -> tuple[dict | None, str | None, str | None]:
-    clone_dir = _with_repo_checkout(cfg)
-    try:
+    with _repo_checkout(cfg) as clone_dir:
         papers_dir = Path(clone_dir) / "papers"
         if not papers_dir.exists():
             return None, None, None
@@ -439,19 +436,14 @@ def _find_legacy_paper_via_git(cfg: RepoConfig, base_id: str) -> tuple[dict | No
             if _strip_arxiv_version(str(paper.get("id", ""))) == base_id:
                 return paper, None, str(cand.relative_to(clone_dir))
         return None, None, None
-    finally:
-        shutil.rmtree(clone_dir, ignore_errors=True)
 
 
 def _load_paper_via_git_clone(cfg: RepoConfig, path: str) -> tuple[dict | None, str | None]:
-    clone_dir = _with_repo_checkout(cfg)
-    try:
+    with _repo_checkout(cfg) as clone_dir:
         paper_file = Path(clone_dir) / path
         if not paper_file.exists():
             return None, None
         return json.loads(paper_file.read_text(encoding="utf-8")), None
-    finally:
-        shutil.rmtree(clone_dir, ignore_errors=True)
 
 
 def _load_paper_via_api(cfg: RepoConfig, path: str, token: str | None) -> tuple[dict | None, str | None]:
@@ -501,30 +493,24 @@ def _delete_paper_via_api(cfg: RepoConfig, path: str, sha: str, token: str, mess
 
 def _load_jc_records(cfg: RepoConfig, token: str | None) -> tuple[list[dict], str | None]:
     if not token and _has_github_ssh_access():
-        clone_dir = _with_repo_checkout(cfg)
-        try:
+        with _repo_checkout(cfg) as clone_dir:
             p = Path(clone_dir) / JC_RECORD_PATH
             if p.exists():
                 body = json.loads(p.read_text(encoding="utf-8"))
                 records = body.get("records", [])
                 return (records if isinstance(records, list) else []), None
-        finally:
-            shutil.rmtree(clone_dir, ignore_errors=True)
         return [], None
     data, sha = _load_json_via_api(cfg, JC_RECORD_PATH, token)
     if data is not None:
         records = data.get("records", [])
         return (records if isinstance(records, list) else []), sha
     if _has_github_ssh_access():
-        clone_dir = _with_repo_checkout(cfg)
-        try:
+        with _repo_checkout(cfg) as clone_dir:
             p = Path(clone_dir) / JC_RECORD_PATH
             if p.exists():
                 body = json.loads(p.read_text(encoding="utf-8"))
                 records = body.get("records", [])
                 return (records if isinstance(records, list) else []), None
-        finally:
-            shutil.rmtree(clone_dir, ignore_errors=True)
     return [], None
 
 
@@ -539,8 +525,7 @@ def _load_jc_records_and_display_names(
     Contents-API sha used by later writes). Falls back to two plain reads on GraphQL failure.
     """
     if not token and _has_github_ssh_access():
-        clone_dir = _with_repo_checkout(cfg)
-        try:
+        with _repo_checkout(cfg) as clone_dir:
             records: list[dict] = []
             rec_path = Path(clone_dir) / JC_RECORD_PATH
             if rec_path.exists():
@@ -558,8 +543,6 @@ def _load_jc_records_and_display_names(
                 _parse_meta_text(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
             )
             return records, None, dn_table
-        finally:
-            shutil.rmtree(clone_dir, ignore_errors=True)
     if token:
         try:
             query = '{ repository(owner: "%s", name: "%s") { %s %s %s } }' % (
@@ -611,17 +594,12 @@ def _save_jc_records(cfg: RepoConfig, token: str | None, user: str, records: lis
         return
     if not _has_github_ssh_access():
         raise SystemExit(f"Writing records needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure SSH key.\n\n{_ssh_setup_instructions()}")
-    clone_dir = _with_repo_checkout(cfg)
-    try:
+    def _stage(clone_dir: str) -> None:
         p = Path(clone_dir) / JC_RECORD_PATH
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        _ensure_commit_identity(clone_dir, user)
         _run_git(["add", JC_RECORD_PATH], cwd=clone_dir)
-        _run_git(["commit", "-m", message], cwd=clone_dir)
-        _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
-    finally:
-        shutil.rmtree(clone_dir, ignore_errors=True)
+    _commit_via_ssh(cfg, user, message, _stage)
 
 
 def _save_meta(cfg: RepoConfig, token: str | None, user: str, body: dict, sha: str | None, message: str) -> None:
@@ -631,16 +609,11 @@ def _save_meta(cfg: RepoConfig, token: str | None, user: str, body: dict, sha: s
         return
     if not _has_github_ssh_access():
         raise SystemExit(f"Writing meta needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure SSH key.\n\n{_ssh_setup_instructions()}")
-    clone_dir = _with_repo_checkout(cfg)
-    try:
+    def _stage(clone_dir: str) -> None:
         p = Path(clone_dir) / META_PATH
         p.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        _ensure_commit_identity(clone_dir, user)
         _run_git(["add", META_PATH], cwd=clone_dir)
-        _run_git(["commit", "-m", message], cwd=clone_dir)
-        _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
-    finally:
-        shutil.rmtree(clone_dir, ignore_errors=True)
+    _commit_via_ssh(cfg, user, message, _stage)
 
 
 def _selected_arxiv_ids(cfg: RepoConfig, token: str | None) -> set[str]:
@@ -1365,8 +1338,7 @@ def _load_vote_paper(cfg: RepoConfig, token: str | None, paper_id: str) -> tuple
         if legacy_paper is not None and legacy_path is not None:
             paper, sha, save_path = legacy_paper, legacy_sha, legacy_path
     if paper is None and token is None and _has_github_ssh_access():
-        clone_dir = _with_repo_checkout(cfg)
-        try:
+        with _repo_checkout(cfg) as clone_dir:
             paper_file = Path(clone_dir) / path
             if paper_file.exists():
                 paper = json.loads(paper_file.read_text(encoding="utf-8"))
@@ -1382,8 +1354,6 @@ def _load_vote_paper(cfg: RepoConfig, token: str | None, paper_id: str) -> tuple
                             paper = cand_paper
                             save_path = str(cand.relative_to(clone_dir))
                             break
-        finally:
-            shutil.rmtree(clone_dir, ignore_errors=True)
     return paper, sha, save_path
 
 
@@ -1401,17 +1371,12 @@ def _save_vote_paper(
         return
     if not _has_github_ssh_access():
         raise SystemExit(f"Voting needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure SSH key.\n\n{_ssh_setup_instructions()}")
-    clone_dir = _with_repo_checkout(cfg)
-    try:
+    def _stage(clone_dir: str) -> None:
         paper_file = Path(clone_dir) / save_path
         paper_file.parent.mkdir(parents=True, exist_ok=True)
         paper_file.write_text(json.dumps(paper, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        _ensure_commit_identity(clone_dir, user)
         _run_git(["add", str(Path(save_path))], cwd=clone_dir)
-        _run_git(["commit", "-m", message], cwd=clone_dir)
-        _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
-    finally:
-        shutil.rmtree(clone_dir, ignore_errors=True)
+    _commit_via_ssh(cfg, user, message, _stage)
 
 
 def _delete_vote_paper(
@@ -1429,17 +1394,12 @@ def _delete_vote_paper(
         return
     if not _has_github_ssh_access():
         raise SystemExit(f"Voting needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure SSH key.\n\n{_ssh_setup_instructions()}")
-    clone_dir = _with_repo_checkout(cfg)
-    try:
+    def _stage(clone_dir: str) -> None:
         paper_file = Path(clone_dir) / save_path
         if not paper_file.exists():
             raise SystemExit(f"Vote file not found for deletion: {save_path}")
-        _ensure_commit_identity(clone_dir, user)
         _run_git(["rm", str(Path(save_path))], cwd=clone_dir)
-        _run_git(["commit", "-m", message], cwd=clone_dir)
-        _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
-    finally:
-        shutil.rmtree(clone_dir, ignore_errors=True)
+    _commit_via_ssh(cfg, user, message, _stage)
 
 
 def _validate_arxiv_entry(paper_id: str) -> dict:
@@ -1482,6 +1442,20 @@ def _with_repo_checkout(cfg: RepoConfig) -> str:
             raise
 
 
+@contextlib.contextmanager
+def _repo_checkout(cfg: RepoConfig):
+    """Shallow clone of the records repo as a context manager; removed on exit.
+
+    Yields the checkout directory. Wraps `_with_repo_checkout` so callers never
+    have to pair a clone with its own `try/finally` cleanup.
+    """
+    clone_dir = _with_repo_checkout(cfg)
+    try:
+        yield clone_dir
+    finally:
+        shutil.rmtree(clone_dir, ignore_errors=True)
+
+
 def _ensure_commit_identity(repo_dir: str, user: str) -> None:
     try:
         email = _run_git(["config", "--global", "user.email"]).strip()
@@ -1492,6 +1466,20 @@ def _ensure_commit_identity(repo_dir: str, user: str) -> None:
         email = f"{safe_user}@users.noreply.github.com"
     _run_git(["config", "user.name", user], cwd=repo_dir)
     _run_git(["config", "user.email", email], cwd=repo_dir)
+
+
+def _commit_via_ssh(cfg: RepoConfig, user: str, message: str, stage) -> None:
+    """Clone, prepare changes via `stage(clone_dir)`, then commit and push over SSH.
+
+    `stage` writes the file(s) into the checkout and runs the matching `git add`/`rm`.
+    Shared by the single-file writers; the multi-file vote/sanitize paths stage
+    conditionally and use `_repo_checkout` directly.
+    """
+    with _repo_checkout(cfg) as clone_dir:
+        _ensure_commit_identity(clone_dir, user)
+        stage(clone_dir)
+        _run_git(["commit", "-m", message], cwd=clone_dir)
+        _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
 
 
 def _load_cache_data(key: str) -> dict | None:
@@ -2447,11 +2435,10 @@ def _batch_vote_papers_ssh(
     """
     if not papers:
         return VoteResult([], [], None)
-    clone_dir = _with_repo_checkout(cfg)
     voted: list[str] = []
     new_votes: list[str] = []
     outdated_msg: str | None = None
-    try:
+    with _repo_checkout(cfg) as clone_dir:
         papers_dir = Path(clone_dir) / "papers"
         papers_dir.mkdir(parents=True, exist_ok=True)
         for p in papers:
@@ -2521,8 +2508,6 @@ def _batch_vote_papers_ssh(
                 msg = f"display-name: update {user}"
             _run_git(["commit", "-m", msg], cwd=clone_dir)
             _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
-    finally:
-        shutil.rmtree(clone_dir, ignore_errors=True)
     return VoteResult(voted, new_votes, outdated_msg)
 
 
@@ -3476,8 +3461,7 @@ def admin_sanitize(
                "legacy display_name removal, journal-club record de-duplication.")
 
     if _has_github_ssh_access():
-        clone_dir = _with_repo_checkout(cfg)
-        try:
+        with _repo_checkout(cfg) as clone_dir:
             papers_dir = Path(clone_dir) / "papers"
             changed = 0
             for path in sorted(papers_dir.glob("*.json")) if papers_dir.exists() else []:
@@ -3506,8 +3490,6 @@ def admin_sanitize(
             _run_git(["commit", "-m", f"sanitize: {changed} paper record(s)"], cwd=clone_dir)
             _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
             typer.echo(f"Sanitized {changed} record(s).")
-        finally:
-            shutil.rmtree(clone_dir, ignore_errors=True)
         return
 
     if not token:
