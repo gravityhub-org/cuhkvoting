@@ -1283,6 +1283,40 @@ def _latest_vote_timestamp(votes: list[dict]) -> float:
     return best
 
 
+def _vote_user_set(votes: list[dict]) -> frozenset[str]:
+    return frozenset(
+        str(v.get("user", "")).strip().lower()
+        for v in votes
+        if str(v.get("user", "")).strip()
+    )
+
+
+def _diversify_topvoted_rows(rows: list[dict]) -> list[dict]:
+    """Order rows by vote count, spreading distinct voters within ties before date."""
+    if len(rows) <= 1:
+        return rows
+    by_votes: dict[int, list[dict]] = {}
+    for row in rows:
+        by_votes.setdefault(row["votes"], []).append(row)
+    ordered: list[dict] = []
+    for vote_count in sorted(by_votes.keys(), reverse=True):
+        remaining = list(by_votes[vote_count])
+        seen_voters: set[str] = set()
+        while remaining:
+            best = min(
+                remaining,
+                key=lambda r: (
+                    len(r["voter_users"] & seen_voters),
+                    -r["latest_vote_ts"],
+                    r["id"],
+                ),
+            )
+            remaining.remove(best)
+            ordered.append(best)
+            seen_voters |= best["voter_users"]
+    return ordered
+
+
 def _prune_expired_votes(paper: dict) -> int:
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=VOTE_EXPIRY_DAYS)
     votes = paper.get("votes", [])
@@ -1526,6 +1560,73 @@ def _lookup_local_cache(paper_id: str) -> dict | None:
             if _strip_arxiv_version(str(entry.get("id", ""))) == paper_id:
                 return entry
     return None
+
+
+def _resolve_vote_metadata(arxiv_id: str, title: str | None = None) -> dict:
+    """Return vote metadata with a non-empty title when the paper exists on arXiv/INSPIRE."""
+    clean_id = _strip_arxiv_version(arxiv_id)
+    resolved_title = (title or "").strip()
+    cached = _lookup_local_cache(clean_id)
+    if not resolved_title and cached:
+        resolved_title = (cached.get("title") or "").strip()
+    if not resolved_title:
+        entry = _validate_arxiv_entry(clean_id)
+        resolved_title = (entry.get("title") or "").strip()
+        if not resolved_title:
+            raise SystemExit(f"Could not resolve title for '{clean_id}'.")
+        return {
+            "paper_id": clean_id,
+            "title": resolved_title,
+            "url": entry.get("url", f"{ARXIV_ABS}{clean_id}"),
+            "abstract": entry.get("abstract", ""),
+        }
+    return {
+        "paper_id": clean_id,
+        "title": resolved_title,
+        "url": (cached or {}).get("url", f"{ARXIV_ABS}{clean_id}"),
+        "abstract": (cached or {}).get("abstract", ""),
+    }
+
+
+def _apply_paper_metadata(paper: dict, meta: dict) -> None:
+    """Backfill missing title/url/abstract on an existing paper record."""
+    title = (meta.get("title") or "").strip()
+    if title and not (paper.get("title") or "").strip():
+        paper["title"] = title
+    url = meta.get("url")
+    if url and not paper.get("url"):
+        paper["url"] = url
+    abstract = meta.get("abstract", "")
+    if abstract and not paper.get("abstract"):
+        paper["abstract"] = abstract
+
+
+def _backfill_paper_metadata(paper: dict) -> list[str]:
+    """Fetch and apply missing title/url/abstract. Returns change descriptions."""
+    reasons: list[str] = []
+    paper_id = _strip_arxiv_version(str(paper.get("id", "")))
+    if not paper_id:
+        return reasons
+    needs_title = not (paper.get("title") or "").strip()
+    needs_abstract = not (paper.get("abstract") or "").strip()
+    needs_url = not (paper.get("url") or "").strip()
+    if not (needs_title or needs_abstract or needs_url):
+        return reasons
+    try:
+        meta = _resolve_vote_metadata(paper_id, None if needs_title else paper.get("title"))
+    except SystemExit:
+        if needs_title:
+            reasons.append(f"title backfill failed ({paper_id})")
+        return reasons
+    before = (paper.get("title"), paper.get("abstract"), paper.get("url"))
+    _apply_paper_metadata(paper, meta)
+    if needs_title and paper.get("title") != before[0]:
+        reasons.append("title backfilled")
+    if needs_abstract and paper.get("abstract") != before[1]:
+        reasons.append("abstract backfilled")
+    if needs_url and paper.get("url") != before[2]:
+        reasons.append("url backfilled")
+    return reasons
 
 
 def _resolve_cache(
@@ -2086,11 +2187,11 @@ def _topvoted_rows_from_papers(papers: list[dict], dn_table: dict[str, str]) -> 
                 "abstract": " ".join(paper.get("abstract", "").split()),
                 "votes": vote_count,
                 "voters": _format_voters(votes, dn_table),
+                "voter_users": _vote_user_set(votes),
                 "latest_vote_ts": _latest_vote_timestamp(votes),
             }
         )
-    rows.sort(key=lambda p: (-p["votes"], -p["latest_vote_ts"], p["id"]))
-    return rows
+    return _diversify_topvoted_rows(rows)
 
 
 def _topvoted_list(args: SimpleNamespace, cfg: Config) -> ListData:
@@ -2284,13 +2385,15 @@ def _batch_vote_papers_ssh(
             paper_file = papers_dir / f"{_safe_filename(paper_id)}.json"
             # No individual API GET — files are read directly from the local checkout,
             # preserving any existing votes from other users without extra round-trips.
+            abstract = p.get("abstract", "")
             if paper_file.exists():
                 try:
                     paper = json.loads(paper_file.read_text(encoding="utf-8"))
                 except Exception:
-                    paper = {"id": paper_id, "title": title, "abstract": "", "url": url, "votes": []}
+                    paper = {"id": paper_id, "title": title, "abstract": abstract, "url": url, "votes": []}
             else:
-                paper = {"id": paper_id, "title": title, "abstract": "", "url": url, "votes": []}
+                paper = {"id": paper_id, "title": title, "abstract": abstract, "url": url, "votes": []}
+            _apply_paper_metadata(paper, p)
             _prune_expired_votes(paper)
             votes = paper.setdefault("votes", [])
             if any(v.get("user") == user for v in votes):
@@ -2459,10 +2562,11 @@ def _batch_vote_papers_api(
             try:
                 paper = json.loads(text)
             except Exception:
-                paper = {"id": paper_id, "title": title, "abstract": "", "url": url, "votes": []}
+                paper = {"id": paper_id, "title": title, "abstract": p.get("abstract", ""), "url": url, "votes": []}
         else:
-            paper = {"id": paper_id, "title": title, "abstract": "", "url": url, "votes": []}
+            paper = {"id": paper_id, "title": title, "abstract": p.get("abstract", ""), "url": url, "votes": []}
 
+        _apply_paper_metadata(paper, p)
         _prune_expired_votes(paper)
         votes = paper.setdefault("votes", [])
         if any(v.get("user") == user for v in votes):
@@ -2545,8 +2649,19 @@ def _vote_paper_with_metadata(
 ) -> int:
     """Vote for a paper using pre-known metadata, skipping arXiv validation."""
     paper, sha, save_path = _load_vote_paper(cfg, token, paper_id)
+    meta = {"paper_id": paper_id, "title": title, "url": url}
+    if not (title or "").strip():
+        meta = _resolve_vote_metadata(paper_id)
     if paper is None:
-        paper = {"id": paper_id, "title": title, "abstract": "", "url": url, "votes": []}
+        paper = {
+            "id": paper_id,
+            "title": meta["title"],
+            "abstract": meta.get("abstract", ""),
+            "url": meta["url"],
+            "votes": [],
+        }
+    else:
+        _apply_paper_metadata(paper, meta)
     _prune_expired_votes(paper)
     votes = paper.setdefault("votes", [])
     if any(v.get("user") == user for v in votes):
@@ -2569,30 +2684,17 @@ def cmd_vote(args: SimpleNamespace) -> int:
     paper, sha, save_path = _load_vote_paper(cfg, token, paper_id)
 
     if paper is None:
-        cached = _lookup_local_cache(paper_id)
-        if cached:
-            entry = cached
-        else:
-            entry = {
-                "id": _strip_arxiv_version(paper_id),
-                "title": "",
-                "abstract": "",
-                "url": f"{ARXIV_ABS}{paper_id}",
-            }
+        meta = _resolve_vote_metadata(paper_id)
         paper = {
-            "id": entry["id"],
-            "title": entry.get("title", ""),
-            "abstract": entry.get("abstract", ""),
-            "url": entry.get("url", f"{ARXIV_ABS}{paper_id}"),
+            "id": meta["paper_id"],
+            "title": meta["title"],
+            "abstract": meta.get("abstract", ""),
+            "url": meta["url"],
             "votes": [],
         }
-    elif not paper.get("abstract"):
-        cached = _lookup_local_cache(paper_id)
-        if cached and cached.get("abstract"):
-            paper["abstract"] = cached["abstract"]
-        elif not cached:
-            entry = _validate_arxiv_entry(paper_id)
-            paper["abstract"] = entry.get("abstract", "")
+    else:
+        meta = _resolve_vote_metadata(paper_id, paper.get("title"))
+        _apply_paper_metadata(paper, meta)
 
     _prune_expired_votes(paper)
     votes = paper.setdefault("votes", [])
@@ -3069,18 +3171,9 @@ def vote_command(
     display_name = cfg.display_name
     _warn_if_display_name_changed(display_name)
 
-    # Resolve title from last list or local cache only — voting must not block on arXiv.
     papers_meta: list[dict] = []
     for arxiv_id, title, _ in resolved:
-        if not title:
-            cached = _lookup_local_cache(arxiv_id)
-            if cached:
-                title = cached.get("title", "")
-        papers_meta.append({
-            "paper_id": arxiv_id,
-            "title": title or "",
-            "url": f"{ARXIV_ABS}{arxiv_id}",
-        })
+        papers_meta.append(_resolve_vote_metadata(arxiv_id, title))
 
     try:
         if _has_github_ssh_access():
@@ -3246,7 +3339,7 @@ def admin_sanitize(
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview without writing."),
 ) -> None:
-    """Normalize whitespace in title/abstract and strip legacy display_name fields from vote entries."""
+    """Normalize records, backfill missing titles, and strip legacy display_name fields."""
     args = SimpleNamespace(repo=repo, branch=branch)
     cfg = _resolve_repo_config(args)
     token = _get_token()
@@ -3267,6 +3360,7 @@ def admin_sanitize(
             if "display_name" in v:
                 del v["display_name"]
                 reasons.append(f"legacy display_name removed ({v.get('user', '?')})")
+        reasons.extend(_backfill_paper_metadata(paper))
         return reasons
 
     def _sanitize_jc_records(body: dict) -> list[str]:
@@ -3289,6 +3383,16 @@ def admin_sanitize(
             if canon != r.get("arxiv_id"):
                 r["arxiv_id"] = canon
                 reasons.append(f"arxiv_id normalized ({raw_id} -> {canon})")
+            if not (r.get("title") or "").strip() and canon:
+                try:
+                    meta = _resolve_vote_metadata(canon)
+                except SystemExit:
+                    reasons.append(f"title backfill failed ({canon})")
+                else:
+                    new_title = meta.get("title", "")
+                    if new_title:
+                        r["title"] = new_title
+                        reasons.append(f"title backfilled ({canon})")
 
         # 2. De-duplicate by canonical arxiv_id, keeping the earliest selection
         #    (earliest selected_at; missing dates sort last). Preserve first-seen order.
@@ -3313,8 +3417,8 @@ def admin_sanitize(
             body["records"] = deduped
         return reasons
 
-    typer.echo("Sanitizing: whitespace normalization, legacy display_name removal, "
-               "journal-club record de-duplication.")
+    typer.echo("Sanitizing: whitespace normalization, missing title backfill, "
+               "legacy display_name removal, journal-club record de-duplication.")
 
     if _has_github_ssh_access():
         clone_dir = _with_repo_checkout(cfg)
