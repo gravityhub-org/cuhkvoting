@@ -85,6 +85,16 @@ DEFAULT_HIGHLIGHT_KEYWORD_COUNT = -1
 DEFAULT_HIGHLIGHT_GLYPH = "★"
 
 
+class TitleUnresolved(Exception):
+    """A paper's title could not be resolved because arXiv has no such id (typo guard).
+
+    Distinct from a network failure: this means arXiv answered and the id is absent,
+    so callers can skip just this paper. Network errors keep their native types
+    (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead)
+    and mean "arXiv unreachable" — voting must not block on those.
+    """
+
+
 @dataclass
 class RepoConfig:
     owner: str
@@ -1570,10 +1580,15 @@ def _resolve_vote_metadata(arxiv_id: str, title: str | None = None) -> dict:
     if not resolved_title and cached:
         resolved_title = (cached.get("title") or "").strip()
     if not resolved_title:
-        entry = _validate_arxiv_entry(clean_id)
+        try:
+            entry = _validate_arxiv_entry(clean_id)
+        except SystemExit:
+            # arXiv answered but has no such id — a typo, not a network outage.
+            # Network failures re-raise their native types from _validate_arxiv_entry.
+            raise TitleUnresolved(clean_id) from None
         resolved_title = (entry.get("title") or "").strip()
         if not resolved_title:
-            raise SystemExit(f"Could not resolve title for '{clean_id}'.")
+            raise TitleUnresolved(clean_id)
         return {
             "paper_id": clean_id,
             "title": resolved_title,
@@ -1586,6 +1601,45 @@ def _resolve_vote_metadata(arxiv_id: str, title: str | None = None) -> dict:
         "url": (cached or {}).get("url", f"{ARXIV_ABS}{clean_id}"),
         "abstract": (cached or {}).get("abstract", ""),
     }
+
+
+def _resolve_batch_metadata(
+    resolved: list[tuple[str, str | None, int | None]],
+) -> tuple[list[dict], list[str]]:
+    """Resolve vote metadata for a batch, isolating per-paper failures.
+
+    Returns (papers_meta, skipped). A paper is skipped only when arXiv is reachable
+    and reports the id does not exist (a typo). When arXiv is unreachable, voting must
+    not block: the paper is kept with whatever title we already have (possibly empty),
+    for `admin sanitize` to backfill later.
+    """
+    papers_meta: list[dict] = []
+    skipped: list[str] = []
+    for arxiv_id, title, _ in resolved:
+        try:
+            papers_meta.append(_resolve_vote_metadata(arxiv_id, title))
+        except TitleUnresolved:
+            typer.echo(
+                typer.style(f"{arxiv_id} not found on arXiv (typo?); skipping.", fg=typer.colors.YELLOW),
+                err=True,
+            )
+            skipped.append(arxiv_id)
+        except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead):
+            clean_id = _strip_arxiv_version(arxiv_id)
+            typer.echo(
+                typer.style(
+                    f"arXiv unreachable; voting {clean_id} with known title — "
+                    "run 'admin sanitize' to backfill.",
+                    fg=typer.colors.YELLOW,
+                ),
+                err=True,
+            )
+            papers_meta.append({
+                "paper_id": clean_id,
+                "title": (title or ""),
+                "url": f"{ARXIV_ABS}{clean_id}",
+            })
+    return papers_meta, skipped
 
 
 def _apply_paper_metadata(paper: dict, meta: dict) -> None:
@@ -1614,9 +1668,12 @@ def _backfill_paper_metadata(paper: dict) -> list[str]:
         return reasons
     try:
         meta = _resolve_vote_metadata(paper_id, None if needs_title else paper.get("title"))
-    except SystemExit:
+    except TitleUnresolved:
         if needs_title:
             reasons.append(f"title backfill failed ({paper_id})")
+        return reasons
+    except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead):
+        reasons.append(f"metadata backfill skipped, arXiv unreachable ({paper_id})")
         return reasons
     before = (paper.get("title"), paper.get("abstract"), paper.get("url"))
     _apply_paper_metadata(paper, meta)
@@ -2651,7 +2708,11 @@ def _vote_paper_with_metadata(
     paper, sha, save_path = _load_vote_paper(cfg, token, paper_id)
     meta = {"paper_id": paper_id, "title": title, "url": url}
     if not (title or "").strip():
-        meta = _resolve_vote_metadata(paper_id)
+        try:
+            meta = _resolve_vote_metadata(paper_id)
+        except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead):
+            # arXiv unreachable — vote with the (empty) title we have; sanitize backfills.
+            pass
     if paper is None:
         paper = {
             "id": paper_id,
@@ -2684,7 +2745,12 @@ def cmd_vote(args: SimpleNamespace) -> int:
     paper, sha, save_path = _load_vote_paper(cfg, token, paper_id)
 
     if paper is None:
-        meta = _resolve_vote_metadata(paper_id)
+        try:
+            meta = _resolve_vote_metadata(paper_id)
+        except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead):
+            # arXiv unreachable — don't block the vote; sanitize can backfill later.
+            clean_id = _strip_arxiv_version(paper_id)
+            meta = {"paper_id": clean_id, "title": "", "url": f"{ARXIV_ABS}{clean_id}", "abstract": ""}
         paper = {
             "id": meta["paper_id"],
             "title": meta["title"],
@@ -2693,8 +2759,14 @@ def cmd_vote(args: SimpleNamespace) -> int:
             "votes": [],
         }
     else:
-        meta = _resolve_vote_metadata(paper_id, paper.get("title"))
-        _apply_paper_metadata(paper, meta)
+        # Existing local record: backfill is best-effort. A typo is impossible here
+        # (the id matched a file), and an outage must not block the vote.
+        try:
+            meta = _resolve_vote_metadata(paper_id, paper.get("title"))
+        except (TitleUnresolved, urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead):
+            meta = None
+        if meta:
+            _apply_paper_metadata(paper, meta)
 
     _prune_expired_votes(paper)
     votes = paper.setdefault("votes", [])
@@ -2965,6 +3037,12 @@ def _invoke_cmd(func, **kwargs: object) -> int:
             err=True,
         )
         return 1
+    except TitleUnresolved as e:
+        typer.echo(
+            typer.style(f"{e} not found on arXiv (typo?).", fg=typer.colors.YELLOW),
+            err=True,
+        )
+        return 1
     except SystemExit as e:
         typer.echo(str(e), err=True)
         return 1
@@ -3171,9 +3249,12 @@ def vote_command(
     display_name = cfg.display_name
     _warn_if_display_name_changed(display_name)
 
-    papers_meta: list[dict] = []
-    for arxiv_id, title, _ in resolved:
-        papers_meta.append(_resolve_vote_metadata(arxiv_id, title))
+    # Resolve per paper: a typo (arXiv reachable, id absent) skips just that paper;
+    # an arXiv outage keeps it with the known title. Neither aborts the batch.
+    papers_meta, skipped = _resolve_batch_metadata(resolved)
+    if not papers_meta:
+        typer.echo("Nothing to vote for (no resolvable arXiv ids).", err=True)
+        raise typer.Exit(code=1)
 
     try:
         if _has_github_ssh_access():
@@ -3188,7 +3269,8 @@ def vote_command(
     except RuntimeError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1)
-    raise typer.Exit(code=0)
+    # Nonzero when some ids were skipped as typos, so the mistake is visible in $?.
+    raise typer.Exit(code=1 if skipped else 0)
 
 
 @app.command("show")
@@ -3386,8 +3468,10 @@ def admin_sanitize(
             if not (r.get("title") or "").strip() and canon:
                 try:
                     meta = _resolve_vote_metadata(canon)
-                except SystemExit:
+                except TitleUnresolved:
                     reasons.append(f"title backfill failed ({canon})")
+                except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead):
+                    reasons.append(f"title backfill skipped, arXiv unreachable ({canon})")
                 else:
                     new_title = meta.get("title", "")
                     if new_title:

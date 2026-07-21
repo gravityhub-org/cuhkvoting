@@ -367,7 +367,7 @@ def sync(
 
     # Resolve cuhkvoting user (GitHub username)
     from cuhkvoting.cli import (  # noqa: PLC0415
-        ARXIV_ABS, DEFAULT_REPO, RepoConfig,
+        ARXIV_ABS, DEFAULT_REPO, RepoConfig, TitleUnresolved,
         _batch_vote_papers_api, _batch_vote_papers_ssh,
         _get_token, _has_github_ssh_access, _load_config,
         _resolve_user, _selected_arxiv_ids, _strip_arxiv_version,
@@ -572,6 +572,10 @@ def sync(
                         title_by_arxiv.get(arxiv_id, ""),
                         f"{ARXIV_ABS}{arxiv_id}", display_name,
                     )
+                except TitleUnresolved:
+                    typer.echo(f"Vote failed for {arxiv_id}: not found on arXiv (typo?)", err=True)
+                    ok = False
+                    continue
                 except (SystemExit, RuntimeError) as exc:
                     typer.echo(f"Vote failed for {arxiv_id}: {exc}", err=True)
                     ok = False
