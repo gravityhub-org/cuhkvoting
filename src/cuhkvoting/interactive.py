@@ -40,7 +40,7 @@ try:
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.keys import ALL_KEYS, KEY_ALIASES
     from prompt_toolkit.layout import (
-        ConditionalContainer, HSplit, Layout, VSplit, Window, WindowAlign,
+        ConditionalContainer, HSplit, Layout, VSplit, Window,
     )
     from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
     from prompt_toolkit.styles import DynamicStyle, Style

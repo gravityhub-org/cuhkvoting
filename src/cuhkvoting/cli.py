@@ -2454,7 +2454,6 @@ def _batch_vote_papers_ssh(
     try:
         papers_dir = Path(clone_dir) / "papers"
         papers_dir.mkdir(parents=True, exist_ok=True)
-        ts = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
         for p in papers:
             paper_id = _strip_arxiv_version(p["paper_id"])
             title = p.get("title", "")
@@ -2593,8 +2592,6 @@ def _batch_vote_papers_api(
 
     base_url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}"
     json_headers = {**_github_headers(token), "Content-Type": "application/json"}
-    ts = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
-
     # Step 1: fetch all needed paper files + display_names.json in one GraphQL request
     aliases: list[str] = []
     alias_map: dict[str, tuple[str, str, dict]] = {}  # alias -> (paper_id, path, input_dict)
@@ -2752,51 +2749,6 @@ def _vote_paper_with_metadata(
     votes.append(_make_vote_entry(user))
     _save_vote_paper(cfg, token, user, paper, sha, save_path, f"vote: {user} -> {paper['id']}")
     print(f"Vote recorded: {user} -> {paper['id']}")
-    return 0
-
-
-def cmd_vote(args: SimpleNamespace) -> int:
-    app_cfg = _load_config()
-    display_name = getattr(args, "display_name", None) or app_cfg.display_name
-    cfg = _resolve_repo_config(args)
-    token = getattr(args, "token", None) or _get_token()
-    user = getattr(args, "user", None) or _resolve_user(token)
-    paper_id = _normalize_paper_id(args.paper_id)
-    paper, sha, save_path = _load_vote_paper(cfg, token, paper_id)
-
-    if paper is None:
-        try:
-            meta = _resolve_vote_metadata(paper_id)
-        except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead):
-            # arXiv unreachable — don't block the vote; sanitize can backfill later.
-            clean_id = _strip_arxiv_version(paper_id)
-            meta = {"paper_id": clean_id, "title": "", "url": f"{ARXIV_ABS}{clean_id}", "abstract": ""}
-        paper = {
-            "id": meta["paper_id"],
-            "title": meta["title"],
-            "abstract": meta.get("abstract", ""),
-            "url": meta["url"],
-            "votes": [],
-        }
-    else:
-        # Existing local record: backfill is best-effort. A typo is impossible here
-        # (the id matched a file), and an outage must not block the vote.
-        try:
-            meta = _resolve_vote_metadata(paper_id, paper.get("title"))
-        except (TitleUnresolved, urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead):
-            meta = None
-        if meta:
-            _apply_paper_metadata(paper, meta)
-
-    _prune_expired_votes(paper)
-    votes = paper.setdefault("votes", [])
-    if any(v.get("user") == user for v in votes):
-        raise SystemExit(f"User '{user}' already voted for {paper.get('id', paper_id)}.")
-    paper_vote_id = _strip_arxiv_version(str(paper.get("id", paper_id)))
-    paper["id"] = paper_vote_id
-    votes.append(_make_vote_entry(user))
-    _save_vote_paper(cfg, token, user, paper, sha, save_path, f"vote: {user} -> {paper_vote_id}")
-    print(f"Vote recorded: {user} -> {paper_vote_id}")
     return 0
 
 
@@ -3282,7 +3234,6 @@ def vote_command(
             _batch_vote_papers_ssh(repo_cfg, user, papers_meta, display_name)
         elif token:
             # One GraphQL read (per file) → parallel blob POSTs → single commit
-            # Avoids the O(N) legacy-paper scan that cmd_vote triggers for new papers
             _batch_vote_papers_api(repo_cfg, token, user, papers_meta, display_name)
         else:
             raise SystemExit(f"Voting needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure SSH key.\n\n{_ssh_setup_instructions()}")
@@ -3350,7 +3301,7 @@ def interactive_command(
 def init_config(
     force: bool = typer.Option(False, "--force", help="Overwrite existing config file."),
 ) -> None:
-    """Create a default config file at ~/.config/cuhkvoting/voting.toml."""
+    """Create a default config file at ~/.config/cuhkvoting/config.toml."""
     if CONFIG_PATH.exists() and not force:
         typer.echo(f"Config already exists: {CONFIG_PATH}  (use --force to overwrite)")
         raise typer.Exit(code=1)
