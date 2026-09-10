@@ -41,13 +41,45 @@ class BatchVoteSshResultTests(unittest.TestCase):
 
         self.assertEqual(result.voted, ["2601.00001", "2601.00002"])
         self.assertEqual(result.new, ["2601.00002"])
+        self.assertEqual(result.skipped_selected, [])
         self.assertEqual(dup_file.read_text(), original)  # duplicate untouched
         new_paper = json.loads((papers_dir / "2601.00002.json").read_text())
         self.assertEqual(new_paper["votes"][0]["user"], "octocat")
 
+    def test_skips_jc_selected_in_same_checkout(self) -> None:
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        papers_dir = Path(tmp) / "papers"
+        papers_dir.mkdir()
+        (papers_dir / "journal_club_records.json").write_text(json.dumps({
+            "records": [{"arxiv_id": "2601.00001", "week": "2026-W01"}],
+        }))
+        err = io.StringIO()
+        with mock.patch("cuhkvoting.cli._with_repo_checkout", return_value=tmp), \
+                mock.patch("cuhkvoting.cli._run_git", return_value=""), \
+                mock.patch("cuhkvoting.cli._ensure_commit_identity"), \
+                mock.patch("cuhkvoting.cli.shutil.rmtree"), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            result = cli._batch_vote_papers_ssh(
+                SimpleNamespace(branch="main"), "octocat",
+                [{"paper_id": "2601.00001", "title": "Sel", "url": "u"},
+                 {"paper_id": "2601.00002", "title": "New", "url": "u"}],
+            )
+        self.assertEqual(result.skipped_selected, ["2601.00001"])
+        self.assertEqual(result.voted, ["2601.00002"])
+        self.assertEqual(result.new, ["2601.00002"])
+        self.assertFalse((papers_dir / "2601.00001.json").exists())
+        self.assertIn("already selected", err.getvalue())
+
     def test_empty_input(self) -> None:
         result = cli._batch_vote_papers_ssh(SimpleNamespace(branch="main"), "octocat", [])
         self.assertEqual((result.voted, result.new, result.outdated_msg), ([], [], None))
+
+    def test_prefer_api_when_token(self) -> None:
+        self.assertTrue(cli._prefer_api_vote("tok"))
+        self.assertFalse(cli._prefer_api_vote(None))
+        self.assertFalse(cli._prefer_api_vote(""))
 
 
 class CastVotesTests(unittest.TestCase):

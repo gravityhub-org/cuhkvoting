@@ -889,14 +889,24 @@ def _cast_votes(session: Session, cfg) -> bool:
         token = cli._get_token()
         repo_cfg = cli._resolve_repo_config(
             SimpleNamespace(repo=None, branch=os.getenv("CUHKVOTING_BRANCH", "main")))
+        use_api = cli._prefer_api_vote(token)
 
-        # Papers already selected for a past journal club must not come back.
-        selected = cli._selected_arxiv_ids(repo_cfg, token)
         metas, skipped = [], []
-        for pid in staged:
-            if cli._strip_arxiv_version(pid) in selected:
-                skipped.append(pid)
-            else:
+        # Cheap API skip-list only; SSH folds JC filtering into the vote checkout.
+        if use_api:
+            selected = cli._selected_arxiv_ids(repo_cfg, token)
+            for pid in staged:
+                if cli._strip_arxiv_version(pid) in selected:
+                    skipped.append(pid)
+                else:
+                    entry = entry_by_id.get(pid, {})
+                    metas.append({
+                        "paper_id": pid,
+                        "title": " ".join(str(entry.get("title", "")).split()),
+                        "url": entry.get("url") or f"{cli.ARXIV_ABS}{pid}",
+                    })
+        else:
+            for pid in staged:
                 entry = entry_by_id.get(pid, {})
                 metas.append({
                     "paper_id": pid,
@@ -907,17 +917,17 @@ def _cast_votes(session: Session, cfg) -> bool:
             session.warnings.append(f"Skipping {pid}: already selected for a past journal club.")
             session.session_votes.append(
                 {"id": pid, "title": session.title_of(pid), "status": "skipped"})
-        if not metas:
+        if use_api and not metas:
             session.voting = []  # selected papers can never be voted; unstage them
             session.feedback = "Nothing to vote for (all staged papers were already selected)"
             return True
 
         user = cli._resolve_user(token)
         cli._warn_if_display_name_changed(cfg.display_name)
-        if cli._has_github_ssh_access():
-            result = cli._batch_vote_papers_ssh(repo_cfg, user, metas, cfg.display_name)
-        elif token:
+        if use_api:
             result = cli._batch_vote_papers_api(repo_cfg, token, user, metas, cfg.display_name)
+        elif cli._has_github_ssh_access():
+            result = cli._batch_vote_papers_ssh(repo_cfg, user, metas, cfg.display_name)
         else:
             raise SystemExit(
                 "Voting needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure SSH key.\n\n"
@@ -937,6 +947,15 @@ def _cast_votes(session: Session, cfg) -> bool:
     except (RuntimeError, SystemExit) as exc:
         session.warnings.append(f"Vote failed: {exc}")
         return False
+
+    for pid in result.skipped_selected:
+        session.warnings.append(f"Skipping {pid}: already selected for a past journal club.")
+        session.session_votes.append(
+            {"id": pid, "title": session.title_of(pid), "status": "skipped"})
+    if not result.voted and result.skipped_selected:
+        session.voting = []
+        session.feedback = "Nothing to vote for (all staged papers were already selected)"
+        return True
 
     duplicates = 0
     for pid in result.voted:

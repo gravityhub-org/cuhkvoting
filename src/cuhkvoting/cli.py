@@ -22,7 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NoReturn
@@ -619,11 +619,43 @@ def _save_meta(cfg: RepoConfig, token: str | None, user: str, body: dict, sha: s
 def _selected_arxiv_ids(cfg: RepoConfig, token: str | None) -> set[str]:
     """Canonical arXiv ids already recorded as journal-club selections."""
     records, _ = _load_jc_records(cfg, token)
+    return _selected_ids_from_records(records)
+
+
+def _selected_ids_from_records(records: list[dict]) -> set[str]:
     return {
         _strip_arxiv_version(str(r.get("arxiv_id", "")))
         for r in records
         if r.get("arxiv_id")
     }
+
+
+def _selected_ids_from_checkout(clone_dir: str) -> set[str]:
+    """Read JC skip-list from an existing checkout (no extra clone)."""
+    p = Path(clone_dir) / JC_RECORD_PATH
+    if not p.exists():
+        return set()
+    try:
+        body = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    records = body.get("records", []) if isinstance(body, dict) else []
+    return _selected_ids_from_records(records if isinstance(records, list) else [])
+
+
+def _prefer_api_vote(token: str | None) -> bool:
+    """Prefer GitHub API when a token exists; SSH clone is the fallback."""
+    return bool(token)
+
+
+def _echo_skip_selected(arxiv_id: str) -> None:
+    typer.echo(
+        typer.style(
+            f"Skipping {arxiv_id}: already selected for a past journal club.",
+            fg=typer.colors.YELLOW,
+        ),
+        err=True,
+    )
 
 
 def _list_papers_via_graphql(cfg: RepoConfig, token: str) -> list[dict]:
@@ -2395,6 +2427,7 @@ class VoteResult:
     voted: list[str]           # every processed paper_id, including already-voted
     new: list[str]             # only the paper_ids whose vote is genuinely new
     outdated_msg: str | None   # client out-of-date notice; None when current
+    skipped_selected: list[str] = field(default_factory=list)  # JC-selected, not voted
 
 
 def _new_paper_record(paper_id: str, meta: dict) -> dict:
@@ -2437,21 +2470,31 @@ def _batch_vote_papers_ssh(
     user: str,
     papers: list[dict],
     display_name: str = "",
+    *,
+    dry_run: bool = False,
 ) -> VoteResult:
     """Vote for multiple papers in a single clone/commit/push cycle.
 
     Each dict in `papers` must have: paper_id, title, url.
+    JC-selected papers are skipped using the same checkout (no extra clone).
+    `dry_run=True` clones and stages locally but skips commit/push.
     """
     if not papers:
         return VoteResult([], [], None)
     voted: list[str] = []
     new_votes: list[str] = []
+    skipped_selected: list[str] = []
     outdated_msg: str | None = None
     with _repo_checkout(cfg) as clone_dir:
+        selected = _selected_ids_from_checkout(clone_dir)
         papers_dir = Path(clone_dir) / "papers"
         papers_dir.mkdir(parents=True, exist_ok=True)
         for p in papers:
             paper_id = _strip_arxiv_version(p["paper_id"])
+            if paper_id in selected:
+                _echo_skip_selected(paper_id)
+                skipped_selected.append(paper_id)
+                continue
             paper_file = papers_dir / f"{_safe_filename(paper_id)}.json"
             # No individual API GET — files are read directly from the local checkout,
             # preserving any existing votes from other users without extra round-trips.
@@ -2494,16 +2537,22 @@ def _batch_vote_papers_ssh(
             meta_changed = new_meta is not None
             if meta_changed:
                 meta_file.write_text(json.dumps(new_meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-            _ensure_commit_identity(clone_dir, user)
-            if new_votes:
-                _run_git(["add", "papers/"], cwd=clone_dir)
-            if dn_changed:
-                _run_git(["add", DISPLAY_NAMES_PATH], cwd=clone_dir)
-            if meta_changed:
-                _run_git(["add", META_PATH], cwd=clone_dir)
-            _run_git(["commit", "-m", _vote_commit_message(user, new_votes)], cwd=clone_dir)
-            _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
-    return VoteResult(voted, new_votes, outdated_msg)
+            if dry_run:
+                print(
+                    f"dry-run: would commit {_vote_commit_message(user, new_votes)} "
+                    f"({len(new_votes)} new vote(s))"
+                )
+            else:
+                _ensure_commit_identity(clone_dir, user)
+                if new_votes:
+                    _run_git(["add", "papers/"], cwd=clone_dir)
+                if dn_changed:
+                    _run_git(["add", DISPLAY_NAMES_PATH], cwd=clone_dir)
+                if meta_changed:
+                    _run_git(["add", META_PATH], cwd=clone_dir)
+                _run_git(["commit", "-m", _vote_commit_message(user, new_votes)], cwd=clone_dir)
+                _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
+    return VoteResult(voted, new_votes, outdated_msg, skipped_selected)
 
 
 def _git_batch_commit(
@@ -2561,18 +2610,22 @@ def _batch_vote_papers_api(
     user: str,
     papers: list[dict],
     display_name: str = "",
+    *,
+    dry_run: bool = False,
 ) -> VoteResult:
     """Vote for multiple papers in a single Git commit via the GitHub Git Data API.
 
     Each dict in `papers` must have: paper_id, title, url.
     Reduces API calls from 2N sequential to N parallel blob POSTs + 5 overhead calls.
+    JC-selected papers are skipped using the same GraphQL round-trip.
+    `dry_run=True` reads and plans the commit but does not write.
     """
     if not papers:
         return VoteResult([], [], None)
 
     base_url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}"
     json_headers = {**_github_headers(token), "Content-Type": "application/json"}
-    # Step 1: fetch all needed paper files + display_names.json in one GraphQL request
+    # Step 1: fetch all needed paper files + display_names + JC records + meta in one GraphQL request
     aliases: list[str] = []
     alias_map: dict[str, tuple[str, str, dict]] = {}  # alias -> (paper_id, path, input_dict)
     for i, p in enumerate(papers):
@@ -2589,6 +2642,9 @@ def _batch_vote_papers_api(
     aliases.append(
         f'meta: object(expression: "{cfg.branch}:{META_PATH}") {{ ... on Blob {{ text }} }}'
     )
+    aliases.append(
+        f'jc: object(expression: "{cfg.branch}:{JC_RECORD_PATH}") {{ ... on Blob {{ text }} }}'
+    )
 
     query = '{ repository(owner: "%s", name: "%s") { %s } }' % (
         cfg.owner, cfg.repo, " ".join(aliases)
@@ -2603,12 +2659,26 @@ def _batch_vote_papers_api(
         gql_data = json.loads(resp.read().decode("utf-8"))
 
     repo_node = ((gql_data.get("data") or {}).get("repository") or {})
+    jc_text = (repo_node.get("jc") or {}).get("text")
+    selected: set[str] = set()
+    if jc_text:
+        try:
+            body = json.loads(jc_text)
+            recs = body.get("records", []) if isinstance(body, dict) else []
+            selected = _selected_ids_from_records(recs if isinstance(recs, list) else [])
+        except Exception:
+            pass
 
     # Step 2: apply votes to each paper dict
     updates: list[tuple[str, str, dict]] = []  # (path, paper_id, updated_paper)
     voted: list[str] = []
+    skipped_selected: list[str] = []
 
     for alias, (paper_id, path, p) in alias_map.items():
+        if paper_id in selected:
+            _echo_skip_selected(paper_id)
+            skipped_selected.append(paper_id)
+            continue
         text = (repo_node.get(alias) or {}).get("text")
         if text:
             try:
@@ -2642,13 +2712,21 @@ def _batch_vote_papers_api(
     _warn_if_client_outdated(meta_doc)
 
     if not updates:
-        return VoteResult(voted, [], outdated_msg)
+        return VoteResult(voted, [], outdated_msg, skipped_selected)
 
     # Ride the existing commit only — appended after the empty-updates guard so a
     # bump can never manufacture a standalone commit.
     new_meta = _bump_meta_client_version(meta_doc, user)
     if new_meta is not None:
         updates.append((META_PATH, "__meta__", new_meta))
+
+    new_ids = [pid for _, pid, _ in updates if pid not in ("__dn__", "__meta__")]
+    if dry_run:
+        print(
+            f"dry-run: would commit {_vote_commit_message(user, new_ids)} "
+            f"({len(new_ids)} new vote(s), {len(updates)} file(s))"
+        )
+        return VoteResult(voted, new_ids, outdated_msg, skipped_selected)
 
     # Step 3: POST blobs concurrently (one per updated file)
     def _post_blob(path_paper: tuple[str, str, dict]) -> tuple[str, str]:
@@ -2667,14 +2745,13 @@ def _batch_vote_papers_api(
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(updates))) as ex:
         blob_results = list(ex.map(_post_blob, updates))
 
-    new_ids = [pid for _, pid, _ in updates if pid not in ("__dn__", "__meta__")]
     commit_msg = _vote_commit_message(user, new_ids)
     tree_entries = [
         {"path": path, "mode": "100644", "type": "blob", "sha": blob_sha}
         for path, blob_sha in blob_results
     ]
     _git_batch_commit(base_url, json_headers, token, cfg.branch, tree_entries, commit_msg)
-    return VoteResult(voted, new_ids, outdated_msg)
+    return VoteResult(voted, new_ids, outdated_msg, skipped_selected)
 
 
 def _vote_paper_with_metadata(
@@ -3150,26 +3227,23 @@ def vote_command(
     cfg = _load_config()
     token = _get_token()
     repo_cfg = _resolve_repo_config(SimpleNamespace(repo=repo, branch=branch))
+    use_api = _prefer_api_vote(token)
 
-    # Drop papers already selected for a past journal club — they should not come back.
-    selected = _selected_arxiv_ids(repo_cfg, token)
-    if selected:
-        kept = []
-        for arxiv_id, title, idx in resolved:
-            if _strip_arxiv_version(arxiv_id) in selected:
-                typer.echo(
-                    typer.style(
-                        f"Skipping {arxiv_id}: already selected for a past journal club.",
-                        fg=typer.colors.YELLOW,
-                    ),
-                    err=True,
-                )
-            else:
-                kept.append((arxiv_id, title, idx))
-        resolved = kept
-    if not resolved:
-        typer.echo("Nothing to vote for (all given papers were already selected).", err=True)
-        raise typer.Exit(code=0)
+    # Cheap API skip-list only. SSH path folds the JC check into the vote checkout
+    # so we do not pay an extra clone before the real write.
+    if use_api:
+        selected = _selected_arxiv_ids(repo_cfg, token)
+        if selected:
+            kept = []
+            for arxiv_id, title, idx in resolved:
+                if _strip_arxiv_version(arxiv_id) in selected:
+                    _echo_skip_selected(arxiv_id)
+                else:
+                    kept.append((arxiv_id, title, idx))
+            resolved = kept
+        if not resolved:
+            typer.echo("Nothing to vote for (all given papers were already selected).", err=True)
+            raise typer.Exit(code=0)
 
     has_index = any(idx is not None for _, _, idx in resolved)
     if has_index and cfg.confirm_by_number:
@@ -3194,17 +3268,20 @@ def vote_command(
         raise typer.Exit(code=1)
 
     try:
-        if _has_github_ssh_access():
-            # One clone → write all files → single commit/push
-            _batch_vote_papers_ssh(repo_cfg, user, papers_meta, display_name)
-        elif token:
-            # One GraphQL read (per file) → parallel blob POSTs → single commit
-            _batch_vote_papers_api(repo_cfg, token, user, papers_meta, display_name)
+        if use_api:
+            # GraphQL read → parallel blob POSTs → single commit
+            result = _batch_vote_papers_api(repo_cfg, token, user, papers_meta, display_name)
+        elif _has_github_ssh_access():
+            # One clone → JC filter + write all files → single commit/push
+            result = _batch_vote_papers_ssh(repo_cfg, user, papers_meta, display_name)
         else:
             raise SystemExit(f"Voting needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure SSH key.\n\n{_ssh_setup_instructions()}")
     except RuntimeError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1)
+    if not result.voted and result.skipped_selected:
+        typer.echo("Nothing to vote for (all given papers were already selected).", err=True)
+        raise typer.Exit(code=0)
     # Nonzero when some ids were skipped as typos, so the mistake is visible in $?.
     raise typer.Exit(code=1 if skipped else 0)
 

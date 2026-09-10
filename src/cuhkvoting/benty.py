@@ -459,9 +459,9 @@ def sync(
     to_add_benty = sorted(cuhk_voted_ids - synced_ids)  # any arXiv paper is voteable on Benty
 
     # Drop papers already selected for a past journal club — re-voting them via the
-    # importer would resurrect a paper that was deliberately retired. Read the records
-    # once and keep the set in memory for the rest of the sync.
-    if to_add_cuhk:
+    # importer would resurrect a paper that was deliberately retired. With a token this
+    # is a cheap API read; SSH-only defers to the vote checkout (no extra clone here).
+    if to_add_cuhk and gh_token:
         owner, repo_name = DEFAULT_REPO.split("/", 1)
         sync_repo_cfg = RepoConfig(owner=owner, repo=repo_name, branch=os.getenv("CUHKVOTING_BRANCH", "main"))
         selected = _selected_arxiv_ids(sync_repo_cfg, gh_token)
@@ -550,17 +550,17 @@ def sync(
         vote_id_by_arxiv = {p["arxiv_id"]: p.get("vote_id") for p in to_add_cuhk}
         title_by_arxiv   = {p["arxiv_id"]: p.get("title") or "" for p in to_add_cuhk}
         voted_ids: list[str] = []
-        if _has_github_ssh_access():
-            try:
-                voted_ids = _batch_vote_papers_ssh(repo_cfg, cuhk_user, papers_meta, display_name).voted
-            except Exception as exc:
-                typer.echo(f"Batch SSH vote failed: {exc}", err=True)
-                ok = False
-        elif gh_token and len(to_add_cuhk) > 1:
+        if gh_token:
             try:
                 voted_ids = _batch_vote_papers_api(repo_cfg, gh_token, cuhk_user, papers_meta, display_name).voted
             except Exception as exc:
                 typer.echo(f"Batch API vote failed: {exc}", err=True)
+                ok = False
+        elif _has_github_ssh_access():
+            try:
+                voted_ids = _batch_vote_papers_ssh(repo_cfg, cuhk_user, papers_meta, display_name).voted
+            except Exception as exc:
+                typer.echo(f"Batch SSH vote failed: {exc}", err=True)
                 ok = False
         else:
             for p in to_add_cuhk:
