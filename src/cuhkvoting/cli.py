@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -41,6 +42,14 @@ ARXIV_HTTP_TIMEOUT = 15
 ARXIV_RETRY_DELAYS = (2, 5, 10)
 ARXIV_QUERY_MAX_SECONDS = 60
 ARXIV_FOUNDING_DATE = dt.date(1991, 8, 14)
+# urlopen may raise these raw (RemoteDisconnected, SSLEOFError) or wrap them in URLError.
+_TRANSIENT_NETWORK_ERRORS = (
+    urllib.error.URLError,
+    ConnectionError,
+    TimeoutError,
+    http.client.IncompleteRead,
+    ssl.SSLError,
+)
 INSPIRE_API = "https://inspirehep.net/api/literature"
 INSPIRE_ARXIV_RECORD = "https://inspirehep.net/api/arxiv"
 INSPIRE_HTTP_TIMEOUT = 15
@@ -91,8 +100,8 @@ class TitleUnresolved(Exception):
 
     Distinct from a network failure: this means arXiv answered and the id is absent,
     so callers can skip just this paper. Network errors keep their native types
-    (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead)
-    and mean "arXiv unreachable" — voting must not block on those.
+    (_TRANSIENT_NETWORK_ERRORS) and mean "arXiv unreachable" — voting must not block
+    on those.
     """
 
 
@@ -697,10 +706,13 @@ def _list_papers_via_api(cfg: RepoConfig, token: str | None) -> list[dict]:
     if token:
         try:
             return _list_papers_via_graphql(cfg, token)
-        except (urllib.error.HTTPError, urllib.error.URLError,
-                json.JSONDecodeError, KeyError, RuntimeError):
+        except (*_TRANSIENT_NETWORK_ERRORS, json.JSONDecodeError, KeyError, RuntimeError):
+            # GraphQL often dies as RemoteDisconnected (ConnectionError), which is not a
+            # URLError — previously that bubbled to the CLI as a fake "arXiv closed" error.
             pass
-    if not token and _has_github_ssh_access():
+    # Prefer SSH clone over the slow recursive-tree + per-file REST fallback, including
+    # when a token exists but GraphQL just failed.
+    if _has_github_ssh_access():
         return _list_papers_via_git_clone(cfg)
     url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/git/trees/{cfg.branch}?recursive=1"
     try:
@@ -788,7 +800,7 @@ def _arxiv_query(params: dict[str, str], *, delays: tuple[int, ...] = ARXIV_RETR
                 timeout=ARXIV_HTTP_TIMEOUT,
             )
             break
-        except (ConnectionError, TimeoutError, urllib.error.URLError, http.client.IncompleteRead) as e:
+        except _TRANSIENT_NETWORK_ERRORS as e:
             last_error = e
             _retry_label = _arxiv_retry_label(e)
             code = getattr(e, "code", None)
@@ -958,7 +970,7 @@ def _inspire_query_retry(query: str, limit: int) -> list[dict[str, str]]:
                     continue
                 parsed.append(entry)
             return parsed
-        except (ConnectionError, TimeoutError, urllib.error.URLError, http.client.IncompleteRead) as e:
+        except _TRANSIENT_NETWORK_ERRORS as e:
             last_error = e
             _retry_label = _inspire_retry_label(e)
             code = getattr(e, "code", None)
@@ -1015,7 +1027,7 @@ def _fetch_entries(categories: list[str], start: dt.date, end: dt.date, limit: i
             },
             delays=(),
         )
-    except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead):
+    except _TRANSIENT_NETWORK_ERRORS:
         # INSPIRE stores arXiv categories in arxiv_eprints.categories and dates in earliest_date
         # (day-granular). Fallback only — INSPIRE indexing lags arXiv for the newest papers.
         _notify_inspire_fallback()
@@ -1440,7 +1452,7 @@ def _validate_arxiv_entry(paper_id: str) -> dict:
     # for brand-new ids. arXiv reachable-but-empty stays a hard "not found" (typo guard).
     try:
         entries = _arxiv_query({"search_query": f"id:{paper_id}", "start": "0", "max_results": "1"}, delays=())
-    except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead):
+    except _TRANSIENT_NETWORK_ERRORS:
         _notify_inspire_fallback()
         try:
             entry = _inspire_get_by_arxiv_id(paper_id)
@@ -1566,7 +1578,7 @@ def _resolve_last_n_window(days: int, categories: list[str], max_age_seconds: in
         return list(data.get("entries", []))
     try:
         entries = _fetch_lastdays_entries(days, categories)
-    except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead) as exc:
+    except _TRANSIENT_NETWORK_ERRORS as exc:
         if data and data.get("entries"):
             typer.echo(
                 typer.style(
@@ -1658,7 +1670,7 @@ def _resolve_batch_metadata(
                 err=True,
             )
             skipped.append(arxiv_id)
-        except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead):
+        except _TRANSIENT_NETWORK_ERRORS:
             clean_id = _strip_arxiv_version(arxiv_id)
             typer.echo(
                 typer.style(
@@ -1712,7 +1724,7 @@ def _backfill_paper_metadata(paper: dict) -> list[str]:
         if needs_title:
             reasons.append(f"title backfill failed, no such arXiv id ({paper_id})")
         return reasons
-    except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead):
+    except _TRANSIENT_NETWORK_ERRORS:
         reasons.append(f"metadata backfill skipped, arXiv unreachable ({paper_id})")
         return reasons
     before = (paper.get("title"), paper.get("abstract"), paper.get("url"))
@@ -1758,7 +1770,7 @@ def _resolve_cache(
 
     try:
         entries = fetch_fn(categories)
-    except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead) as exc:
+    except _TRANSIENT_NETWORK_ERRORS as exc:
         if data is not None and data.get("entries"):
             age = _format_age(dt.datetime.now(dt.timezone.utc) - fetched_at) if fetched_at else "unknown age"
             typer.echo(
@@ -2769,7 +2781,7 @@ def _vote_paper_with_metadata(
     if not (title or "").strip():
         try:
             meta = _resolve_vote_metadata(paper_id)
-        except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead):
+        except _TRANSIENT_NETWORK_ERRORS:
             # arXiv unreachable — vote with the (empty) title we have; sanitize backfills.
             pass
     if paper is None:
@@ -3035,19 +3047,13 @@ def _invoke_cmd(func, **kwargs: object) -> int:
     except urllib.error.URLError as e:
         typer.echo(f"Network error: {e.reason}", err=True)
         return 1
-    except ConnectionError as e:
+    except (ConnectionError, TimeoutError, http.client.IncompleteRead, ssl.SSLError) as e:
+        # Do not blame arXiv: GitHub GraphQL/REST can raise the same ConnectionError
+        # (RemoteDisconnected) on flaky links; browse commands may still use --max-age.
         typer.echo(
-            f"arXiv closed the connection ({e}). "
-            "This is usually a temporary rate limit — retry in a moment, "
-            "or use --max-age to serve results from the local cache.",
-            err=True,
-        )
-        return 1
-    except (TimeoutError, http.client.IncompleteRead) as e:
-        typer.echo(
-            f"arXiv request failed ({type(e).__name__}: {e}). "
-            "This is usually a temporary issue — retry in a moment, "
-            "or use --max-age to serve results from the local cache.",
+            f"Network connection failed ({type(e).__name__}: {e}). "
+            "This is usually temporary — retry in a moment. "
+            "For browse commands, --max-age can serve results from the local cache.",
             err=True,
         )
         return 1
@@ -3483,7 +3489,7 @@ def admin_sanitize(
                     meta = _resolve_vote_metadata(canon)
                 except TitleUnresolved:
                     reasons.append(f"title backfill failed ({canon})")
-                except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead):
+                except _TRANSIENT_NETWORK_ERRORS:
                     reasons.append(f"title backfill skipped, arXiv unreachable ({canon})")
                 else:
                     new_title = meta.get("title", "")
