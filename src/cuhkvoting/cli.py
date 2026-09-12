@@ -58,7 +58,7 @@ INSPIRE_HTTP_TIMEOUT = 15
 INSPIRE_RETRY_DELAYS = (1, 2, 5)
 INSPIRE_QUERY_MAX_SECONDS = 30
 DEFAULT_REPO = "gravityhub-org/cuhkvoting-records"
-VOTE_EXPIRY_DAYS = 183
+VOTE_EXPIRY_DAYS = 30
 JC_RECORD_PATH = "papers/journal_club_records.json"
 def _user_config_dir() -> Path:
     if sys.platform == "win32":
