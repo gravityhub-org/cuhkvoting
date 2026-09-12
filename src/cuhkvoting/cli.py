@@ -8,6 +8,7 @@ import datetime as dt
 import email.utils
 import fnmatch
 import importlib.metadata
+import io
 import json
 import os
 import re
@@ -15,6 +16,7 @@ import shutil
 import ssl
 import subprocess
 import sys
+import tarfile
 import tempfile
 import textwrap
 import time
@@ -96,11 +98,11 @@ DEFAULT_HIGHLIGHT_GLYPH = "★"
 
 
 class TitleUnresolved(Exception):
-    """A paper's title could not be resolved because arXiv has no such id (typo guard).
+    """A paper's title could not be resolved because INSPIRE has no such arXiv id (typo guard).
 
-    Distinct from a network failure: this means arXiv answered and the id is absent,
+    Distinct from a network failure: this means INSPIRE answered and the id is absent,
     so callers can skip just this paper. Network errors keep their native types
-    (_TRANSIENT_NETWORK_ERRORS) and mean "arXiv unreachable" — voting must not block
+    (_TRANSIENT_NETWORK_ERRORS) and mean "metadata unreachable" — voting must not block
     on those.
     """
 
@@ -702,8 +704,45 @@ def _list_papers_via_graphql(cfg: RepoConfig, token: str) -> list[dict]:
     return papers
 
 
+def _list_papers_via_tarball(cfg: RepoConfig, token: str) -> list[dict]:
+    """Download the branch as a tarball and parse ``papers/*.json`` locally.
+
+    Much faster than GraphQL nested blob resolution once the repo has hundreds of
+    paper files (~1s vs multi-second GraphQL for ~900 blobs).
+    """
+    url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/tarball/{urllib.parse.quote(cfg.branch)}"
+    req = urllib.request.Request(url, headers=_github_headers(token))
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        payload = resp.read()
+    papers: list[dict] = []
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as tf:
+        for member in tf.getmembers():
+            if not member.isfile():
+                continue
+            # Paths look like ``<repo>-<sha>/papers/<id>.json``.
+            parts = member.name.split("/")
+            if len(parts) < 3 or parts[1] != "papers" or not parts[-1].endswith(".json"):
+                continue
+            if parts[-1] == "journal_club_records.json":
+                continue
+            handle = tf.extractfile(member)
+            if handle is None:
+                continue
+            try:
+                paper = json.loads(handle.read().decode("utf-8"))
+            except Exception:
+                continue
+            if isinstance(paper, dict):
+                papers.append(paper)
+    return papers
+
+
 def _list_papers_via_api(cfg: RepoConfig, token: str | None) -> list[dict]:
     if token:
+        try:
+            return _list_papers_via_tarball(cfg, token)
+        except (*_TRANSIENT_NETWORK_ERRORS, tarfile.TarError, json.JSONDecodeError, KeyError, RuntimeError):
+            pass
         try:
             return _list_papers_via_graphql(cfg, token)
         except (*_TRANSIENT_NETWORK_ERRORS, json.JSONDecodeError, KeyError, RuntimeError):
@@ -711,7 +750,7 @@ def _list_papers_via_api(cfg: RepoConfig, token: str | None) -> list[dict]:
             # URLError — previously that bubbled to the CLI as a fake "arXiv closed" error.
             pass
     # Prefer SSH clone over the slow recursive-tree + per-file REST fallback, including
-    # when a token exists but GraphQL just failed.
+    # when a token exists but the API listing paths just failed.
     if _has_github_ssh_access():
         return _list_papers_via_git_clone(cfg)
     url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}/git/trees/{cfg.branch}?recursive=1"
@@ -770,80 +809,16 @@ def _arxiv_retry_label(exc: BaseException) -> str:
 
 
 def _arxiv_query(params: dict[str, str], *, delays: tuple[int, ...] = ARXIV_RETRY_DELAYS) -> list[dict[str, str]]:
-    url = f"{ARXIV_API}?{urllib.parse.urlencode(params)}"
-    max_attempts = len(delays)
-    deadline = time.monotonic() + ARXIV_QUERY_MAX_SECONDS
-    _retry_label = "arXiv error"
-    next_delay: int | None = None
-    last_error: BaseException | None = None
-    xml_str: str | None = None
+    """Disabled: do not call the arXiv API from CUHK (shared egress rate limits).
 
-    for attempt in range(max_attempts + 1):
-        if attempt > 0:
-            base_delay = next_delay if next_delay is not None else delays[attempt - 1]
-            sleep_for = min(base_delay, max(0, int(deadline - time.monotonic())))
-            if sleep_for <= 0:
-                break
-            for remaining in range(sleep_for, 0, -1):
-                sys.stderr.write(
-                    f"\r{_retry_label} (attempt {attempt}/{max_attempts}), retrying in {remaining}s… "
-                )
-                sys.stderr.flush()
-                time.sleep(1)
-            sys.stderr.write("\r" + " " * 70 + "\r")
-            sys.stderr.flush()
-            next_delay = None
-        try:
-            xml_str = _http_text(
-                url,
-                headers={"User-Agent": USER_AGENT},
-                timeout=ARXIV_HTTP_TIMEOUT,
-            )
-            break
-        except _TRANSIENT_NETWORK_ERRORS as e:
-            last_error = e
-            _retry_label = _arxiv_retry_label(e)
-            code = getattr(e, "code", None)
-            if attempt >= max_attempts or time.monotonic() >= deadline:
-                break
-            if code is not None and code not in (429, 503):
-                break
-            if code in (429, 503):
-                next_delay = _parse_retry_after(getattr(e, "headers", None))
+    Paper metadata must go through INSPIRE-HEP helpers instead.
+    """
+    raise RuntimeError(
+        "arXiv API is disabled; use INSPIRE-HEP (_inspire_query_retry / "
+        "_inspire_get_by_arxiv_id) instead"
+    )
 
-    if xml_str is None:
-        # Exhausted/non-retryable: re-raise the original network error (not SystemExit) so
-        # callers' INSPIRE and stale-cache fallbacks (which catch the URLError family) trigger.
-        raise last_error if last_error is not None else RuntimeError("arXiv query failed")
 
-    root = ET.fromstring(xml_str)
-    ns = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
-    entries: list[dict[str, str]] = []
-    for ent in root.findall("atom:entry", ns):
-        entry_id = (ent.findtext("atom:id", "", ns) or "").strip()
-        title = " ".join((ent.findtext("atom:title", "", ns) or "").split())
-        summary = " ".join((ent.findtext("atom:summary", "", ns) or "").split())
-        authors: list[str] = []
-        for author in ent.findall("atom:author", ns):
-            full_name = " ".join((author.findtext("atom:name", "", ns) or "").split())
-            if full_name:
-                authors.append(full_name)
-        arxiv_id = _strip_arxiv_version(entry_id.rsplit("/", 1)[-1])
-        published = (ent.findtext("atom:published", "", ns) or "").strip()
-        primary_cat_el = ent.find("arxiv:primary_category", ns)
-        primary_category = primary_cat_el.get("term", "") if primary_cat_el is not None else ""
-        entries.append(
-            {
-                "id": arxiv_id,
-                "title": title,
-                "abstract": summary,
-                "url": f"{ARXIV_ABS}{arxiv_id}",
-                "authors": authors,
-                "published": published,
-                "primary_category": primary_category,
-            }
-        )
-    return entries
 
 
 def _first_inspire_value(items: object, key: str) -> str:
@@ -1000,40 +975,17 @@ def _inspire_get_by_arxiv_id(paper_id: str) -> dict | None:
 
 
 def _notify_inspire_fallback() -> None:
-    """One-line notice that arXiv is unreachable and INSPIRE-HEP is being used instead."""
-    typer.echo(
-        typer.style("Note: arXiv unavailable — falling back to INSPIRE-HEP.", fg=typer.colors.YELLOW),
-        err=True,
-    )
+    """Deprecated no-op: paper metadata is INSPIRE-only (no arXiv API at CUHK)."""
+    return
 
 
 def _fetch_entries(categories: list[str], start: dt.date, end: dt.date, limit: int) -> list[dict]:
-    # arXiv is primary; INSPIRE is the fallback when arXiv is unreachable. The arXiv attempt
-    # is single and timer-less (delays=()), so the failover to INSPIRE is invisible (no retry
-    # countdown). If INSPIRE also fails it re-raises → caller's stale-cache fallback handles it.
-    start_dt = dt.datetime.combine(start, dt.time.min)
-    end_dt = dt.datetime.combine(end, dt.time.max).replace(second=0, microsecond=0)
-    try:
-        return _arxiv_query(
-            {
-                "search_query": (
-                    f"{_build_cat_query(categories)} AND "
-                    f"submittedDate:[{start_dt.strftime('%Y%m%d%H%M')} TO {end_dt.strftime('%Y%m%d%H%M')}]"
-                ),
-                "start": "0",
-                "max_results": str(limit),
-                "sortBy": "submittedDate",
-                "sortOrder": "descending",
-            },
-            delays=(),
-        )
-    except _TRANSIENT_NETWORK_ERRORS:
-        # INSPIRE stores arXiv categories in arxiv_eprints.categories and dates in earliest_date
-        # (day-granular). Fallback only — INSPIRE indexing lags arXiv for the newest papers.
-        _notify_inspire_fallback()
-        cats_q = "(" + " or ".join(f"arxiv_eprints.categories:{c}" for c in categories) + ")"
-        q = f"{cats_q} and earliest_date:[{start.isoformat()} to {end.isoformat()}]"
-        return _inspire_query_retry(q, limit)
+    # INSPIRE-only: shared CUHK egress rate-limits arXiv when many clients hit export.arxiv.org.
+    # Categories live in arxiv_eprints.categories; dates in earliest_date (day-granular).
+    # If INSPIRE fails, re-raise so callers' stale-cache fallbacks can handle it.
+    cats_q = "(" + " or ".join(f"arxiv_eprints.categories:{c}" for c in categories) + ")"
+    q = f"{cats_q} and earliest_date:[{start.isoformat()} to {end.isoformat()}]"
+    return _inspire_query_retry(q, limit)
 
 
 def _build_inspire_title_query(keywords: list[str]) -> str:
@@ -1447,23 +1399,11 @@ def _delete_vote_paper(
 
 
 def _validate_arxiv_entry(paper_id: str) -> dict:
-    # arXiv is primary (single, timer-less attempt). INSPIRE is the fallback only when arXiv
-    # is unreachable — keeps the invisible-failover behaviour and avoids INSPIRE's indexing lag
-    # for brand-new ids. arXiv reachable-but-empty stays a hard "not found" (typo guard).
-    try:
-        entries = _arxiv_query({"search_query": f"id:{paper_id}", "start": "0", "max_results": "1"}, delays=())
-    except _TRANSIENT_NETWORK_ERRORS:
-        _notify_inspire_fallback()
-        try:
-            entry = _inspire_get_by_arxiv_id(paper_id)
-        except Exception:
-            entry = None
-        if entry:
-            return entry
-        raise  # re-raise the arXiv network error → friendly top-level handler
-    if not entries:
+    # INSPIRE-only lookup by arXiv id (no export.arxiv.org). Missing record → typo guard.
+    entry = _inspire_get_by_arxiv_id(paper_id)
+    if not entry:
         raise SystemExit(f"Could not find arXiv entry for id '{paper_id}'.")
-    return entries[0]
+    return entry
 
 
 def _with_repo_checkout(cfg: RepoConfig) -> str:
@@ -1886,7 +1826,7 @@ def _resolve_paper_ids(raw_ids: list[str]) -> list[tuple[str, str | None, int | 
 def _fetch_today_entries(categories: list[str]) -> list[dict]:
     # arXiv doesn't announce on weekends; a strict 24-hour window would return nothing
     # on Monday morning. Query a 7-day window and keep only the most recent announcement
-    # date (published field). Sourced via _fetch_entries (arXiv primary, INSPIRE fallback).
+    # date (published field). Sourced via _fetch_entries (INSPIRE-HEP only).
     end_day = dt.datetime.now(dt.timezone.utc).date()
     start_day = end_day - dt.timedelta(days=7)
     all_entries = _fetch_entries(categories, start_day, end_day, limit=1000)

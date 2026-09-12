@@ -1,0 +1,29 @@
+---
+description: Never call the arXiv API; always use INSPIRE-HEP for paper metadata
+alwaysApply: true
+---
+
+# No arXiv API (CUHK rate limits)
+
+Shared CUHK egress hits arXiv rate limits when many users run this CLI. **Do not
+query `export.arxiv.org` / the arXiv Atom API.**
+
+## Required
+
+- Fetch paper lists and validate arXiv ids via **INSPIRE-HEP only**
+  (`_inspire_query_retry`, `_inspire_get_by_arxiv_id`, `_inspire_query`).
+- Do not call `_arxiv_query`, restore arXiv-first fallbacks, or add new
+  `https://export.arxiv.org/...` requests.
+- `https://arxiv.org/abs/...` (and pdf) links in stored records / display are fine;
+  those are user-facing URLs, not API traffic.
+
+## Examples
+
+```python
+# ❌ BAD — hits arXiv API
+entries = _arxiv_query({"search_query": f"id:{paper_id}", ...})
+
+# ✅ GOOD — INSPIRE only
+entry = _inspire_get_by_arxiv_id(paper_id)
+entries = _inspire_query_retry(inspire_q, limit)
+```

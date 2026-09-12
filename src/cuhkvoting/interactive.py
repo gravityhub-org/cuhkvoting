@@ -156,9 +156,9 @@ def _strip_ansi(text: str) -> str:
 def _load_list(tokens: list[str], cfg) -> tuple:
     """Run the dispatched loader; capture warnings that cli helpers print directly.
 
-    `_resolve_cache` (stale-cache notes) and `_notify_inspire_fallback` write
-    straight to stdout/stderr; inside the TUI those lines must become sticky
-    warnings instead of corrupting the screen.
+    `_resolve_cache` (stale-cache notes) may write straight to stdout/stderr;
+    inside the TUI those lines must become sticky warnings instead of corrupting
+    the screen.
     """
     loader, args = _dispatch(tokens)
     out, err = io.StringIO(), io.StringIO()
