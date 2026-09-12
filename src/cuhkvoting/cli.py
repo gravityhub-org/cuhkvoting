@@ -1309,6 +1309,22 @@ def _prune_expired_votes(paper: dict) -> int:
     return removed
 
 
+def _days_until_expiry(votes: list[dict], *, now: dt.datetime | None = None) -> int | None:
+    """Whole days until the newest vote expires (when the paper leaves topvoted)."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    latest: dt.datetime | None = None
+    for v in votes:
+        voted_at = _parse_utc(str(v.get("voted_at", "")))
+        if voted_at is None:
+            continue
+        if latest is None or voted_at > latest:
+            latest = voted_at
+    if latest is None:
+        return None
+    expires_on = (latest + dt.timedelta(days=VOTE_EXPIRY_DAYS)).date()
+    return max(0, (expires_on - now.date()).days)
+
+
 def _resolve_user(token: str | None) -> str:
     user = os.getenv("CUHKVOTING_USER")
     if not user:
@@ -2225,6 +2241,7 @@ def _topvoted_rows_from_papers(papers: list[dict], dn_table: dict[str, str]) -> 
                 "voters": _format_voters(votes, dn_table),
                 "voter_users": _vote_user_set(votes),
                 "latest_vote_ts": _latest_vote_timestamp(votes),
+                "expires_in_days": _days_until_expiry(votes),
             }
         )
     return _diversify_topvoted_rows(rows)
@@ -2293,6 +2310,9 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
             idx_str = typer.style(f"{idx:>{w}}.", fg=typer.colors.BRIGHT_BLACK) if grey else f"{idx:>{w}}."
             n = p["votes"]
             vote_label = f"{n} vote" + ("s" if n != 1 else "")
+            days = p.get("expires_in_days")
+            if days is not None:
+                vote_label = f"{vote_label} · {days}d"
             voters_str = typer.style(f"[{p['voters']}] ⇒ {vote_label}", fg=typer.colors.CYAN)
             if has_ties:
                 print(f"{idx_str} {box} {_format_clickable_id(p['id'])}  {p['title']}  {voters_str}")

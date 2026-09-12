@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import copy
+import datetime as dt
 import unittest
 
-from cuhkvoting.cli import _latest_vote_timestamp, _topvoted_rows_from_papers
+from cuhkvoting.cli import (
+    VOTE_EXPIRY_DAYS,
+    _days_until_expiry,
+    _latest_vote_timestamp,
+    _topvoted_rows_from_papers,
+)
 
 
 def _paper(
@@ -27,6 +33,23 @@ def _paper(
 
 def _vote(user: str, voted_at: str) -> dict:
     return {"user": user, "voted_at": voted_at}
+
+
+class TestDaysUntilExpiry(unittest.TestCase):
+    def test_based_on_newest_vote(self) -> None:
+        now = dt.datetime(2030, 6, 15, tzinfo=dt.timezone.utc)
+        votes = [
+            _vote("a", "2030-05-01T00:00:00Z"),
+            _vote("b", "2030-06-01T00:00:00Z"),  # newest → expires VOTE_EXPIRY_DAYS later
+        ]
+        expected = VOTE_EXPIRY_DAYS - (now.date() - dt.date(2030, 6, 1)).days
+        self.assertEqual(_days_until_expiry(votes, now=now), expected)
+
+    def test_row_includes_expires_in_days(self) -> None:
+        papers = [_paper("5555.0001", [_vote("a", "2030-01-01T00:00:00Z")])]
+        rows = _topvoted_rows_from_papers(copy.deepcopy(papers), {})
+        self.assertIn("expires_in_days", rows[0])
+        self.assertIsInstance(rows[0]["expires_in_days"], int)
 
 
 class TestLatestVoteTimestamp(unittest.TestCase):
