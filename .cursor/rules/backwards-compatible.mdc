@@ -1,0 +1,43 @@
+---
+description: Keep the cuhkvoting package backwards-compatible with existing installs and data
+alwaysApply: true
+---
+
+# Backwards compatibility
+
+`cuhkvoting` must stay usable for older installed clients and existing on-disk /
+GitHub voting data. Prefer additive changes over breaking ones.
+
+## Required
+
+- Do not remove, rename, or change the meaning of public CLI commands, options,
+  env vars, or `project.scripts` entry points without a compatibility shim.
+- Keep stored record / voting file formats readable by older clients when
+  possible; new fields must be optional with safe defaults.
+- Prefer deprecation warnings and dual-path support over hard breaks; only drop
+  a path after an explicit major-version decision.
+- Do not raise the minimum Python version, drop optional extras, or change
+  default behavior in a way that breaks existing workflows without an opt-in.
+
+## Examples
+
+```python
+# ❌ BAD — renames a flag older scripts still pass
+@app.command()
+def vote(paper_id: str, score: int = typer.Option(..., "--rating")): ...
+
+# ✅ GOOD — keep the old flag; add new names as aliases if needed
+@app.command()
+def vote(
+    paper_id: str,
+    score: int = typer.Option(..., "--score", "--rating"),
+): ...
+```
+
+```python
+# ❌ BAD — requires a new JSON key that old clients never wrote
+threshold = meta["min_votes"]
+
+# ✅ GOOD — new keys optional
+threshold = meta.get("min_votes", DEFAULT_MIN_VOTES)
+```
