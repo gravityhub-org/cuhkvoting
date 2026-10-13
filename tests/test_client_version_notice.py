@@ -125,6 +125,37 @@ class WarnIfClientOutdatedTests(unittest.TestCase):
         self._warn({"client": {"latest_version": "0.9.0\x1b[2J"}}).assert_not_called()
 
 
+class WarnClientOutdatedFromRepoTests(unittest.TestCase):
+    def test_loads_meta_and_warns(self) -> None:
+        cfg = cli.RepoConfig(owner="o", repo="r", branch="main")
+        meta = {"client": {"latest_version": "0.9.0"}}
+        with mock.patch("cuhkvoting.cli._load_json_via_api", return_value=(meta, "sha")) as load:
+            with mock.patch("cuhkvoting.cli._warn_if_client_outdated") as warn:
+                cli._warn_client_outdated_from_repo(cfg, "tok")
+        load.assert_called_once_with(cfg, cli.META_PATH, "tok")
+        warn.assert_called_once_with(meta)
+
+    def test_swallows_fetch_errors(self) -> None:
+        cfg = cli.RepoConfig(owner="o", repo="r", branch="main")
+        with mock.patch("cuhkvoting.cli._load_json_via_api", side_effect=ConnectionError("down")):
+            with mock.patch("cuhkvoting.cli._warn_if_client_outdated") as warn:
+                cli._warn_client_outdated_from_repo(cfg, None)
+        warn.assert_not_called()
+
+    def test_topvoted_list_always_checks_meta(self) -> None:
+        args = SimpleNamespace(N=10, repo=None, branch="main")
+        cfg = cli._load_config()
+        repo_cfg = cli.RepoConfig(owner="gravityhub-org", repo="cuhkvoting-records", branch="main")
+        with mock.patch("cuhkvoting.cli._resolve_repo_config", return_value=repo_cfg), \
+             mock.patch("cuhkvoting.cli._get_token", return_value="tok"), \
+             mock.patch("cuhkvoting.cli._warn_client_outdated_from_repo") as warn, \
+             mock.patch("cuhkvoting.cli._list_papers_via_api", return_value=[]), \
+             mock.patch("cuhkvoting.cli._fetch_display_names", return_value={}):
+            data = cli._topvoted_list(args, cfg)
+        warn.assert_called_once_with(repo_cfg, "tok")
+        self.assertEqual(data.empty_msg, "No voted papers yet.")
+
+
 class ClientOutdatedMessageTests(unittest.TestCase):
     """The message builder extracted for the interactive mode's sticky warning."""
 

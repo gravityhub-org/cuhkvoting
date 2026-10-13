@@ -2023,6 +2023,16 @@ def _warn_if_client_outdated(meta_doc: dict | None) -> None:
         typer.echo(typer.style(msg, fg=typer.colors.YELLOW), err=True)
 
 
+def _warn_client_outdated_from_repo(cfg: RepoConfig, token: str | None) -> None:
+    """Fetch records-repo meta.json and warn if this client is behind. Never raises."""
+    try:
+        data, _sha = _load_json_via_api(cfg, META_PATH, token)
+    except Exception:
+        return
+    if isinstance(data, dict):
+        _warn_if_client_outdated(data)
+
+
 def _stamp_client_node(node: dict, version: str, user: str, source: str) -> None:
     """Set the client high-water-mark fields in place, preserving any unknown sub-keys.
 
@@ -2280,6 +2290,7 @@ def _topvoted_rows_from_papers(papers: list[dict], dn_table: dict[str, str]) -> 
 def _topvoted_list(args: SimpleNamespace, cfg: Config) -> ListData:
     repo_cfg = _resolve_repo_config(args)
     token = _get_token()
+    _warn_client_outdated_from_repo(repo_cfg, token)
     papers = _list_papers_via_api(repo_cfg, token)
 
     dn_table = {**_fetch_display_names(repo_cfg, token), **cfg.display_name_overrides}
@@ -3019,7 +3030,22 @@ app = typer.Typer(
     name="cuhkvoting",
     help="Minimal arXiv voting CLI backed by GitHub.",
     add_completion=True,
+    invoke_without_command=True,
 )
+
+
+@app.callback(invoke_without_command=True)
+def _root(ctx: typer.Context) -> None:
+    """Bare `cuhkvoting` is `topvoted` (and prints the upgrade note when behind)."""
+    if ctx.invoked_subcommand is not None:
+        return
+    _run_cmd(
+        cmd_topvoted,
+        N=10,
+        repo=None,
+        branch=os.getenv("CUHKVOTING_BRANCH", "main"),
+        abstract=None,
+    )
 
 
 def _invoke_cmd(func, **kwargs: object) -> int:

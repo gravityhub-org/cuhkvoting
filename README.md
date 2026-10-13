@@ -11,7 +11,7 @@ uv tool install --upgrade git+ssh://git@github.com/gravityhub-org/cuhkvoting.git
 cuhkvoting today # Lists arxiv papers today
 cuhkvoting lastweek gravitational wave # Lists last week's papers with "gravitational" and "wave" in title/abstract
 cuhkvoting last 3 # Lists papers from the last 3 days
-cuhkvoting topvoted # Shows top voted papers
+cuhkvoting topvoted # Shows top voted papers (bare `cuhkvoting` does the same)
 cuhkvoting --help # Help 
 cuhkvoting vote 2504.12345 # Vote for 2504.12345 [requires ssh key; see setup below]
 cuhkvoting vote remove 2504.12345 # Remove vote for 2504.12345
