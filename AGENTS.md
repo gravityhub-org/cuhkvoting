@@ -108,8 +108,11 @@ any other `--repo`/`CUHKVOTING_REPO`. Branch defaults to `main` (`CUHKVOTING_BRA
 
 ## Data model / records repo
 
-- `papers/<arxiv_id>.json`: `{id, title, url, abstract, votes: [{user, voted_at}]}`.
-  Votes expire after `VOTE_EXPIRY_DAYS` (183). One vote per GitHub username, enforced in CLI.
+- `papers/<arxiv_id>.json`: `{id, title, url, abstract, votes: [{user, voted_at}]}`
+  plus optional `archived` / `archived_at`. Paper-level timer: if no vote within
+  `VOTE_EXPIRY_DAYS` (30), the paper is archived (hidden from topvoted); individual
+  votes are never stripped for age. A new vote clears archive and restarts the timer.
+  One vote per GitHub username, enforced in CLI.
 - `papers/journal_club_records.json`: journal-club selection history (canonical,
   version-stripped ids; de-duplicated by `admin sanitize`).
 - `display_names.json`: shared GitHub-username -> display-name table.

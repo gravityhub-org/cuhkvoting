@@ -8,7 +8,7 @@ journal-club page and cuhkvoting records:
 - **cuhkvoting → Benty-Fields**: papers you voted for in cuhkvoting are voted
   for on Benty-Fields.
 - Votes explicitly removed in either system are removed in the other. Natural
-  30-day expiry in cuhkvoting does not propagate.
+  paper archive expiry in cuhkvoting (no votes within 30 days) does not propagate.
 
 ## Install
 

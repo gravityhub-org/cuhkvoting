@@ -280,9 +280,15 @@ def _extract_group_id(html: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 def _get_cuhk_voted_ids(user: str) -> dict[str, dict]:
-    """Return {arxiv_id: {"voted_at": str|None, "title": str|None}} for user's active votes."""
+    """Return {arxiv_id: {"voted_at": str|None, "title": str|None}} for user's votes on active papers.
+
+    A paper is active when it is not archived and has received some vote within
+    VOTE_EXPIRY_DAYS (paper-level timer). The user's own vote age alone does not
+    drop them while the paper is still active.
+    """
     from cuhkvoting.cli import (  # noqa: PLC0415
-        DEFAULT_REPO, _get_token, _list_papers_via_api, _resolve_repo_config,
+        DEFAULT_REPO, _get_token, _list_papers_via_api, _paper_is_expired,
+        _resolve_repo_config,
     )
 
     token = _get_token()
@@ -290,27 +296,18 @@ def _get_cuhk_voted_ids(user: str) -> dict[str, dict]:
     cfg = _resolve_repo_config(SimpleNamespace(repo=DEFAULT_REPO, branch=branch))
     papers = _list_papers_via_api(cfg, token)
 
-    now = dt.datetime.now(dt.timezone.utc)
-    cutoff = now - dt.timedelta(days=VOTE_EXPIRY_DAYS)
-
     result: dict[str, dict] = {}
     for paper in papers:
         raw_id = paper.get("id", "")
         arxiv_id = re.sub(r"v\d+$", "", raw_id) if raw_id else None
         if not arxiv_id:
             continue
+        if paper.get("archived") or _paper_is_expired(paper):
+            continue
         for vote in paper.get("votes", []):
             if vote.get("user") != user:
                 continue
-            voted_at_str = vote.get("voted_at")
-            if voted_at_str:
-                try:
-                    voted_at = dt.datetime.fromisoformat(voted_at_str.replace("Z", "+00:00"))
-                    if voted_at < cutoff:
-                        continue  # expired
-                except ValueError:
-                    pass
-            result[arxiv_id] = {"voted_at": voted_at_str, "title": paper.get("title")}
+            result[arxiv_id] = {"voted_at": vote.get("voted_at"), "title": paper.get("title")}
             break
 
     return result

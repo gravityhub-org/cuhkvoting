@@ -1296,22 +1296,8 @@ def _diversify_topvoted_rows(rows: list[dict]) -> list[dict]:
     return ordered
 
 
-def _prune_expired_votes(paper: dict) -> int:
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=VOTE_EXPIRY_DAYS)
-    votes = paper.get("votes", [])
-    kept = []
-    for v in votes:
-        voted_at = _parse_utc(str(v.get("voted_at", "")))
-        if voted_at and voted_at >= cutoff:
-            kept.append(v)
-    removed = len(votes) - len(kept)
-    paper["votes"] = kept
-    return removed
-
-
-def _days_until_expiry(votes: list[dict], *, now: dt.datetime | None = None) -> int | None:
-    """Whole days until the newest vote expires (when the paper leaves topvoted)."""
-    now = now or dt.datetime.now(dt.timezone.utc)
+def _newest_vote_datetime(votes: list[dict]) -> dt.datetime | None:
+    """Newest parseable voted_at among votes, or None."""
     latest: dt.datetime | None = None
     for v in votes:
         voted_at = _parse_utc(str(v.get("voted_at", "")))
@@ -1319,6 +1305,49 @@ def _days_until_expiry(votes: list[dict], *, now: dt.datetime | None = None) -> 
             continue
         if latest is None or voted_at > latest:
             latest = voted_at
+    return latest
+
+
+def _paper_is_expired(paper: dict, *, now: dt.datetime | None = None) -> bool:
+    """True when the paper has no vote within VOTE_EXPIRY_DAYS (newest vote too old)."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    latest = _newest_vote_datetime(paper.get("votes", []))
+    if latest is None:
+        return True
+    cutoff = now - dt.timedelta(days=VOTE_EXPIRY_DAYS)
+    return latest < cutoff
+
+
+def _archive_expired_paper(paper: dict, *, now: dt.datetime | None = None) -> bool:
+    """Mark paper archived if expired; never mutates votes. Returns True if newly archived."""
+    if paper.get("archived"):
+        return False
+    now = now or dt.datetime.now(dt.timezone.utc)
+    if not _paper_is_expired(paper, now=now):
+        return False
+    paper["archived"] = True
+    paper["archived_at"] = now.isoformat().replace("+00:00", "Z")
+    return True
+
+
+def _unarchive_paper(paper: dict) -> None:
+    """Clear archive fields so a new vote can restart the paper timer."""
+    paper.pop("archived", None)
+    paper.pop("archived_at", None)
+
+
+def _prune_expired_votes(paper: dict) -> int:
+    """Compat shim: archive expired papers; never strip individual votes.
+
+    Returns 1 if newly archived, else 0. Name kept for older call sites.
+    """
+    return 1 if _archive_expired_paper(paper) else 0
+
+
+def _days_until_expiry(votes: list[dict], *, now: dt.datetime | None = None) -> int | None:
+    """Whole days until the newest vote expires (when the paper leaves topvoted)."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    latest = _newest_vote_datetime(votes)
     if latest is None:
         return None
     expires_on = (latest + dt.timedelta(days=VOTE_EXPIRY_DAYS)).date()
@@ -2222,11 +2251,12 @@ def cmd_last(args: SimpleNamespace) -> int:
 
 
 def _topvoted_rows_from_papers(papers: list[dict], dn_table: dict[str, str]) -> list[dict]:
-    """Build sorted rows for `topvoted`. Mutates each paper via `_prune_expired_votes`."""
+    """Build sorted rows for `topvoted`. Skips selected/archived/expired papers; never strips votes."""
     rows: list[dict] = []
     for paper in papers:
-        _prune_expired_votes(paper)
         if paper.get("selected"):
+            continue
+        if paper.get("archived") or _paper_is_expired(paper):
             continue
         votes = paper.get("votes", [])
         vote_count = len(votes)
@@ -2414,16 +2444,17 @@ def _new_paper_record(paper_id: str, meta: dict) -> dict:
 
 
 def _register_vote(paper: dict, paper_id: str, user: str, meta: dict) -> bool:
-    """Backfill metadata, prune expired votes, and record `user`'s vote on `paper`.
+    """Backfill metadata, unarchive if needed, and record `user`'s vote on `paper`.
 
     Returns True when a new vote was added, False when the user had already voted.
     Shared by both batch transports; the caller persists `paper` only when True.
+    Individual votes are never removed for age; a new vote restarts the paper timer.
     """
     _apply_paper_metadata(paper, meta)
-    _prune_expired_votes(paper)
     votes = paper.setdefault("votes", [])
     if any(v.get("user") == user for v in votes):
         return False
+    _unarchive_paper(paper)
     paper["id"] = paper_id
     votes.append(_make_vote_entry(user))
     return True
@@ -2754,11 +2785,11 @@ def _vote_paper_with_metadata(
         }
     else:
         _apply_paper_metadata(paper, meta)
-    _prune_expired_votes(paper)
     votes = paper.setdefault("votes", [])
     if any(v.get("user") == user for v in votes):
         print(f"Already voted: {user} -> {paper_id}")
         return 0
+    _unarchive_paper(paper)
     paper["id"] = _strip_arxiv_version(str(paper.get("id", paper_id)))
     votes.append(_make_vote_entry(user))
     _save_vote_paper(cfg, token, user, paper, sha, save_path, f"vote: {user} -> {paper['id']}")
@@ -2774,7 +2805,6 @@ def cmd_vote_remove(args: SimpleNamespace) -> int:
     paper, sha, save_path = _load_vote_paper(cfg, token, paper_id)
     if paper is None:
         raise SystemExit(f"No vote record found for '{paper_id}'.")
-    _prune_expired_votes(paper)
     votes = paper.setdefault("votes", [])
     kept = [v for v in votes if v.get("user") != user]
     if len(kept) == len(votes):
@@ -2831,8 +2861,6 @@ def cmd_select(args: SimpleNamespace) -> int:
     else:
         title = _validate_arxiv_entry(paper_id).get("title", "")
 
-    if paper:
-        _prune_expired_votes(paper)
     vote_count = len(paper.get("votes", [])) if paper else 0
     now = dt.datetime.now(dt.timezone.utc)
     year, week, _ = now.isocalendar()
@@ -3400,7 +3428,7 @@ def admin_sanitize(
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview without writing."),
 ) -> None:
-    """Normalize records, backfill missing titles, and strip legacy display_name fields."""
+    """Normalize records, backfill titles, strip legacy fields, archive expired papers."""
     args = SimpleNamespace(repo=repo, branch=branch)
     cfg = _resolve_repo_config(args)
     token = _get_token()
@@ -3422,6 +3450,8 @@ def admin_sanitize(
                 del v["display_name"]
                 reasons.append(f"legacy display_name removed ({v.get('user', '?')})")
         reasons.extend(_backfill_paper_metadata(paper))
+        if _archive_expired_paper(paper):
+            reasons.append(f"archived (no votes within {VOTE_EXPIRY_DAYS} days)")
         return reasons
 
     def _sanitize_jc_records(body: dict) -> list[str]:
@@ -3481,7 +3511,8 @@ def admin_sanitize(
         return reasons
 
     typer.echo("Sanitizing: whitespace normalization, missing title backfill, "
-               "legacy display_name removal, journal-club record de-duplication.")
+               "legacy display_name removal, journal-club record de-duplication, "
+               f"archive papers with no votes within {VOTE_EXPIRY_DAYS} days.")
 
     if _has_github_ssh_access():
         with _repo_checkout(cfg) as clone_dir:

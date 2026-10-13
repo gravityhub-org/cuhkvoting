@@ -319,4 +319,4 @@ Votes and metadata are stored as JSON files in the records repo:
 - `papers/<arxiv_id>.json` - one file per paper, one vote per GitHub username enforced by CLI
 - `papers/journal_club_records.json` - history of selected papers
 - `meta.json` - client-maintained: records the highest `cuhkvoting` version seen from a properly-installed client, so older clients get a passive "please upgrade" note. Mutated in place (never fully replaced), so it can host other keys later. Repair with `cuhkvoting admin set-version`.
-- votes expire after 30 days (~1 month)
+- papers are archived (leave topvoted) after 30 days with no new votes; individual votes are kept; a new vote restarts the timer
