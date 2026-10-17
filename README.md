@@ -106,11 +106,12 @@ cuhkvoting search gravitational wave hubble constant --limit 10
 cuhkvoting topvoted --N 10
 cuhkvoting vote 2504.12345
 cuhkvoting vote 2504.12345 2504.67890           # vote for multiple papers at once
-cuhkvoting vote remove 2504.12345
+cuhkvoting vote remove 2504.12345               # remove your vote
 
 # Vote by list index (refers to the last printed list from today/lastweek/search/topvoted/show)
 cuhkvoting vote 3
 cuhkvoting vote 1 5 2504.12345                  # mix of indices and arXiv IDs
+cuhkvoting vote remove 3                        # remove your vote for list entry 3
 
 # Show full details (title, authors, full abstract) for specific papers
 cuhkvoting show 3
@@ -137,6 +138,8 @@ cuhkvoting admin trash 2504.12345
 cuhkvoting admin sanitize                       # strip legacy fields, normalize whitespace, de-duplicate records
 cuhkvoting admin sanitize --dry-run             # preview without writing
 ```
+
+`vote remove <id>` removes only your own vote; other users' votes are left untouched. If yours was the last vote on the paper (and the paper was not selected for a journal club), the paper record is deleted. List indices work as well: `vote remove 3` refers to the last printed list.
 
 Once a paper is selected it should not come back, so the CLI guards against it: re-running `select` on an already-selected paper is a no-op with a notice, and `vote` skips any paper already selected for a past journal club. Use `select remove <id>` to reverse a selection.
 
