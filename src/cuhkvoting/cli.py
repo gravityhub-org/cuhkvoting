@@ -3145,7 +3145,7 @@ def last(
 
 @app.command("topvoted")
 def topvoted(
-    n: int = typer.Option(10, "--N", "--n", help="Number of entries to show."),
+    n: int = typer.Option(10, "--N", "--n", "-n", help="Number of entries to show."),
     repo: str | None = typer.Option(
         None,
         "--repo",

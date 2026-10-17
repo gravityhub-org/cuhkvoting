@@ -103,7 +103,7 @@ cuhkvoting search "vision language model"
 cuhkvoting search gravitational wave hubble constant --limit 10
 
 # Voting
-cuhkvoting topvoted --N 10
+cuhkvoting topvoted -n 10                       # also: --n / --N
 cuhkvoting vote 2504.12345
 cuhkvoting vote 2504.12345 2504.67890           # vote for multiple papers at once
 cuhkvoting vote remove 2504.12345               # remove your vote
