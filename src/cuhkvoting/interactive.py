@@ -18,7 +18,6 @@ import os
 import re
 import subprocess
 import sys
-import textwrap
 import urllib.error
 import webbrowser
 from dataclasses import dataclass, field
@@ -40,9 +39,10 @@ try:
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.keys import ALL_KEYS, KEY_ALIASES
     from prompt_toolkit.layout import (
-        ConditionalContainer, HSplit, Layout, VSplit, Window,
+        ConditionalContainer, Float, FloatContainer, HSplit, Layout, VSplit, Window,
     )
     from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+    from prompt_toolkit.mouse_events import MouseEventType
     from prompt_toolkit.styles import DynamicStyle, Style
     PROMPT_TOOLKIT_OK = True
 except ImportError:
@@ -158,7 +158,8 @@ def _load_list(tokens: list[str], cfg) -> tuple:
 
     `_resolve_cache` (stale-cache notes) may write straight to stdout/stderr;
     inside the TUI those lines must become sticky warnings instead of corrupting
-    the screen.
+    the screen. Returns (ListData, captured lines, loader) — the loader lets
+    `run` tell date-sorted lists from relevance-sorted ones for day grouping.
     """
     loader, args = _dispatch(tokens)
     out, err = io.StringIO(), io.StringIO()
@@ -170,7 +171,7 @@ def _load_list(tokens: list[str], cfg) -> tuple:
         for line in (out.getvalue() + err.getvalue()).splitlines()
         if line.strip()
     ]
-    return data, captured
+    return data, captured, loader
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +193,7 @@ class Session:
         self.cursor = 0                        # position within visible()
         self.voting: list[str] = []            # staged arXiv ids, in staging order
         self.ls_only = False                   # :ls filter active
+        self.group_by_day = False              # date rows + sticky header (date-sorted lists)
         self.follow = False                    # zi: selected abstract always open
         self.view = "list"                     # list | help | confirm
         self.mode = NOR
@@ -546,6 +548,7 @@ THEMES: dict[str, dict[str, str]] = {
         "warning":   "bg:ansiyellow ansiblack",
         "cursor":    "reverse",
         "index":     "",
+        "index.dim": "ansibrightblack",
         "id":        "ansibrightblue",
         "title":     "",
         "authors":   "",
@@ -553,6 +556,7 @@ THEMES: dict[str, dict[str, str]] = {
         "kw":        "ansibrightblue bold",
         "mark":      "ansigreen bold",
         "search":    "underline bold",
+        "day":       "ansibrightblack",
         "hint":      "ansibrightblack",
         "feedback":  "italic",
         "abstract":  "",
@@ -564,6 +568,7 @@ THEMES: dict[str, dict[str, str]] = {
         "warning":   "bg:#e5c07b #282c34",
         "cursor":    "bg:#3e4451 bold",
         "index":     "#5c6370",
+        "index.dim": "#4b5263",
         "id":        "#61afef",
         "title":     "#abb2bf",
         "authors":   "#5c6370",
@@ -571,6 +576,7 @@ THEMES: dict[str, dict[str, str]] = {
         "kw":        "#e5c07b bold",
         "mark":      "#98c379 bold",
         "search":    "bg:#61afef #282c34",
+        "day":       "#5c6370 bold",
         "hint":      "#5c6370",
         "feedback":  "#56b6c2 italic",
         "abstract":  "#848b98",
@@ -582,6 +588,7 @@ THEMES: dict[str, dict[str, str]] = {
         "warning":   "bg:#fabd2f #282828",
         "cursor":    "bg:#504945 bold",
         "index":     "#928374",
+        "index.dim": "#665c54",
         "id":        "#83a598",
         "title":     "#ebdbb2",
         "authors":   "#928374",
@@ -589,6 +596,7 @@ THEMES: dict[str, dict[str, str]] = {
         "kw":        "#fabd2f bold",
         "mark":      "#b8bb26 bold",
         "search":    "bg:#fe8019 #282828",
+        "day":       "#928374 bold",
         "hint":      "#928374",
         "feedback":  "#8ec07c italic",
         "abstract":  "#a89984",
@@ -600,6 +608,7 @@ THEMES: dict[str, dict[str, str]] = {
         "warning":   "bg:#f9e2af #1e1e2e",
         "cursor":    "bg:#45475a bold",
         "index":     "#6c7086",
+        "index.dim": "#585b70",
         "id":        "#89b4fa",
         "title":     "#cdd6f4",
         "authors":   "#6c7086",
@@ -607,6 +616,7 @@ THEMES: dict[str, dict[str, str]] = {
         "kw":        "#f9e2af bold",
         "mark":      "#a6e3a1 bold",
         "search":    "bg:#89b4fa #1e1e2e",
+        "day":       "#6c7086 bold",
         "hint":      "#6c7086",
         "feedback":  "#94e2d5 italic",
         "abstract":  "#9399b2",
@@ -618,6 +628,7 @@ THEMES: dict[str, dict[str, str]] = {
         "warning":   "bg:#b58900 #002b36",
         "cursor":    "bg:#073642 bold",
         "index":     "#586e75",
+        "index.dim": "#465a61",
         "id":        "#268bd2",
         "title":     "#93a1a1",
         "authors":   "#586e75",
@@ -625,6 +636,7 @@ THEMES: dict[str, dict[str, str]] = {
         "kw":        "#b58900 bold",
         "mark":      "#859900 bold",
         "search":    "bg:#268bd2 #002b36",
+        "day":       "#586e75 bold",
         "hint":      "#586e75",
         "feedback":  "#2aa198 italic",
         "abstract":  "#657b83",
@@ -636,6 +648,7 @@ THEMES: dict[str, dict[str, str]] = {
         "warning":   "bg:#ebcb8b #2e3440",
         "cursor":    "bg:#434c5e bold",
         "index":     "#4c566a",
+        "index.dim": "#434c5e",
         "id":        "#88c0d0",
         "title":     "#d8dee9",
         "authors":   "#4c566a",
@@ -643,6 +656,7 @@ THEMES: dict[str, dict[str, str]] = {
         "kw":        "#ebcb8b bold",
         "mark":      "#a3be8c bold",
         "search":    "bg:#88c0d0 #2e3440",
+        "day":       "#4c566a bold",
         "hint":      "#4c566a",
         "feedback":  "#8fbcbb italic",
         "abstract":  "#81a1c1",
@@ -735,8 +749,174 @@ def _styled_text(text: str, base: str, keywords: list[str], search_pat: str) -> 
     return frags
 
 
-def _entry_fragments(paper: Paper, session: Session, cfg) -> list:
-    """Fragments for one paper; every visual line ends with '\\n'."""
+def _emit_run(out: list, style: str, text: str) -> None:
+    """Append (style, text) to `out`, merging with the previous run when equal."""
+    if not text:
+        return
+    if out and out[-1][0] == style:
+        out[-1] = (style, out[-1][1] + text)
+    else:
+        out.append((style, text))
+
+
+def _wrap_styled(frags: list, width: int, indent: str = "",
+                 indent_style: str = "", *, indent_first: bool = False) -> list:
+    """Reflow one paragraph of styled fragments to fit `width` columns.
+
+    Words break at spaces; space runs are preserved when they stay on a line;
+    words longer than a line are hard-broken. Styles survive the re-flow.
+    Continuation lines start with `indent`, styled with `indent_style` — and so
+    does the first line when `indent_first` is set (abstracts indent fully).
+    Every produced line ends with "\\n".
+    """
+    width = max(1, int(width))
+    if len(indent) >= width:
+        indent, indent_style = "", ""
+
+    # (char, style) stream — every character, spaces included.
+    chars: list[tuple[str, str]] = [
+        (ch, style) for style, text in frags for ch in text
+    ]
+
+    # Leading spaces belong to the first line; other runs separate words.
+    lead: list[tuple[str, str]] = []
+    i = 0
+    while i < len(chars) and chars[i][0].isspace():
+        lead.append(chars[i])
+        i += 1
+    words: list[tuple[list[tuple[str, str]], list[tuple[str, str]]]] = []
+    while i < len(chars):
+        j = i
+        while j < len(chars) and not chars[j][0].isspace():
+            j += 1
+        k = j
+        while k < len(chars) and chars[k][0].isspace():
+            k += 1
+        words.append((chars[i:j], chars[j:k]))
+        i = k
+    if not words:
+        return []
+
+    out: list = []
+    buf: list[tuple[str, str]] = list(lead)   # current line (char, style), sans indent
+    used = len(buf) + (len(indent) if indent_first else 0)
+    first = True
+    has_word = False
+
+    def flush() -> None:
+        nonlocal buf, used, first, has_word
+        _emit_run(out, indent_style, indent if (indent_first or not first) else "")
+        for ch, style in buf:
+            _emit_run(out, style, ch)
+        _emit_run(out, "", "\n")
+        buf, used, has_word = [], len(indent), False
+        first = False
+
+    for idx, (word, _space) in enumerate(words):
+        sep = words[idx - 1][1] if (idx > 0 and has_word) else []
+        fresh = width - len(indent)      # capacity of any continuation line
+        # Move the whole word to a fresh line when it does not fit here but
+        # would fit there; otherwise fall through and hard-break it in place.
+        if has_word and len(word) <= fresh and used + len(sep) + len(word) > width:
+            flush()
+            sep = []
+        rest = list(word)
+        while rest:
+            if has_word and sep:
+                if used + len(sep) + 1 <= width:
+                    buf.extend(sep)
+                    used += len(sep)
+                    sep = []
+                else:
+                    flush()  # no room for the space run: wrap before the word
+                    continue
+            cap = width - used
+            if cap <= 0:
+                flush()
+                continue
+            take = min(len(rest), cap)
+            buf.extend(rest[:take])
+            used += take
+            rest = rest[take:]
+            has_word = True
+            if rest:
+                flush()
+    flush()
+    return out
+
+
+def _rank_roles(papers: list[Paper]) -> tuple[bool, dict[int, str]]:
+    """Tie-gutter roles for ranked (topvoted) rows: (has_ties, {index: role}).
+
+    Roles are single / top / mid / bottom, mirroring the plain command's
+    grouping; (False, {}) means "render plain rows" (not a ranked list, or no
+    ties among the visible papers).
+    """
+    if not papers or any("votes" not in p.entry for p in papers):
+        return False, {}
+    groups: list[list[Paper]] = []
+    for paper in papers:
+        votes = int(paper.entry.get("votes", 0))
+        if groups and int(groups[-1][0].entry.get("votes", 0)) == votes:
+            groups[-1].append(paper)
+        else:
+            groups.append([paper])
+    if not any(len(g) > 1 for g in groups):
+        return False, {}
+    roles: dict[int, str] = {}
+    for group in groups:
+        for pos, paper in enumerate(group):
+            if len(group) == 1:
+                roles[paper.index] = "single"
+            elif pos == 0:
+                roles[paper.index] = "top"
+            elif pos == len(group) - 1:
+                roles[paper.index] = "bottom"
+            else:
+                roles[paper.index] = "mid"
+    return True, roles
+
+
+def _day_of(entry: dict) -> str:
+    """Day granularity of an entry ("YYYY-MM-DD"); "" when there is none."""
+    return str(entry.get("published", ""))[:10]
+
+
+def _display_items(session: Session) -> list[tuple[str, object]]:
+    """Visible list as display rows: ("day", "YYYY-MM-DD") and ("paper", Paper).
+
+    Day rows appear only for date-sorted lists (``session.group_by_day``) that
+    span more than one day; papers without a date inherit the previous day.
+    """
+    papers = session.visible()
+    if session.group_by_day:
+        days = {_day_of(p.entry) for p in papers if _day_of(p.entry)}
+        if len(days) > 1:
+            items: list[tuple[str, object]] = []
+            prev = ""
+            for paper in papers:
+                day = _day_of(paper.entry)
+                if day and day != prev:
+                    items.append(("day", day))
+                    prev = day
+                items.append(("paper", paper))
+            return items
+    return [("paper", p) for p in papers]
+
+
+def _day_rule(day: str, width: int) -> str:
+    """Full-width dim rule introducing a day's section, e.g. ``── 2026-10-15 ───``."""
+    label = f"── {day} "
+    return label + "─" * max(0, width - len(label) - 1) + "\n"
+
+
+def _entry_fragments(paper: Paper, session: Session, cfg, width: int,
+                     role: str | None = None) -> list:
+    """Fragments for one paper, reflowed to `width`; every line ends with '\\n'.
+
+    `role` is a tie-gutter position (single/top/mid/bottom) set for topvoted
+    rows when the visible list has ties; None renders a plain row.
+    """
     e = paper.entry
     is_cur = paper is session.current()
     sel = " class:cursor" if is_cur else ""
@@ -744,61 +924,68 @@ def _entry_fragments(paper: Paper, session: Session, cfg) -> list:
     pid = str(e.get("id", ""))
     title = " ".join(str(e.get("title", "")).split())
 
-    frags: list = [
-        (f"class:index{sel}", f"{paper.index:>3}. "),
-        (f"class:id{sel}", pid),
-        (sel, "  "),
-    ]
-    frags.extend(_styled_text(title, f"class:title{sel}", [], session.search_pat))
+    dim = role in ("mid", "bottom")
+    idx_cls = f"class:index.dim{sel}" if dim else f"class:index{sel}"
+    row: list = [(idx_cls, f"{paper.index:>3}. ")]
+    if role is not None:
+        box = {"single": " ", "top": "┳", "mid": "┣", "bottom": "┗"}[role]
+        row.append((sel, f"{box} "))
+    row.append((f"class:id{sel}", pid))
+    row.append((sel, "  "))
+    row.extend(_styled_text(title, f"class:title{sel}", [], session.search_pat))
 
     authors = e.get("authors", []) or []
     if authors:
-        frags.append((f"class:authors{sel}", "  ["))
+        row.append((f"class:authors{sel}", "  ["))
         shown = authors[:3]
         for i, author in enumerate(shown):
             lastname = cli._last_name(author)
             highlighted = any(cli._author_matches_highlight(author, h)
                               for h in cfg.highlight_authors)
             cls = f"class:author.hl{sel}" if highlighted else f"class:authors{sel}"
-            frags.append((cls, lastname))
+            row.append((cls, lastname))
             if i < len(shown) - 1:
-                frags.append((f"class:authors{sel}", ", "))
-        frags.append((f"class:authors{sel}", "]"))
+                row.append((f"class:authors{sel}", ", "))
+        row.append((f"class:authors{sel}", "]"))
 
     if keywords:
         matches = cli._find_keyword_matches([title, str(e.get("abstract", ""))], keywords)
         if matches:
-            frags.append((f"class:kw{sel}", f"  {cfg.highlight_glyph} {', '.join(matches)}"))
+            row.append((f"class:kw{sel}", f"  {cfg.highlight_glyph} {', '.join(matches)}"))
 
     if "voters" in e:  # topvoted rows carry votes/voters instead of authors
         n = int(e.get("votes", 0))
-        frags.append((f"class:voters{sel}", f"  [{e['voters']}] ⇒ {n} vote{'s' if n != 1 else ''}"))
+        row.append((f"class:voters{sel}", f"  [{e['voters']}] ⇒ {n} vote{'s' if n != 1 else ''}"))
 
     if pid in session.voting:
-        frags.append((f"class:mark{sel}", f"  {VOTE_MARK}"))
-    frags.append((sel, "\n"))
+        row.append((f"class:mark{sel}", f"  {VOTE_MARK}"))
+
+    # Wrapped rows re-align under the title; tie members that still have a row
+    # below keep the ┃ continuation in the box column so the gutter stays
+    # unbroken (the last member has nothing below, mirroring plain `topvoted`).
+    hang = len(f"{paper.index:>3}. ") + (2 if role is not None else 0) + len(pid) + 2
+    if role in ("top", "mid"):
+        indent = "     ┃ " + " " * max(0, hang - 7)
+    else:
+        indent = " " * hang
+    frags = _wrap_styled(row, width, indent=indent, indent_style=sel)
 
     if session.abstract_open(paper):
         abstract = " ".join(str(e.get("abstract", "")).split())
         if abstract:
-            for line in textwrap.wrap(abstract, width=cfg.abstract_wrap):
-                frags.extend(_styled_text(line, "class:abstract", keywords, session.search_pat))
-                frags.append(("class:abstract", "\n"))
+            if role in ("top", "mid"):
+                indent = "     ┃ "        # mirror the plain command's ┃ continuation
+            elif role in ("bottom", "single"):
+                indent = "       "
+            else:
+                indent = "      "
+            body = _styled_text(abstract, "class:abstract", keywords, session.search_pat)
+            frags.extend(_wrap_styled(
+                body, width, indent=indent, indent_style="class:abstract", indent_first=True,
+            ))
         else:
             frags.append(("class:abstract", "(no abstract available)\n"))
     return frags
-
-
-def _abstract_prefixed(frags: list) -> list:
-    """Indent abstract fragments like the CLI does (6 spaces)."""
-    out = []
-    at_line_start = True
-    for style, text in frags:
-        if at_line_start and "abstract" in style:
-            out.append((style, "      "))
-        out.append((style, text))
-        at_line_start = text.endswith("\n")
-    return out
 
 
 def _help_lines(keymap: dict[str, list[str]]) -> list[tuple[str, str]]:
@@ -1035,6 +1222,28 @@ if PROMPT_TOOLKIT_OK:
                 if name.startswith(prefix):
                     yield Completion(name, start_position=-len(prefix))
 
+    class _WheelWindow(Window):
+        """Window whose mouse-wheel events drive the list (scroll + edge drag).
+
+        prompt_toolkit clamps the viewport to the cursor, so scrolling past the
+        selection is only possible by moving the selection along; `on_wheel`
+        implements that, and forwarding the sticky-header row keeps the wheel
+        working over the pinned bar.
+        """
+
+        def __init__(self, on_wheel, *args, **kwargs) -> None:
+            self._on_wheel = on_wheel
+            super().__init__(*args, **kwargs)
+
+        def _mouse_handler(self, mouse_event):
+            if mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+                self._on_wheel(1)
+                return None
+            if mouse_event.event_type == MouseEventType.SCROLL_UP:
+                self._on_wheel(-1)
+                return None
+            return super()._mouse_handler(mouse_event)
+
 
 class Tui:
     """Owns the Session, the input buffer, the style, and the Application."""
@@ -1048,6 +1257,10 @@ class Tui:
         self.cmd_prefix = ""
         self.style = _theme_style(session.theme)
         self._frag_cache: dict = {}
+        self._last_width: int | None = None
+        self._line_owner: list[tuple[str, object]] = []   # content line -> ("day", d) | ("paper", index)
+        self._paper_spans: dict[int, tuple[int, int]] = {}  # paper index -> (start, end) lines
+        self._paper_days: dict[int, str] = {}               # paper index -> section day
         self._last_point = Point(x=0, y=0)
         self.buffer = Buffer(
             multiline=False,
@@ -1159,23 +1372,114 @@ class Tui:
         if s.view == "confirm":
             self._last_point = Point(x=0, y=0)
             return _confirm_fragments(s)
+
+        width = max(20, self.app.output.get_size().columns)
+        if width != self._last_width:  # every wrapped row depends on the width
+            self._frag_cache.clear()
+            self._last_width = width
+
+        _has_ties, roles = _rank_roles(s.visible())
         frags: list = []
         line = 0
         cursor_line = 0
-        for pos, paper in enumerate(s.visible()):
-            is_cur = pos == s.cursor
+        day_seen = ""
+        self._line_owner = []
+        self._paper_spans = {}
+        self._paper_days = {}
+        for kind, payload in _display_items(s):
+            if kind == "day":
+                frags.append(("class:day", _day_rule(str(payload), width)))
+                self._line_owner.append(("day", payload))
+                line += 1
+                day_seen = str(payload)
+                continue
+            paper = payload
+            is_cur = paper is s.current()
             if is_cur:
                 cursor_line = line
+            role = roles.get(paper.index)
             key = (paper.index, s.abstract_open(paper), str(paper.entry.get("id", "")) in s.voting,
-                   is_cur, s.search_pat, s.theme)
+                   is_cur, s.search_pat, s.theme, role)
             cached = self._frag_cache.get(key)
             if cached is None:
-                cached = _abstract_prefixed(_entry_fragments(paper, s, self.cfg))
+                cached = _entry_fragments(paper, s, self.cfg, width, role)
                 self._frag_cache[key] = cached
+            start = line
             frags.extend(cached)
-            line += sum(text.count("\n") for _style, text in cached)
+            count = sum(text.count("\n") for _style, text in cached)
+            self._paper_spans[paper.index] = (start, start + count)
+            if day_seen:
+                self._paper_days[paper.index] = day_seen
+            for _ in range(count):
+                self._line_owner.append(("paper", paper.index))
+            line += count
         self._last_point = Point(x=0, y=cursor_line)
         return frags
+
+    def render_sticky(self) -> list:
+        """Pinned day header, shown once a section's inline row scrolled off."""
+        s = self.session
+        if s.view != "list" or not s.group_by_day:
+            return []
+        info = getattr(self.body_window, "render_info", None)
+        if info is None:
+            return []
+        first = info.first_visible_line()
+        if not 0 <= first < len(self._line_owner):
+            return []
+        kind, payload = self._line_owner[first]
+        if kind != "paper":
+            return []  # the inline day row itself is visible — no duplicate
+        day = self._paper_days.get(payload)  # payload is the paper's full-list index
+        if not day:
+            return []
+        width = max(1, self.app.output.get_size().columns)
+        return [("class:day", _day_rule(day, width).rstrip("\n"))]
+
+    def wheel(self, delta: int) -> None:
+        """Mouse wheel: scroll the viewport; drag the selection at the edges.
+
+        The selection's screen rows come from the last render's line spans plus
+        the current scroll offset (not from `render_info`, which lags between
+        consecutive wheel ticks), so ticks compose without an intermediate
+        redraw.
+        """
+        s = self.session
+        if s.mode != NOR or s.view != "list":
+            return
+        info = getattr(self.body_window, "render_info", None)
+        if info is None or info.window_height <= 0:
+            return
+        vis = s.visible()
+        if not vis:
+            return
+        scroll = self.body_window.vertical_scroll
+        span = self._paper_spans.get(s.current().index) if s.current() else None
+        if delta > 0:
+            top_row = (span[0] - scroll) if span else info.cursor_position.y
+            if top_row > 0 or s.cursor >= len(vis) - 1:
+                self._scroll_body(delta, info)
+                return
+            s.move(1)  # selection reached the top edge: drag it along
+            span = self._paper_spans.get(s.current().index) if s.current() else None
+            # Follow mode opens/closes folds with the move, so the last render's
+            # spans are stale; let prompt_toolkit clamp the scroll there.
+            if span and not s.follow:  # pin the dragged block's first line
+                self.body_window.vertical_scroll = span[0]
+        else:
+            bottom_row = (span[1] - 1 - scroll) if span else info.cursor_position.y
+            if bottom_row < info.window_height - 1 or s.cursor <= 0:
+                self._scroll_body(delta, info)
+                return
+            s.move(-1)
+            span = self._paper_spans.get(s.current().index) if s.current() else None
+            if span and not s.follow:  # pin the dragged block's last line
+                self.body_window.vertical_scroll = max(0, span[1] - info.window_height)
+
+    def _scroll_body(self, delta: int, info) -> None:
+        top = self.body_window.vertical_scroll
+        max_top = max(0, info.content_height - info.window_height)
+        self.body_window.vertical_scroll = min(max(0, top + delta), max_top)
 
     def render_idle_line(self) -> list:
         s = self.session
@@ -1207,7 +1511,8 @@ def _build_layout(tui: Tui) -> "Layout":
         filter=Condition(lambda: bool(s.warnings)),
     )
 
-    tui.body_window = Window(
+    tui.body_window = _WheelWindow(
+        tui.wheel,
         FormattedTextControl(
             tui.render_body,
             focusable=True,
@@ -1216,6 +1521,15 @@ def _build_layout(tui: Tui) -> "Layout":
         ),
         wrap_lines=True,
     )
+
+    # Pinned day header: a 1-row float over the top of the list. It is drawn
+    # after the body (same frame), so it can read the body's fresh scroll state.
+    sticky_header = Float(
+        _WheelWindow(tui.wheel, FormattedTextControl(tui.render_sticky), height=1),
+        top=0,
+        left=0,
+    )
+    body_area = FloatContainer(content=tui.body_window, floats=[sticky_header])
 
     status_bar = VSplit(
         [
@@ -1257,7 +1571,7 @@ def _build_layout(tui: Tui) -> "Layout":
         filter=~in_cmd,
     )
 
-    root = HSplit([warning_bar, tui.body_window, status_bar, cmd_line, idle_line],
+    root = HSplit([warning_bar, body_area, status_bar, cmd_line, idle_line],
                   style="class:body")
     layout = Layout(root)
     layout.focus(tui.body_window)
@@ -1391,7 +1705,7 @@ def run(tokens: list[str]) -> int:
 
     cfg = cli._load_config()
     try:
-        data, captured = _load_list(tokens, cfg)
+        data, captured, loader = _load_list(tokens, cfg)
     except SystemExit as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -1420,6 +1734,11 @@ def run(tokens: list[str]) -> int:
 
     session = Session(data.entries, theme=theme)
     session.follow = icfg.follow
+    # Day rows belong to date-sorted listings only; search results are ranked
+    # by relevance and topvoted rows carry no publication date.
+    session.group_by_day = loader in (
+        cli._today_list, cli._lastweek_list, cli._lastdays_list, cli._show_date_list,
+    )
     session.warnings.extend(data.notes + captured + key_problems)
 
     tui = Tui(session, cfg, icfg, keymap)

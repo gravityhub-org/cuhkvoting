@@ -41,6 +41,7 @@ quitting, `cuhkvoting vote 3` still refers to paper 3 of what you just browsed.
 
 ```
 | /!\ Note: no papers announced today (UTC); showing last batch (7-15)|  sticky warnings
+| ── 2026-07-15 ───────────────────────────────────────────────────── |  day row
 | 12. 2507.01234  Gravitational-wave echoes …    [Chan, Li +1]        |
 |>13. 2507.02345  Neutron-star mergers …  [Kumar, Sato]  ●           |  cursor row
 |      We study the nucleosynthetic yields of binary neutron-star     |  open abstract
@@ -53,6 +54,14 @@ quitting, `cuhkvoting vote 3` still refers to paper 3 of what you just browsed.
 - `13:34` is the cursor position over the list length.
 - The mode is `NOR` (normal) or `CMD` while typing a `:`, `/` or `?` command.
 - Warnings stay sticky at the top on a yellow background.
+- Date-sorted lists (`today`, `lastweek`, `last <#>`, `show <date>`) are split
+  into day sections by dim rule rows. While a day's rule is scrolled off the
+  top, the day stays pinned at the top of the list; the rule itself is not
+  selectable, so paper numbers keep matching `vote <#>`.
+- In `topvoted`, tied papers share the plain command's ranking gutter
+  (`┳ ┣ ┗`) and the index of non-leading rows is dimmed. While a tie group has
+  a row below, wrapped titles and open abstracts keep the `┃` continuation
+  line, so the gutter never breaks mid-row.
 - The bottom line shows key hints while idle; it becomes the input line as soon
   as you type. Set `key_hints = false` in `[interactive]` to turn the hints off.
 
@@ -149,6 +158,9 @@ defaults. The help screen (`:h`) always reflects the effective keymap.
 
 - `--category`, `--limit`, and `--max-age` are not yet accepted by
   `interactive` subcommands; the plain commands' defaults apply.
-- The mouse wheel scrolls the view, but the next keypress snaps back to the
-  cursor.
+- The mouse wheel scrolls the list; once the selection reaches the window edge
+  it is dragged along, so the viewport never scrolls past the selection.
+- Titles and abstracts reflow to the terminal width and re-wrap when the
+  window is resized; the `[display] abstract_wrap` setting only applies to the
+  plain commands.
 - A pending `g`/`z` prefix is not echoed in the input line (counts are).
