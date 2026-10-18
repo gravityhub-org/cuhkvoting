@@ -51,6 +51,8 @@ quitting, `cuhkvoting vote 3` still refers to paper 3 of what you just browsed.
 ```
 
 - `●` marks papers staged in the voting list; `2 sel` counts them.
+- `✓` marks papers voted during this session (green); the marks are
+  session-local and reset when `interactive` is restarted.
 - `13:34` is the cursor position over the list length.
 - The mode is `NOR` (normal) or `CMD` while typing a `:`, `/` or `?` command.
 - Warnings stay sticky at the top on a yellow background.
@@ -106,6 +108,10 @@ terminal is briefly restored while the votes are cast in one batch (same
 SSH/API machinery as `cuhkvoting vote`); papers already selected for a past
 journal club are skipped with a warning. On failure the voting list is kept, so
 `:w` can simply be retried.
+
+Papers whose vote is recorded — including ones `:w` reports as duplicates from
+earlier votes — get a green `✓` and tinted row for the rest of the session, so
+you can keep browsing without losing track of what you already voted for.
 
 After quitting, a summary lists this session's votes:
 

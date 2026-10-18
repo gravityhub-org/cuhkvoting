@@ -57,6 +57,7 @@ INSTALL_HINT = (
 
 NOR, CMD = "NOR", "CMD"
 VOTE_MARK = "●"
+VOTED_MARK = "✓"   # voted (or confirmed already-voted) during this session
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +193,7 @@ class Session:
         self.papers = [Paper(i, e) for i, e in enumerate(entries, 1)]
         self.cursor = 0                        # position within visible()
         self.voting: list[str] = []            # staged arXiv ids, in staging order
+        self.voted: set[str] = set()           # cast this session (duplicates included)
         self.ls_only = False                   # :ls filter active
         self.group_by_day = False              # date rows + sticky header (date-sorted lists)
         self.follow = False                    # zi: selected abstract always open
@@ -555,6 +557,7 @@ THEMES: dict[str, dict[str, str]] = {
         "author.hl": "ansibrightblue bold",
         "kw":        "ansibrightblue bold",
         "mark":      "ansigreen bold",
+        "voted":     "ansigreen",
         "search":    "underline bold",
         "day":       "ansibrightblack",
         "hint":      "ansibrightblack",
@@ -575,6 +578,7 @@ THEMES: dict[str, dict[str, str]] = {
         "author.hl": "#c678dd bold",
         "kw":        "#e5c07b bold",
         "mark":      "#98c379 bold",
+        "voted":     "#98c379",
         "search":    "bg:#61afef #282c34",
         "day":       "#5c6370 bold",
         "hint":      "#5c6370",
@@ -595,6 +599,7 @@ THEMES: dict[str, dict[str, str]] = {
         "author.hl": "#d3869b bold",
         "kw":        "#fabd2f bold",
         "mark":      "#b8bb26 bold",
+        "voted":     "#b8bb26",
         "search":    "bg:#fe8019 #282828",
         "day":       "#928374 bold",
         "hint":      "#928374",
@@ -615,6 +620,7 @@ THEMES: dict[str, dict[str, str]] = {
         "author.hl": "#cba6f7 bold",
         "kw":        "#f9e2af bold",
         "mark":      "#a6e3a1 bold",
+        "voted":     "#a6e3a1",
         "search":    "bg:#89b4fa #1e1e2e",
         "day":       "#6c7086 bold",
         "hint":      "#6c7086",
@@ -635,6 +641,7 @@ THEMES: dict[str, dict[str, str]] = {
         "author.hl": "#6c71c4 bold",
         "kw":        "#b58900 bold",
         "mark":      "#859900 bold",
+        "voted":     "#859900",
         "search":    "bg:#268bd2 #002b36",
         "day":       "#586e75 bold",
         "hint":      "#586e75",
@@ -655,6 +662,7 @@ THEMES: dict[str, dict[str, str]] = {
         "author.hl": "#b48ead bold",
         "kw":        "#ebcb8b bold",
         "mark":      "#a3be8c bold",
+        "voted":     "#a3be8c",
         "search":    "bg:#88c0d0 #2e3440",
         "day":       "#4c566a bold",
         "hint":      "#4c566a",
@@ -919,46 +927,50 @@ def _entry_fragments(paper: Paper, session: Session, cfg, width: int,
     """
     e = paper.entry
     is_cur = paper is session.current()
-    sel = " class:cursor" if is_cur else ""
-    keywords = cfg.highlight_keywords or []
     pid = str(e.get("id", ""))
+    sel = " class:cursor" if is_cur else ""
+    vtd = " class:voted" if pid in session.voted else ""
+    sfx = sel + vtd
+    keywords = cfg.highlight_keywords or []
     title = " ".join(str(e.get("title", "")).split())
 
     dim = role in ("mid", "bottom")
-    idx_cls = f"class:index.dim{sel}" if dim else f"class:index{sel}"
+    idx_cls = f"class:index.dim{sfx}" if dim else f"class:index{sfx}"
     row: list = [(idx_cls, f"{paper.index:>3}. ")]
     if role is not None:
         box = {"single": " ", "top": "┳", "mid": "┣", "bottom": "┗"}[role]
-        row.append((sel, f"{box} "))
-    row.append((f"class:id{sel}", pid))
-    row.append((sel, "  "))
-    row.extend(_styled_text(title, f"class:title{sel}", [], session.search_pat))
+        row.append((sfx, f"{box} "))
+    row.append((f"class:id{sfx}", pid))
+    row.append((sfx, "  "))
+    row.extend(_styled_text(title, f"class:title{sfx}", [], session.search_pat))
 
     authors = e.get("authors", []) or []
     if authors:
-        row.append((f"class:authors{sel}", "  ["))
+        row.append((f"class:authors{sfx}", "  ["))
         shown = authors[:3]
         for i, author in enumerate(shown):
             lastname = cli._last_name(author)
             highlighted = any(cli._author_matches_highlight(author, h)
                               for h in cfg.highlight_authors)
-            cls = f"class:author.hl{sel}" if highlighted else f"class:authors{sel}"
+            cls = f"class:author.hl{sfx}" if highlighted else f"class:authors{sfx}"
             row.append((cls, lastname))
             if i < len(shown) - 1:
-                row.append((f"class:authors{sel}", ", "))
-        row.append((f"class:authors{sel}", "]"))
+                row.append((f"class:authors{sfx}", ", "))
+        row.append((f"class:authors{sfx}", "]"))
 
     if keywords:
         matches = cli._find_keyword_matches([title, str(e.get("abstract", ""))], keywords)
         if matches:
-            row.append((f"class:kw{sel}", f"  {cfg.highlight_glyph} {', '.join(matches)}"))
+            row.append((f"class:kw{sfx}", f"  {cfg.highlight_glyph} {', '.join(matches)}"))
 
     if "voters" in e:  # topvoted rows carry votes/voters instead of authors
         n = int(e.get("votes", 0))
-        row.append((f"class:voters{sel}", f"  [{e['voters']}] ⇒ {n} vote{'s' if n != 1 else ''}"))
+        row.append((f"class:voters{sfx}", f"  [{e['voters']}] ⇒ {n} vote{'s' if n != 1 else ''}"))
 
     if pid in session.voting:
-        row.append((f"class:mark{sel}", f"  {VOTE_MARK}"))
+        row.append((f"class:mark{sfx}", f"  {VOTE_MARK}"))
+    if pid in session.voted:
+        row.append((f"class:voted{sel}", f"  {VOTED_MARK}"))
 
     # Wrapped rows re-align under the title; tie members that still have a row
     # below keep the ┃ continuation in the box column so the gutter stays
@@ -968,7 +980,7 @@ def _entry_fragments(paper: Paper, session: Session, cfg, width: int,
         indent = "     ┃ " + " " * max(0, hang - 7)
     else:
         indent = " " * hang
-    frags = _wrap_styled(row, width, indent=indent, indent_style=sel)
+    frags = _wrap_styled(row, width, indent=indent, indent_style=sfx)
 
     if session.abstract_open(paper):
         abstract = " ".join(str(e.get("abstract", "")).split())
@@ -979,12 +991,13 @@ def _entry_fragments(paper: Paper, session: Session, cfg, width: int,
                 indent = "       "
             else:
                 indent = "      "
-            body = _styled_text(abstract, "class:abstract", keywords, session.search_pat)
+            body = _styled_text(abstract, f"class:abstract{vtd}", keywords, session.search_pat)
             frags.extend(_wrap_styled(
-                body, width, indent=indent, indent_style="class:abstract", indent_first=True,
+                body, width, indent=indent,
+                indent_style=f"class:abstract{vtd}", indent_first=True,
             ))
         else:
-            frags.append(("class:abstract", "(no abstract available)\n"))
+            frags.append((f"class:abstract{vtd}", "(no abstract available)\n"))
     return frags
 
 
@@ -1144,6 +1157,9 @@ def _cast_votes(session: Session, cfg) -> bool:
         session.feedback = "Nothing to vote for (all staged papers were already selected)"
         return True
 
+    # Session-local "already voted" marks: newly cast votes and duplicates (the
+    # batch reports papers the user had voted for before this session).
+    session.voted.update(result.voted)
     duplicates = 0
     for pid in result.voted:
         status = "new" if pid in result.new else "duplicate"
@@ -1398,7 +1414,8 @@ class Tui:
             if is_cur:
                 cursor_line = line
             role = roles.get(paper.index)
-            key = (paper.index, s.abstract_open(paper), str(paper.entry.get("id", "")) in s.voting,
+            pid = str(paper.entry.get("id", ""))
+            key = (paper.index, s.abstract_open(paper), pid in s.voting, pid in s.voted,
                    is_cur, s.search_pat, s.theme, role)
             cached = self._frag_cache.get(key)
             if cached is None:
