@@ -1085,6 +1085,17 @@ def _cast_votes(session: Session, cfg) -> bool:
     """Cast the staged votes, mirroring `vote_command`. True when the batch went through."""
     staged = list(session.voting)
     entry_by_id = {str(p.entry.get("id", "")): p.entry for p in session.papers}
+
+    def vote_meta(pid: str) -> dict:
+        """Vote metadata from the in-memory list entry (abstract included, like plain vote)."""
+        entry = entry_by_id.get(pid, {})
+        return {
+            "paper_id": pid,
+            "title": " ".join(str(entry.get("title", "")).split()),
+            "abstract": " ".join(str(entry.get("abstract", "")).split()),
+            "url": entry.get("url") or f"{cli.ARXIV_ABS}{pid}",
+        }
+
     try:
         token = cli._get_token()
         repo_cfg = cli._resolve_repo_config(
@@ -1099,20 +1110,10 @@ def _cast_votes(session: Session, cfg) -> bool:
                 if cli._strip_arxiv_version(pid) in selected:
                     skipped.append(pid)
                 else:
-                    entry = entry_by_id.get(pid, {})
-                    metas.append({
-                        "paper_id": pid,
-                        "title": " ".join(str(entry.get("title", "")).split()),
-                        "url": entry.get("url") or f"{cli.ARXIV_ABS}{pid}",
-                    })
+                    metas.append(vote_meta(pid))
         else:
             for pid in staged:
-                entry = entry_by_id.get(pid, {})
-                metas.append({
-                    "paper_id": pid,
-                    "title": " ".join(str(entry.get("title", "")).split()),
-                    "url": entry.get("url") or f"{cli.ARXIV_ABS}{pid}",
-                })
+                metas.append(vote_meta(pid))
         for pid in skipped:
             session.warnings.append(f"Skipping {pid}: already selected for a past journal club.")
             session.session_votes.append(

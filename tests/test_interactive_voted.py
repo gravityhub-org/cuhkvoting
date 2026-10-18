@@ -28,8 +28,11 @@ def _entry(index: int) -> dict:
 
 
 class CastVotesMarksSessionTest(unittest.TestCase):
-    def _cast(self, session: interactive.Session, result) -> bool:
-        def fake_batch(*_args, **_kwargs):
+    def _cast(self, session: interactive.Session, result) -> tuple[bool, list[list[dict]]]:
+        metas_calls: list[list[dict]] = []
+
+        def fake_batch(*args, **_kwargs):
+            metas_calls.append(args[2] if len(args) > 2 else [])
             if isinstance(result, Exception):
                 raise result
             return result
@@ -41,13 +44,15 @@ class CastVotesMarksSessionTest(unittest.TestCase):
              mock.patch("cuhkvoting.cli._resolve_user", return_value="tester"), \
              mock.patch("cuhkvoting.cli._warn_if_display_name_changed"), \
              mock.patch("cuhkvoting.cli._batch_vote_papers_ssh", side_effect=fake_batch):
-            return interactive._cast_votes(session, _cfg())
+            ok = interactive._cast_votes(session, _cfg())
+        return ok, metas_calls
 
     def test_new_and_duplicate_votes_get_marked(self) -> None:
         session = interactive.Session([_entry(1), _entry(2)])
         session.voting = ["2601.00001", "2601.00002"]
         result = cli.VoteResult(["2601.00001", "2601.00002"], ["2601.00001"], None)
-        self.assertTrue(self._cast(session, result))
+        ok, _calls = self._cast(session, result)
+        self.assertTrue(ok)
         self.assertEqual(session.voted, {"2601.00001", "2601.00002"})
         self.assertEqual(session.voting, [])
         self.assertEqual(
@@ -57,7 +62,8 @@ class CastVotesMarksSessionTest(unittest.TestCase):
     def test_failed_cast_marks_nothing(self) -> None:
         session = interactive.Session([_entry(1)])
         session.voting = ["2601.00001"]
-        self.assertFalse(self._cast(session, RuntimeError("boom")))
+        ok, _calls = self._cast(session, RuntimeError("boom"))
+        self.assertFalse(ok)
         self.assertEqual(session.voted, set())
         self.assertEqual(session.voting, ["2601.00001"])
 
@@ -65,7 +71,8 @@ class CastVotesMarksSessionTest(unittest.TestCase):
         session = interactive.Session([_entry(1)])
         session.voting = ["2601.00001"]
         result = cli.VoteResult([], [], None, ["2601.00001"])
-        self.assertTrue(self._cast(session, result))
+        ok, _calls = self._cast(session, result)
+        self.assertTrue(ok)
         self.assertEqual(session.voted, set())
         self.assertEqual(session.voting, [])
 
@@ -76,6 +83,21 @@ class CastVotesMarksSessionTest(unittest.TestCase):
         session.voting = ["2601.00002"]
         self._cast(session, cli.VoteResult(["2601.00002"], ["2601.00002"], None))
         self.assertEqual(session.voted, {"2601.00001", "2601.00002"})
+
+    def test_cast_passes_the_abstract_to_the_batch(self) -> None:
+        session = interactive.Session([_entry(1)])
+        session.voting = ["2601.00001"]
+        _ok, calls = self._cast(session, cli.VoteResult(["2601.00001"], ["2601.00001"], None))
+        self.assertEqual(calls[0][0]["abstract"], "abs")
+        self.assertEqual(calls[0][0]["title"], "Paper 1")
+        self.assertEqual(calls[0][0]["paper_id"], "2601.00001")
+
+    def test_abstract_whitespace_is_normalized(self) -> None:
+        entry = dict(_entry(1), abstract="first line\n  second\tline")
+        session = interactive.Session([entry])
+        session.voting = ["2601.00001"]
+        _ok, calls = self._cast(session, cli.VoteResult(["2601.00001"], ["2601.00001"], None))
+        self.assertEqual(calls[0][0]["abstract"], "first line second line")
 
 
 class VotedFragmentsTest(unittest.TestCase):
