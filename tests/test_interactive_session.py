@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 
+from cuhkvoting import interactive
 from cuhkvoting.interactive import Session
 
 
@@ -90,7 +91,54 @@ class VotingListTests(unittest.TestCase):
         s = Session(_entries(3))
         s.enter_ls()
         self.assertFalse(s.ls_only)
-        self.assertIn("empty", s.feedback)
+        self.assertIn("Nothing staged", s.feedback)
+
+    def test_d_stages_a_removal_only_for_voted_papers(self) -> None:
+        s = Session(_entries(2))
+        s.remove_current()
+        self.assertIn("not in the voting list", s.feedback)
+        s.voted.add("2607.00001")
+        s.remove_current()
+        self.assertEqual(s.unvoting, ["2607.00001"])
+        self.assertIn("Staged removal", s.feedback)
+        s.remove_current()  # d again cancels the staged removal
+        self.assertEqual(s.unvoting, [])
+        self.assertIn("Cancelled", s.feedback)
+
+    def test_v_cancels_a_staged_removal(self) -> None:
+        s = Session(_entries(1))
+        s.voted.add("2607.00001")
+        s.remove_current()
+        s.add_current()
+        self.assertEqual(s.unvoting, [])
+        self.assertEqual(s.voting, [])
+        self.assertIn("Cancelled", s.feedback)
+
+    def test_add_refuses_an_already_voted_paper(self) -> None:
+        s = Session(_entries(1))
+        s.voted.add("2607.00001")
+        s.add_current()
+        self.assertEqual(s.voting, [])
+        self.assertIn("already voted", s.feedback)
+
+    def test_ls_includes_staged_removals(self) -> None:
+        s = Session(_entries(3))
+        s.voted.add("2607.00002")
+        s.jump_index(2)
+        s.remove_current()
+        s.enter_ls()
+        self.assertTrue(s.ls_only)
+        self.assertEqual([p.index for p in s.visible()], [2])
+        self.assertEqual(s.status_right(), "0 sel  1 del  1:1")
+
+    def test_cancelling_the_last_staged_removal_exits_ls(self) -> None:
+        s = Session(_entries(2))
+        s.voted.add("2607.00001")
+        s.remove_current()
+        s.enter_ls()
+        s.remove_current()
+        self.assertFalse(s.ls_only)
+        self.assertEqual(s.unvoting, [])
 
     def test_exit_ls_restores_cursor(self) -> None:
         s = Session(_entries(5))
@@ -111,6 +159,30 @@ class VotingListTests(unittest.TestCase):
         s.remove_current()
         self.assertEqual(s.voting, [])
         self.assertFalse(s.ls_only)
+
+
+class ConfirmViewTests(unittest.TestCase):
+    @staticmethod
+    def _text(session: Session) -> str:
+        return "".join(text for _style, text in interactive._confirm_fragments(session))
+
+    def test_removals_are_listed_and_prompted(self) -> None:
+        s = Session(_entries(2))
+        s.voted.add("2607.00001")
+        s.remove_current()
+        text = self._text(s)
+        self.assertIn("remove your vote for", text)
+        self.assertIn("2607.00001", text)
+        self.assertIn("Remove 1 vote?", text)
+
+    def test_mixed_changes_use_a_combined_prompt(self) -> None:
+        s = Session(_entries(2))
+        s.voting = ["2607.00001"]
+        s.unvoting = ["2607.00002"]
+        text = self._text(s)
+        self.assertIn("vote for", text)
+        self.assertIn("remove your vote for", text)
+        self.assertIn("Apply 2 changes?", text)
 
 
 class FoldTests(unittest.TestCase):

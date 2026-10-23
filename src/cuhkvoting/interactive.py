@@ -58,6 +58,7 @@ INSTALL_HINT = (
 NOR, CMD = "NOR", "CMD"
 VOTE_MARK = "●"
 VOTED_MARK = "✓"   # voted (or confirmed already-voted) during this session
+REMOVAL_MARK = "−"  # staged removal of this paper's vote
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +194,7 @@ class Session:
         self.papers = [Paper(i, e) for i, e in enumerate(entries, 1)]
         self.cursor = 0                        # position within visible()
         self.voting: list[str] = []            # staged arXiv ids, in staging order
+        self.unvoting: list[str] = []          # staged vote removals, in staging order
         self.voted: set[str] = set()           # cast this session (duplicates included)
         self.ls_only = False                   # :ls filter active
         self.group_by_day = False              # date rows + sticky header (date-sorted lists)
@@ -213,7 +215,8 @@ class Session:
 
     def visible(self) -> list[Paper]:
         if self.ls_only:
-            return [p for p in self.papers if str(p.entry.get("id", "")) in self.voting]
+            staged = set(self.voting) | set(self.unvoting)
+            return [p for p in self.papers if str(p.entry.get("id", "")) in staged]
         return self.papers
 
     def current(self) -> Paper | None:
@@ -254,6 +257,17 @@ class Session:
 
     # -- voting list -------------------------------------------------------
 
+    def _after_unstage(self, message: str) -> None:
+        """Re-clamp the :ls view after a staged row vanished (or leave it when empty)."""
+        self.feedback = message
+        if not self.ls_only:
+            return
+        if self.voting or self.unvoting:
+            self.move(0)  # re-clamp: the row under the cursor vanished
+        else:
+            self.exit_ls()
+            self.feedback = f"{message} — nothing staged"
+
     def add_current(self) -> None:
         p = self.current()
         if p is None:
@@ -261,6 +275,11 @@ class Session:
         pid = str(p.entry.get("id", ""))
         if pid in self.voting:
             self.feedback = f"{pid} is already in the voting list"
+        elif pid in self.unvoting:
+            self.unvoting.remove(pid)
+            self._after_unstage(f"Cancelled removal of {pid}")
+        elif pid in self.voted:
+            self.feedback = f"You have already voted for {pid}"
         else:
             self.voting.append(pid)
             self.feedback = f"Added {pid} to the voting list"
@@ -270,26 +289,29 @@ class Session:
         if p is None:
             return
         pid = str(p.entry.get("id", ""))
-        if pid not in self.voting:
-            self.feedback = f"{pid} is not in the voting list"
+        if pid in self.voting:
+            self.voting.remove(pid)
+            self._after_unstage(f"Removed {pid} from the voting list")
             return
-        self.voting.remove(pid)
-        self.feedback = f"Removed {pid} from the voting list"
-        if self.ls_only:
-            if self.voting:
-                self.move(0)  # re-clamp: the row under the cursor vanished
+        if pid in self.voted:
+            if pid in self.unvoting:
+                self.unvoting.remove(pid)
+                self._after_unstage(f"Cancelled removal of {pid}")
             else:
-                self.exit_ls()
-                self.feedback = f"Removed {pid} — voting list is now empty"
+                self.unvoting.append(pid)
+                self.feedback = f"Staged removal of your vote for {pid}"
+            return
+        self.feedback = f"{pid} is not in the voting list (and you have not voted for it)"
 
     def enter_ls(self) -> None:
-        if not self.voting:
-            self.feedback = "Voting list is empty"
+        if not self.voting and not self.unvoting:
+            self.feedback = "Nothing staged"
             return
         cur = self.current()
         self.ls_only = True
         self.cursor = 0
-        if cur is not None and str(cur.entry.get("id", "")) in self.voting:
+        staged = set(self.voting) | set(self.unvoting)
+        if cur is not None and str(cur.entry.get("id", "")) in staged:
             self.jump_index(cur.index)
 
     def exit_ls(self) -> None:
@@ -385,7 +407,8 @@ class Session:
     def status_right(self) -> str:
         vis = self.visible()
         pos = self.cursor + 1 if vis else 0
-        return f"{len(self.voting)} sel  {pos}:{len(vis)}"
+        removals = f"  {len(self.unvoting)} del" if self.unvoting else ""
+        return f"{len(self.voting)} sel{removals}  {pos}:{len(vis)}"
 
 
 # ---------------------------------------------------------------------------
@@ -558,6 +581,7 @@ THEMES: dict[str, dict[str, str]] = {
         "kw":        "ansibrightblue bold",
         "mark":      "ansigreen bold",
         "voted":     "ansigreen",
+        "removal":   "ansired",
         "search":    "underline bold",
         "day":       "ansibrightblack",
         "hint":      "ansibrightblack",
@@ -579,6 +603,7 @@ THEMES: dict[str, dict[str, str]] = {
         "kw":        "#e5c07b bold",
         "mark":      "#98c379 bold",
         "voted":     "#98c379",
+        "removal":   "#e06c75",
         "search":    "bg:#61afef #282c34",
         "day":       "#5c6370 bold",
         "hint":      "#5c6370",
@@ -600,6 +625,7 @@ THEMES: dict[str, dict[str, str]] = {
         "kw":        "#fabd2f bold",
         "mark":      "#b8bb26 bold",
         "voted":     "#b8bb26",
+        "removal":   "#fb4934",
         "search":    "bg:#fe8019 #282828",
         "day":       "#928374 bold",
         "hint":      "#928374",
@@ -621,6 +647,7 @@ THEMES: dict[str, dict[str, str]] = {
         "kw":        "#f9e2af bold",
         "mark":      "#a6e3a1 bold",
         "voted":     "#a6e3a1",
+        "removal":   "#f38ba8",
         "search":    "bg:#89b4fa #1e1e2e",
         "day":       "#6c7086 bold",
         "hint":      "#6c7086",
@@ -642,6 +669,7 @@ THEMES: dict[str, dict[str, str]] = {
         "kw":        "#b58900 bold",
         "mark":      "#859900 bold",
         "voted":     "#859900",
+        "removal":   "#dc322f",
         "search":    "bg:#268bd2 #002b36",
         "day":       "#586e75 bold",
         "hint":      "#586e75",
@@ -663,6 +691,7 @@ THEMES: dict[str, dict[str, str]] = {
         "kw":        "#ebcb8b bold",
         "mark":      "#a3be8c bold",
         "voted":     "#a3be8c",
+        "removal":   "#bf616a",
         "search":    "bg:#88c0d0 #2e3440",
         "day":       "#4c566a bold",
         "hint":      "#4c566a",
@@ -972,6 +1001,8 @@ def _entry_fragments(paper: Paper, session: Session, cfg, width: int,
         row.append((f"class:mark{sel}", f"  {VOTE_MARK}"))
     if pid in session.voted:
         row.append((f"class:voted{sel}", f"  {VOTED_MARK}"))
+    if pid in session.unvoting:
+        row.append((f"class:removal{sel}", f"  {REMOVAL_MARK}"))
 
     # Wrapped rows re-align under the title; tie members that still have a row
     # below keep the ┃ continuation in the box column so the gutter stays
@@ -1014,10 +1045,10 @@ def _help_lines(keymap: dict[str, list[str]]) -> list[tuple[str, str]]:
         (f"{k('top')}, {k('bottom')}", "first / last paper (<#>gg / <#>G jump to paper <#>)"),
         (":<#>", "jump to paper <#>"),
         ("", ""),
-        ("Voting list", ""),
-        (k("add"), "add the current paper"),
-        (k("remove"), "remove the current paper"),
-        (":ls", "show only the voting list (<escape> returns)"),
+        ("Staged changes", ""),
+        (k("add"), "vote for the current paper"),
+        (k("remove"), "unstage it, or stage removal of your vote"),
+        (":ls", "show only staged changes (<escape> returns)"),
         ("", ""),
         ("Consulting", ""),
         (k("open_url"), "open the paper's webpage in the browser"),
@@ -1030,10 +1061,10 @@ def _help_lines(keymap: dict[str, list[str]]) -> list[tuple[str, str]]:
         (f"{k('next_match')} / {k('prev_match')}", "next / previous match"),
         ("", ""),
         ("Voting and leaving", ""),
-        (":w, :write", "review and cast the staged votes"),
-        (":x, :wq, :write-quit", "cast the staged votes, then quit"),
-        (":q, :quit", "quit (refuses if the voting list is not empty)"),
-        (":q!, :quit!", "quit and discard the voting list"),
+        (":w, :write", "review and apply staged changes"),
+        (":x, :wq, :write-quit", "apply staged changes, then quit"),
+        (":q, :quit", "quit (refuses while changes are staged)"),
+        (":q!, :quit!", "quit and discard staged changes"),
         ("", ""),
         ("Other", ""),
         (":theme <name>", "color theme (<tab> previews, <enter> saves to config.toml)"),
@@ -1057,14 +1088,31 @@ def _help_fragments(keymap: dict[str, list[str]]) -> list:
 
 
 def _confirm_fragments(session: Session) -> list:
-    frags: list = [("bold", "You are about to vote for:\n\n")]
-    width = len(str(len(session.voting)))
-    for i, pid in enumerate(session.voting, 1):
-        frags.append(("", f"  {i:>{width}}. "))
-        frags.append(("class:id", pid))
-        frags.append(("class:title", f"  {session.title_of(pid)}\n"))
-    n = len(session.voting)
-    frags.append(("bold", f"\nCast {n} vote{'s' if n != 1 else ''}? "))
+    frags: list = []
+    if session.voting:
+        frags.append(("bold", "You are about to vote for:\n\n"))
+        width = len(str(len(session.voting)))
+        for i, pid in enumerate(session.voting, 1):
+            frags.append(("", f"  {i:>{width}}. "))
+            frags.append(("class:id", pid))
+            frags.append(("class:title", f"  {session.title_of(pid)}\n"))
+    if session.unvoting:
+        if frags:
+            frags.append(("", "\n"))
+        frags.append(("bold", "You are about to remove your vote for:\n\n"))
+        width = len(str(len(session.unvoting)))
+        for i, pid in enumerate(session.unvoting, 1):
+            frags.append(("", f"  {i:>{width}}. "))
+            frags.append(("class:id", pid))
+            frags.append(("class:title", f"  {session.title_of(pid)}\n"))
+    adds, removals = len(session.voting), len(session.unvoting)
+    if not removals:
+        prompt = f"Cast {adds} vote{'s' if adds != 1 else ''}? "
+    elif not adds:
+        prompt = f"Remove {removals} vote{'s' if removals != 1 else ''}? "
+    else:
+        prompt = f"Apply {adds + removals} changes? "
+    frags.append(("bold", f"\n{prompt}"))
     frags.append(("class:hint", "[y]es / [n]o\n"))
     return frags
 
@@ -1116,8 +1164,9 @@ def _mark_known_votes(session: Session, user: str | None) -> None:
 
 
 def _cast_votes(session: Session, cfg) -> bool:
-    """Cast the staged votes, mirroring `vote_command`. True when the batch went through."""
+    """Apply staged votes and removals. True when the batch went through."""
     staged = list(session.voting)
+    removals = list(session.unvoting)
     entry_by_id = {str(p.entry.get("id", "")): p.entry for p in session.papers}
 
     def vote_meta(pid: str) -> dict:
@@ -1138,7 +1187,7 @@ def _cast_votes(session: Session, cfg) -> bool:
 
         metas, skipped = [], []
         # Cheap API skip-list only; SSH folds JC filtering into the vote checkout.
-        if use_api:
+        if staged and use_api:
             selected = cli._selected_arxiv_ids(repo_cfg, token)
             for pid in staged:
                 if cli._strip_arxiv_version(pid) in selected:
@@ -1152,17 +1201,20 @@ def _cast_votes(session: Session, cfg) -> bool:
             session.warnings.append(f"Skipping {pid}: already selected for a past journal club.")
             session.session_votes.append(
                 {"id": pid, "title": session.title_of(pid), "status": "skipped"})
-        if use_api and not metas:
+        if use_api and not metas and not removals:
             session.voting = []  # selected papers can never be voted; unstage them
             session.feedback = "Nothing to vote for (all staged papers were already selected)"
             return True
 
         user = cli._resolve_user(token)
-        cli._warn_if_display_name_changed(cfg.display_name)
+        if staged:
+            cli._warn_if_display_name_changed(cfg.display_name)
         if use_api:
-            result = cli._batch_vote_papers_api(repo_cfg, token, user, metas, cfg.display_name)
+            result = cli._batch_vote_papers_api(
+                repo_cfg, token, user, metas, cfg.display_name, removals=removals)
         elif cli._has_github_ssh_access():
-            result = cli._batch_vote_papers_ssh(repo_cfg, user, metas, cfg.display_name)
+            result = cli._batch_vote_papers_ssh(
+                repo_cfg, user, metas, cfg.display_name, removals=removals)
         else:
             raise SystemExit(
                 "Voting needs auth. Set CUHKVOTING_TOKEN/GITHUB_TOKEN or configure SSH key.\n\n"
@@ -1170,27 +1222,27 @@ def _cast_votes(session: Session, cfg) -> bool:
             )
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="ignore")
-        session.warnings.append(f"Vote failed — HTTP {exc.code}: {body[:200]}")
+        session.warnings.append(f"Vote update failed — HTTP {exc.code}: {body[:200]}")
         return False
     except urllib.error.URLError as exc:
-        session.warnings.append(f"Vote failed — network error: {exc.reason}. Votes kept staged; retry with :w")
+        session.warnings.append(
+            f"Vote update failed — network error: {exc.reason}. Changes kept staged; retry with :w")
         return False
     except (ConnectionError, TimeoutError, http.client.IncompleteRead) as exc:
         session.warnings.append(
-            f"Vote failed ({type(exc).__name__}: {exc}). Votes kept staged; retry with :w")
+            f"Vote update failed ({type(exc).__name__}: {exc}). "
+            "Changes kept staged; retry with :w")
         return False
     except (RuntimeError, SystemExit) as exc:
-        session.warnings.append(f"Vote failed: {exc}")
+        session.warnings.append(f"Vote update failed: {exc}")
         return False
 
     for pid in result.skipped_selected:
         session.warnings.append(f"Skipping {pid}: already selected for a past journal club.")
         session.session_votes.append(
             {"id": pid, "title": session.title_of(pid), "status": "skipped"})
-    if not result.voted and result.skipped_selected:
-        session.voting = []
-        session.feedback = "Nothing to vote for (all staged papers were already selected)"
-        return True
+    for pid in result.missing:
+        session.warnings.append(f"No active vote to remove for {pid}.")
 
     # Session-local "already voted" marks: newly cast votes and duplicates (the
     # batch reports papers the user had voted for before this session). The
@@ -1198,17 +1250,33 @@ def _cast_votes(session: Session, cfg) -> bool:
     # sessions only learn their login here, when the first write happens.
     session.voted.update(result.voted)
     _mark_known_votes(session, user)
+    session.voted.difference_update(result.removed)
+
     duplicates = 0
     for pid in result.voted:
         status = "new" if pid in result.new else "duplicate"
         duplicates += status == "duplicate"
         session.session_votes.append({"id": pid, "title": session.title_of(pid), "status": status})
+    for pid in result.removed:
+        session.session_votes.append(
+            {"id": pid, "title": session.title_of(pid), "status": "removed"})
     if result.outdated_msg:
         session.outdated_msg = result.outdated_msg
         session.warnings.append(result.outdated_msg.splitlines()[0])
+
     session.voting = []
-    session.feedback = f"{len(result.new)} vote(s) recorded" + (
-        f", {duplicates} duplicate(s)" if duplicates else "")
+    session.unvoting = []
+    if not (result.voted or result.removed or result.missing):
+        session.feedback = "Nothing to vote for (all staged papers were already selected)"
+    else:
+        parts = [f"{len(result.new)} vote(s) recorded"]
+        if result.removed:
+            parts.append(f"{len(result.removed)} vote(s) removed")
+        if duplicates:
+            parts.append(f"{duplicates} duplicate(s)")
+        if result.missing:
+            parts.append(f"{len(result.missing)} removal(s) skipped")
+        session.feedback = ", ".join(parts)
     return True
 
 
@@ -1217,7 +1285,7 @@ def _print_exit_summary(session: Session) -> None:
     if not rows:
         print("No votes cast this session.")
     else:
-        print("Votes cast this session:")
+        print("Changes this session:")
         legend: dict[str, str] = {}
         for row in rows:
             glyph = ""
@@ -1227,6 +1295,9 @@ def _print_exit_summary(session: Session) -> None:
             elif row["status"] == "skipped":
                 glyph = "  ⊘"
                 legend["⊘"] = "skipped: already selected for a past journal club"
+            elif row["status"] == "removed":
+                glyph = f"  {REMOVAL_MARK}"
+                legend[REMOVAL_MARK] = "vote removed"
             print(f"  {row['id']}  {row['title']}{glyph}")
         for glyph, meaning in legend.items():
             print(f"    {glyph} = {meaning}")
@@ -1384,16 +1455,17 @@ class Tui:
         if name == "jump":
             s.jump_index(payload)
         elif name == "quit":
-            if s.voting:
-                s.feedback = "Voting list not empty — :w to vote, :q! to discard"
+            if s.voting or s.unvoting:
+                s.feedback = "Staged changes not applied — :w to apply, :q! to discard"
             else:
                 self.app.exit()
         elif name == "quit!":
             s.voting = []
+            s.unvoting = []
             self.app.exit()
         elif name in ("write", "write-quit"):
-            if not s.voting:
-                s.feedback = "Voting list is empty — nothing to write"
+            if not s.voting and not s.unvoting:
+                s.feedback = "Nothing staged — nothing to write"
             else:
                 s.exit_after_write = name == "write-quit"
                 s.view = "confirm"
@@ -1454,7 +1526,7 @@ class Tui:
             role = roles.get(paper.index)
             pid = str(paper.entry.get("id", ""))
             key = (paper.index, s.abstract_open(paper), pid in s.voting, pid in s.voted,
-                   is_cur, s.search_pat, s.theme, role)
+                   pid in s.unvoting, is_cur, s.search_pat, s.theme, role)
             cached = self._frag_cache.get(key)
             if cached is None:
                 cached = _entry_fragments(paper, s, self.cfg, width, role)
@@ -1737,8 +1809,8 @@ def _build_key_bindings(tui: Tui) -> "KeyBindings":
 
     @kb.add("c-c", filter=~in_cmd)
     def _ctrl_c(event) -> None:
-        if s.voting:
-            s.feedback = "Voting list not empty — :w to vote, :q! to discard"
+        if s.voting or s.unvoting:
+            s.feedback = "Staged changes not applied — :w to apply, :q! to discard"
         else:
             event.app.exit()
 

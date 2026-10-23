@@ -50,7 +50,8 @@ quitting, `cuhkvoting vote 3` still refers to paper 3 of what you just browsed.
 | v add  d del  o open  za abs  / find  :w vote  :q quit  :h help     |  key hints
 ```
 
-- `●` marks papers staged in the voting list; `2 sel` counts them.
+- `●` marks papers staged for voting; `2 sel` counts them.
+- `−` marks a staged removal of your vote; `1 del` counts them (status line).
 - `✓` marks papers you voted for (green tick and title). The marks are session-local, but in
   `topvoted` earlier votes are recognised on load when your GitHub login is
   available (`CUHKVOTING_USER`/`GITHUB_USER`, or the normal token/credential
@@ -77,7 +78,7 @@ quitting, `cuhkvoting vote 3` still refers to paper 3 of what you just browsed.
 | `ctrl-f` / `ctrl-b`, `PageDown` / `PageUp` | page down / up |
 | `gg` / `G` | first / last paper (`<#>G` jumps to paper `<#>`) |
 | `v` / `enter` | add the current paper to the voting list |
-| `d` / `delete` | remove it from the voting list |
+| `d` / `delete` | unstage it; on a paper you voted for, stage removal of your vote |
 | `o` | open the paper's webpage in the browser |
 | `za` / `zo` / `zc` | toggle / open / close the abstract |
 | `→` / `←` | open / close the current paper's abstract |
@@ -94,11 +95,11 @@ Commands need `<enter>` to run; while typing, a hint is shown right-aligned.
 | Command | Action |
 |---------|--------|
 | `:<#>` | jump to paper `<#>` |
-| `:ls` | show only the voting list (`escape` returns) |
-| `:w`, `:write` | review the voting list and cast the votes |
-| `:x`, `:wq`, `:write-quit` | cast the votes, then quit |
-| `:q`, `:quit` | quit — refuses if the voting list is not empty |
-| `:q!`, `:quit!` | quit and discard the voting list |
+| `:ls` | show only staged changes (`escape` returns) |
+| `:w`, `:write` | review and apply staged votes/removals |
+| `:x`, `:wq`, `:write-quit` | apply staged changes, then quit |
+| `:q`, `:quit` | quit — refuses while changes are staged |
+| `:q!`, `:quit!` | quit and discard staged changes |
 | `:theme <name>` | switch color theme (`tab` previews, `enter` saves) |
 | `:h`, `:help` | help screen |
 
@@ -106,11 +107,18 @@ Commands need `<enter>` to run; while typing, a hint is shown right-aligned.
 
 ## Voting
 
-`:w` switches to a confirmation view listing the staged papers. On `y` the
-terminal is briefly restored while the votes are cast in one batch (same
-SSH/API machinery as `cuhkvoting vote`); papers already selected for a past
-journal club are skipped with a warning. On failure the voting list is kept, so
-`:w` can simply be retried.
+`:w` switches to a confirmation view listing the staged changes. On `y` the
+terminal is briefly restored while votes and removals are applied in one batch
+(same SSH/API machinery as `cuhkvoting vote`); papers already selected for a
+past journal club are skipped with a warning. On failure the staged changes are
+kept, so `:w` can simply be retried.
+
+`d` on a paper you have already voted for (green `✓`) stages removal of your
+vote instead of unstaging an add: the row gets a red `−` marker and `N del`
+appears in the status line. Press `d` again (or `v`) to cancel it. `:w` applies
+staged votes and removals together in a single commit; if the removal leaves no
+votes and the paper was not selected for a journal club, its record file is
+deleted.
 
 Papers whose vote is recorded — including ones `:w` reports as duplicates from
 earlier votes — get a green `✓` and a green title for the rest of the session,
@@ -118,19 +126,22 @@ so you can keep browsing without losing track of what you already voted for. In
 `topvoted`, the rows already carry the voter usernames, so votes you cast in
 earlier sessions are ticked on load as well when your login is known.
 
-After quitting, a summary lists this session's votes:
+After quitting, a summary lists this session's changes:
 
 ```
-Votes cast this session:
+Changes this session:
   2507.01234  First title
   2507.05678  Second title  ✗
+  2507.09012  Third title  −
     ✗ = duplicated an earlier vote (nothing changed)
+    − = vote removed
 ```
 
-`✗` marks votes that duplicated an earlier vote of yours; `⊘` marks papers
-skipped because they were already selected for a journal club. If the records
-repo advertises a newer cuhkvoting release, the upgrade note is appended here
-(and shown as a sticky warning during the session).
+`✗` marks votes that duplicated an earlier vote of yours; `−` marks votes that
+were removed; `⊘` marks papers skipped because they were already selected for a
+journal club. If the records repo advertises a newer cuhkvoting release, the
+upgrade note is appended here (and shown as a sticky warning during the
+session).
 
 ## Themes
 

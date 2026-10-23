@@ -2436,11 +2436,13 @@ def cmd_show_date(args: SimpleNamespace) -> int:
 
 @dataclass
 class VoteResult:
-    """Outcome of a batch vote."""
+    """Outcome of a batch vote (and, optionally, removals)."""
     voted: list[str]           # every processed paper_id, including already-voted
     new: list[str]             # only the paper_ids whose vote is genuinely new
     outdated_msg: str | None   # client out-of-date notice; None when current
     skipped_selected: list[str] = field(default_factory=list)  # JC-selected, not voted
+    removed: list[str] = field(default_factory=list)           # votes actually removed
+    missing: list[str] = field(default_factory=list)           # removal targets with no vote
 
 
 def _new_paper_record(paper_id: str, meta: dict) -> dict:
@@ -2471,12 +2473,28 @@ def _register_vote(paper: dict, paper_id: str, user: str, meta: dict) -> bool:
     return True
 
 
-def _vote_commit_message(user: str, new_ids: list[str]) -> str:
-    """Commit message for a batch: a vote summary, or a display-name-only update."""
-    if not new_ids:
-        return f"display-name: update {user}"
-    ids_str = ", ".join(new_ids[:3]) + ("…" if len(new_ids) > 3 else "")
-    return f"vote: {user} -> [{ids_str}] ({len(new_ids)} papers)"
+def _remove_user_vote(paper: dict, user: str) -> bool:
+    """Drop `user`'s vote from `paper`; True when one was present."""
+    votes = paper.get("votes", [])
+    kept = [v for v in votes if v.get("user") != user]
+    if len(kept) == len(votes):
+        return False
+    paper["votes"] = kept
+    return True
+
+
+def _vote_commit_message(
+    user: str, new_ids: list[str], removed_ids: list[str] | None = None,
+) -> str:
+    """Commit message for a batch: votes, removals, or a display-name-only update."""
+    parts = []
+    if new_ids:
+        ids_str = ", ".join(new_ids[:3]) + ("…" if len(new_ids) > 3 else "")
+        parts.append(f"vote: {user} -> [{ids_str}] ({len(new_ids)} papers)")
+    if removed_ids:
+        ids_str = ", ".join(removed_ids[:3]) + ("…" if len(removed_ids) > 3 else "")
+        parts.append(f"vote-remove: {user} -> [{ids_str}] ({len(removed_ids)} papers)")
+    return "; ".join(parts) if parts else f"display-name: update {user}"
 
 
 def _batch_vote_papers_ssh(
@@ -2486,18 +2504,24 @@ def _batch_vote_papers_ssh(
     display_name: str = "",
     *,
     dry_run: bool = False,
+    removals: list[str] | None = None,
 ) -> VoteResult:
-    """Vote for multiple papers in a single clone/commit/push cycle.
+    """Vote for and/or unvote multiple papers in a single clone/commit/push cycle.
 
-    Each dict in `papers` must have: paper_id, title, url.
+    Each dict in `papers` must have: paper_id, title, url. `removals` holds paper
+    ids whose vote by `user` should be dropped (paper files are deleted when that
+    was the last vote and the paper was not selected for a journal club).
     JC-selected papers are skipped using the same checkout (no extra clone).
     `dry_run=True` clones and stages locally but skips commit/push.
     """
-    if not papers:
+    removals = [_strip_arxiv_version(r) for r in (removals or [])]
+    if not papers and not removals:
         return VoteResult([], [], None)
     voted: list[str] = []
     new_votes: list[str] = []
     skipped_selected: list[str] = []
+    removed: list[str] = []
+    missing: list[str] = []
     outdated_msg: str | None = None
     with _repo_checkout(cfg) as clone_dir:
         selected = _selected_ids_from_checkout(clone_dir)
@@ -2525,17 +2549,40 @@ def _batch_vote_papers_ssh(
             else:
                 print(f"Already voted: {user} -> {paper_id}")
             voted.append(paper_id)
-        # Update display_names.json if the user's entry has changed
-        dn_file = Path(clone_dir) / DISPLAY_NAMES_PATH
-        dn_table: dict = {}
-        if dn_file.exists():
+
+        for paper_id in removals:
+            paper_file = papers_dir / f"{_safe_filename(paper_id)}.json"
+            if not paper_file.exists():
+                missing.append(paper_id)
+                continue
             try:
-                dn_table = json.loads(dn_file.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        dn_changed = _update_dn_table(dn_table, user, display_name)
-        if dn_changed:
-            dn_file.write_text(json.dumps(dn_table, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                paper = json.loads(paper_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                missing.append(paper_id)
+                continue
+            if not _remove_user_vote(paper, user):
+                missing.append(paper_id)
+                continue
+            if not paper.get("votes") and not paper.get("selected"):
+                paper_file.unlink()
+            else:
+                paper_file.write_text(json.dumps(paper, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            removed.append(paper_id)
+
+        # Update display_names.json if the user's entry has changed. Removals
+        # alone must not touch it; display names belong to the vote path.
+        dn_changed = False
+        if papers:
+            dn_file = Path(clone_dir) / DISPLAY_NAMES_PATH
+            dn_table: dict = {}
+            if dn_file.exists():
+                try:
+                    dn_table = json.loads(dn_file.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            dn_changed = _update_dn_table(dn_table, user, display_name)
+            if dn_changed:
+                dn_file.write_text(json.dumps(dn_table, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
         # Client-version high-water-mark, read for free from the checkout. Warn
         # (behind) or self-update (ahead) — never both. The write only rides the
@@ -2546,27 +2593,33 @@ def _batch_vote_papers_ssh(
         outdated_msg = _client_outdated_message(meta_doc)
         _warn_if_client_outdated(meta_doc)
 
+        meta_changed = False
         if new_votes or dn_changed:
             new_meta = _bump_meta_client_version(meta_doc, user)
             meta_changed = new_meta is not None
             if meta_changed:
                 meta_file.write_text(json.dumps(new_meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        if new_votes or removed or dn_changed:
             if dry_run:
                 print(
-                    f"dry-run: would commit {_vote_commit_message(user, new_votes)} "
-                    f"({len(new_votes)} new vote(s))"
+                    f"dry-run: would commit {_vote_commit_message(user, new_votes, removed)} "
+                    f"({len(new_votes)} vote(s), {len(removed)} removal(s))"
                 )
             else:
                 _ensure_commit_identity(clone_dir, user)
-                if new_votes:
-                    _run_git(["add", "papers/"], cwd=clone_dir)
+                if new_votes or removed:
+                    _run_git(["add", "-A", "papers/"], cwd=clone_dir)
                 if dn_changed:
                     _run_git(["add", DISPLAY_NAMES_PATH], cwd=clone_dir)
                 if meta_changed:
                     _run_git(["add", META_PATH], cwd=clone_dir)
-                _run_git(["commit", "-m", _vote_commit_message(user, new_votes)], cwd=clone_dir)
+                _run_git(
+                    ["commit", "-m", _vote_commit_message(user, new_votes, removed)],
+                    cwd=clone_dir,
+                )
                 _run_git(["push", "origin", f"HEAD:{cfg.branch}"], cwd=clone_dir)
-    return VoteResult(voted, new_votes, outdated_msg, skipped_selected)
+    return VoteResult(voted, new_votes, outdated_msg, skipped_selected, removed, missing)
 
 
 def _git_batch_commit(
@@ -2626,15 +2679,19 @@ def _batch_vote_papers_api(
     display_name: str = "",
     *,
     dry_run: bool = False,
+    removals: list[str] | None = None,
 ) -> VoteResult:
-    """Vote for multiple papers in a single Git commit via the GitHub Git Data API.
+    """Vote for and/or unvote multiple papers in a single Git commit via the Git Data API.
 
-    Each dict in `papers` must have: paper_id, title, url.
+    Each dict in `papers` must have: paper_id, title, url. `removals` holds paper
+    ids whose vote by `user` should be dropped (paper files are deleted when that
+    was the last vote and the paper was not selected for a journal club).
     Reduces API calls from 2N sequential to N parallel blob POSTs + 5 overhead calls.
     JC-selected papers are skipped using the same GraphQL round-trip.
     `dry_run=True` reads and plans the commit but does not write.
     """
-    if not papers:
+    removals = [_strip_arxiv_version(r) for r in (removals or [])]
+    if not papers and not removals:
         return VoteResult([], [], None)
 
     base_url = f"https://api.github.com/repos/{cfg.owner}/{cfg.repo}"
@@ -2642,6 +2699,7 @@ def _batch_vote_papers_api(
     # Step 1: fetch all needed paper files + display_names + JC records + meta in one GraphQL request
     aliases: list[str] = []
     alias_map: dict[str, tuple[str, str, dict]] = {}  # alias -> (paper_id, path, input_dict)
+    removal_map: dict[str, tuple[str, str]] = {}      # alias -> (paper_id, path)
     for i, p in enumerate(papers):
         paper_id = _strip_arxiv_version(p["paper_id"])
         path = f"papers/{_safe_filename(paper_id)}.json"
@@ -2650,6 +2708,13 @@ def _batch_vote_papers_api(
             f'{alias}: object(expression: "{cfg.branch}:{path}") {{ ... on Blob {{ text }} }}'
         )
         alias_map[alias] = (paper_id, path, p)
+    for i, paper_id in enumerate(removals):
+        path = f"papers/{_safe_filename(paper_id)}.json"
+        alias = f"r{i}"
+        aliases.append(
+            f'{alias}: object(expression: "{cfg.branch}:{path}") {{ ... on Blob {{ text }} }}'
+        )
+        removal_map[alias] = (paper_id, path)
     aliases.append(
         f'dn: object(expression: "{cfg.branch}:{DISPLAY_NAMES_PATH}") {{ ... on Blob {{ text }} }}'
     )
@@ -2683,9 +2748,13 @@ def _batch_vote_papers_api(
         except Exception:
             pass
 
-    # Step 2: apply votes to each paper dict
+    # Step 2: apply votes and removals to each paper dict
     updates: list[tuple[str, str, dict]] = []  # (path, paper_id, updated_paper)
+    deletions: list[str] = []
     voted: list[str] = []
+    new_ids: list[str] = []
+    removed: list[str] = []
+    missing: list[str] = []
     skipped_selected: list[str] = []
 
     for alias, (paper_id, path, p) in alias_map.items():
@@ -2703,21 +2772,44 @@ def _batch_vote_papers_api(
             paper = _new_paper_record(paper_id, p)
         if _register_vote(paper, paper_id, user, p):
             updates.append((path, paper_id, paper))
+            new_ids.append(paper_id)
         else:
             print(f"Already voted: {user} -> {paper_id}")
         voted.append(paper_id)
 
-    # Check if display_names.json needs updating
-    dn_text = (repo_node.get("dn") or {}).get("text")
-    dn_table: dict[str, str] = {}
-    if dn_text:
+    for alias, (paper_id, path) in removal_map.items():
+        text = (repo_node.get(alias) or {}).get("text")
+        if not text:
+            missing.append(paper_id)
+            continue
         try:
-            dn_table = json.loads(dn_text)
-        except Exception:
-            pass
-    dn_changed = _update_dn_table(dn_table, user, display_name)
-    if dn_changed:
-        updates.append((DISPLAY_NAMES_PATH, "__dn__", dn_table))
+            paper = json.loads(text)
+        except ValueError:
+            missing.append(paper_id)
+            continue
+        if not _remove_user_vote(paper, user):
+            missing.append(paper_id)
+            continue
+        if not paper.get("votes") and not paper.get("selected"):
+            deletions.append(path)
+        else:
+            updates.append((path, paper_id, paper))
+        removed.append(paper_id)
+
+    # Check if display_names.json needs updating. Removals alone must not touch
+    # it; display names belong to the vote path.
+    dn_changed = False
+    if papers:
+        dn_text = (repo_node.get("dn") or {}).get("text")
+        dn_table: dict[str, str] = {}
+        if dn_text:
+            try:
+                dn_table = json.loads(dn_text)
+            except Exception:
+                pass
+        dn_changed = _update_dn_table(dn_table, user, display_name)
+        if dn_changed:
+            updates.append((DISPLAY_NAMES_PATH, "__dn__", dn_table))
 
     # Client-version high-water-mark, read for free from the same query. On this
     # invocation we either warn (behind) or self-update (ahead) — never both.
@@ -2725,22 +2817,23 @@ def _batch_vote_papers_api(
     outdated_msg = _client_outdated_message(meta_doc)
     _warn_if_client_outdated(meta_doc)
 
-    if not updates:
-        return VoteResult(voted, [], outdated_msg, skipped_selected)
+    if not updates and not deletions:
+        return VoteResult(voted, new_ids, outdated_msg, skipped_selected, removed, missing)
 
     # Ride the existing commit only — appended after the empty-updates guard so a
-    # bump can never manufacture a standalone commit.
-    new_meta = _bump_meta_client_version(meta_doc, user)
-    if new_meta is not None:
-        updates.append((META_PATH, "__meta__", new_meta))
+    # bump can never manufacture a standalone commit, and never on removals alone.
+    if new_ids or dn_changed:
+        new_meta = _bump_meta_client_version(meta_doc, user)
+        if new_meta is not None:
+            updates.append((META_PATH, "__meta__", new_meta))
 
-    new_ids = [pid for _, pid, _ in updates if pid not in ("__dn__", "__meta__")]
     if dry_run:
         print(
-            f"dry-run: would commit {_vote_commit_message(user, new_ids)} "
-            f"({len(new_ids)} new vote(s), {len(updates)} file(s))"
+            f"dry-run: would commit {_vote_commit_message(user, new_ids, removed)} "
+            f"({len(new_ids)} vote(s), {len(removed)} removal(s), "
+            f"{len(updates) + len(deletions)} file(s))"
         )
-        return VoteResult(voted, new_ids, outdated_msg, skipped_selected)
+        return VoteResult(voted, new_ids, outdated_msg, skipped_selected, removed, missing)
 
     # Step 3: POST blobs concurrently (one per updated file)
     def _post_blob(path_paper: tuple[str, str, dict]) -> tuple[str, str]:
@@ -2757,15 +2850,19 @@ def _batch_vote_papers_api(
         return path, resp["sha"]
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(updates))) as ex:
-        blob_results = list(ex.map(_post_blob, updates))
+        blob_results = list(ex.map(_post_blob, updates)) if updates else []
 
-    commit_msg = _vote_commit_message(user, new_ids)
+    commit_msg = _vote_commit_message(user, new_ids, removed)
     tree_entries = [
         {"path": path, "mode": "100644", "type": "blob", "sha": blob_sha}
         for path, blob_sha in blob_results
     ]
+    tree_entries.extend(
+        {"path": path, "mode": "100644", "type": "blob", "sha": None}
+        for path in deletions
+    )
     _git_batch_commit(base_url, json_headers, token, cfg.branch, tree_entries, commit_msg)
-    return VoteResult(voted, new_ids, outdated_msg, skipped_selected)
+    return VoteResult(voted, new_ids, outdated_msg, skipped_selected, removed, missing)
 
 
 def _vote_paper_with_metadata(
