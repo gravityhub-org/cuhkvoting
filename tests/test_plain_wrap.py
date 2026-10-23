@@ -69,7 +69,9 @@ class WrapAnsiRowTests(unittest.TestCase):
         lines = cli._wrap_ansi_row(" 1. x  ", "abc" * 20, " " * 8, 20)
         self.assertTrue(all(cli._visible_width(line) <= 20 for line in lines))
         self.assertTrue(all(line.startswith("        ") for line in lines[1:]))
-        self.assertEqual("".join(_visible(line) for line in lines).count("abc"), 20)
+        content = _visible(lines[0])[len(" 1. x  "):] + "".join(
+            _visible(line).strip() for line in lines[1:])
+        self.assertEqual(content, "abc" * 20)
 
     def test_resets_are_kept_and_openers_follow_the_prefix(self) -> None:
         cyan, reset = "\x1b[36m", "\x1b[0m"

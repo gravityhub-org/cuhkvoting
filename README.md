@@ -201,6 +201,31 @@ Titles wrap to the terminal width, with continuation lines aligned under the
 title (and the `topvoted` tie gutter kept unbroken). `abstract_wrap` caps only
 the abstract text; the terminal width caps it further on narrow windows.
 
+### Topvoted row format
+
+`cuhkvoting topvoted` rows can be rearranged with `[display] topvoted_format`.
+The index and the tie gutter (`┳ ┣ ┗`) are always added by the renderer; the
+format controls the row body after them.
+
+| Field | Expands to |
+|-------|------------|
+| `{arxiv}` | arXiv id (clickable in the plain command) |
+| `{title}` | paper title |
+| `{voters}` | bracketed voter names, e.g. `[Ann, Bo]` |
+| `{nb_votes}` | vote count and noun, e.g. `3 votes` |
+| `{days_left}` | days until the vote expires, e.g. `12d` (empty when unknown) |
+
+The default, and the built-in layout, is:
+
+```toml
+topvoted_format = "{arxiv}  {title}  {voters} ⇒ {nb_votes} · {days_left}"
+```
+
+`\t` advances to the next 8-column tab stop; `\n` starts a new row line
+(aligned after the index/gutter, with the `┃` gutter continuing on tie rows).
+Use `{{`/`}}` for literal braces. Invalid formats warn and fall back to the
+default.
+
 ### Configuration file
 
 Config location by platform:
@@ -233,6 +258,9 @@ lastweek_max_age = 360  # minutes
 # 0 = none (default), -1 = full abstract, N = first N wrapped lines.
 abstract_lines = 0
 abstract_wrap = 80      # maximum abstract width (the terminal width caps it)
+# Format of topvoted rows after the index/tie gutter.
+# Fields: {arxiv}, {title}, {voters}, {nb_votes}, {days_left}; \t and \n work.
+topvoted_format = "{arxiv}  {title}  {voters} ⇒ {nb_votes} · {days_left}"
 
 [vote]
 # Show a confirmation prompt when voting by list index (e.g. cuhkvoting vote 3).

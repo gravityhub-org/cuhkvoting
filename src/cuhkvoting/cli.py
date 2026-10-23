@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import ssl
+import string
 import subprocess
 import sys
 import tarfile
@@ -91,6 +92,10 @@ DEFAULT_TODAY_MAX_AGE = 60
 DEFAULT_LASTWEEK_MAX_AGE = 360
 DEFAULT_ABSTRACT_LINES = 0
 DEFAULT_ABSTRACT_WRAP = 80
+# Row body after the index/tie gutter. Fields: arxiv, title, voters, nb_votes,
+# days_left. Two spaces reproduce the historical layout exactly.
+DEFAULT_TOPVOTED_FORMAT = "{arxiv}  {title}  {voters} ⇒ {nb_votes} · {days_left}"
+TOPVOTED_FORMAT_FIELDS = frozenset({"arxiv", "title", "voters", "nb_votes", "days_left"})
 DEFAULT_HIGHLIGHT_AUTHORS: list[str] = []
 DEFAULT_HIGHLIGHT_KEYWORDS: list[str] = []
 DEFAULT_HIGHLIGHT_KEYWORD_COUNT = -1
@@ -132,6 +137,7 @@ class Config:
     highlight_keywords: list[str]
     highlight_keyword_count: int
     highlight_glyph: str
+    topvoted_format: str = DEFAULT_TOPVOTED_FORMAT
 
 
 def _load_config() -> Config:
@@ -152,6 +158,8 @@ def _load_config() -> Config:
                 lastweek_max_age=int(cache_cfg.get("lastweek_max_age", DEFAULT_LASTWEEK_MAX_AGE)),
                 abstract_lines=int(display_cfg.get("abstract_lines", DEFAULT_ABSTRACT_LINES)),
                 abstract_wrap=int(display_cfg.get("abstract_wrap", DEFAULT_ABSTRACT_WRAP)),
+                topvoted_format=_validated_topvoted_format(
+                    display_cfg.get("topvoted_format", DEFAULT_TOPVOTED_FORMAT)),
                 confirm_by_number=bool(vote_cfg.get("confirm_by_number", True)),
                 display_name=str(vote_cfg.get("display_name", "")),
                 display_name_overrides=dn_overrides,
@@ -1072,13 +1080,144 @@ def _terminal_width() -> int:
     return max(20, shutil.get_terminal_size(fallback=(80, 24)).columns)
 
 
-def _wrap_plain_spans(text: str, width: int) -> list[tuple[int, int]]:
+def _parse_topvoted_format(fmt: str) -> list[tuple[str, str]] | None:
+    """Topvoted format -> ("lit"|"field", text) tokens; None when invalid.
+
+    Only the documented fields are accepted, with no format spec or conversion.
+    ``{{``/``}}`` escape literal braces via ``string.Formatter``.
+    """
+    try:
+        parts = list(string.Formatter().parse(fmt))
+    except ValueError:
+        return None
+    tokens: list[tuple[str, str]] = []
+    for literal, field_name, spec, conversion in parts:
+        if literal:
+            tokens.append(("lit", literal))
+        if field_name is not None:
+            if field_name not in TOPVOTED_FORMAT_FIELDS or spec or conversion:
+                return None
+            tokens.append(("field", field_name))
+    return tokens
+
+
+def _validated_topvoted_format(raw: object) -> str:
+    fmt = str(raw)
+    if _parse_topvoted_format(fmt) is None:
+        typer.echo(
+            typer.style(
+                f"Warning: invalid topvoted_format in {CONFIG_PATH}; using the default.",
+                fg=typer.colors.YELLOW,
+            ),
+            err=True,
+        )
+        return DEFAULT_TOPVOTED_FORMAT
+    return fmt
+
+
+def _topvoted_field_values(p: dict) -> dict[str, str]:
+    """Text substituted for each ``topvoted_format`` placeholder."""
+    n = int(p.get("votes", 0))
+    days = p.get("expires_in_days")
+    voters = str(p.get("voters", "")).strip() or "-"
+    return {
+        "arxiv": _strip_arxiv_version(str(p.get("id", ""))),
+        "title": " ".join(str(p.get("title", "")).split()),
+        "voters": f"[{voters}]",
+        "nb_votes": f"{n} vote" + ("s" if n != 1 else ""),
+        "days_left": f"{int(days)}d" if days is not None else "",
+    }
+
+
+def _expand_tabs(text: str, start_col: int = 0, tab_size: int = 8) -> str:
+    """Expand tabs to spaces at 8-column stops, ignoring ANSI/OSC sequences."""
+    out: list[str] = []
+    col = start_col
+    pos = 0
+
+    def emit(chunk: str) -> None:
+        nonlocal col
+        for ch in chunk:
+            if ch == "\t":
+                spaces = tab_size - (col % tab_size)
+                out.append(" " * spaces)
+                col += spaces
+            elif ch == "\n":
+                out.append(ch)
+                col = 0
+            else:
+                out.append(ch)
+                col += 1
+
+    for match in _ANSI_SEQ_RE.finditer(text):
+        emit(text[pos:match.start()])
+        out.append(match.group(0))
+        pos = match.end()
+    emit(text[pos:])
+    return "".join(out)
+
+
+def _split_format_lines(
+    tokens: list[tuple[str, str]],
+) -> list[list[tuple[str, str]]]:
+    """Split format tokens on literal newlines (a new line per ``\\n``)."""
+    lines: list[list[tuple[str, str]]] = [[]]
+    for kind, text in tokens:
+        if kind == "field":
+            lines[-1].append((kind, text))
+            continue
+        parts = text.split("\n")
+        for i, part in enumerate(parts):
+            if part:
+                lines[-1].append(("lit", part))
+            if i < len(parts) - 1:
+                lines.append([])
+    return lines
+
+
+def _plain_topvoted_line(
+    tokens: list[tuple[str, str]], values: dict[str, str], start_col: int,
+) -> tuple[str, int | None]:
+    """Render one format line as ANSI text; return (body, absolute title column)."""
+    out: list[str] = []
+    col = start_col
+    title_col: int | None = None
+    for kind, text in tokens:
+        if kind == "lit":
+            expanded = _expand_tabs(text, col)
+            out.append(expanded)
+            col += len(expanded)
+            continue
+        if text == "title" and title_col is None:
+            title_col = col
+        value = values[text]
+        if text == "arxiv":
+            rendered = _format_clickable_id(value)
+            width = _visible_width(rendered)
+        elif text in ("voters", "nb_votes", "days_left"):
+            rendered = typer.style(value, fg=typer.colors.CYAN) if value else ""
+            width = len(value)
+        else:  # title
+            rendered = value
+            width = len(value)
+        out.append(rendered)
+        col += width
+    return "".join(out), title_col
+
+
+def _wrap_plain_spans(
+    text: str, first_width: int, cont_width: int | None = None,
+) -> list[tuple[int, int]]:
     """Greedy word wrap for plain text: [start, end) spans per line.
 
+    The first line may have a different capacity than continuations (a shorter
+    prefix, e.g. when a custom row format does not start with the title).
     Mirrors interactive mode: spaces at a break are dropped, space runs inside
     a line are preserved, and words longer than a line are hard-broken.
     """
-    width = max(1, width)
+    first_width = max(1, first_width)
+    cont_width = max(1, first_width if cont_width is None else cont_width)
+    width = first_width
     spans: list[tuple[int, int]] = []
     n = len(text)
     i = 0
@@ -1106,6 +1245,7 @@ def _wrap_plain_spans(text: str, width: int) -> list[tuple[int, int]]:
             spans.append((line_start, prev_end))
             line_start = i
             used = 0
+            width = cont_width
         pos, remaining = i, wlen
         while remaining:
             cap = width - used
@@ -1113,6 +1253,7 @@ def _wrap_plain_spans(text: str, width: int) -> list[tuple[int, int]]:
                 spans.append((line_start, pos))
                 line_start = pos
                 used = 0
+                width = cont_width
                 cap = width
             take = min(remaining, cap)
             used += take
@@ -1122,6 +1263,7 @@ def _wrap_plain_spans(text: str, width: int) -> list[tuple[int, int]]:
                 spans.append((line_start, pos))
                 line_start = pos
                 used = 0
+                width = cont_width
         prev_end = pos
         pending = 0
         i = j
@@ -1187,8 +1329,9 @@ def _wrap_ansi_row(
     opening codes after it, so the gutter never inherits a neighbour's color.
     """
     chars, pre, tail = _ansi_atoms(body)
-    prefix_w = max(_visible_width(first_prefix), _visible_width(cont_prefix))
-    spans = _wrap_plain_spans("".join(chars), max(1, width - prefix_w))
+    first_w = max(1, width - _visible_width(first_prefix))
+    cont_w = max(1, width - _visible_width(cont_prefix))
+    spans = _wrap_plain_spans("".join(chars), first_w, cont_w)
     if not spans:
         return [first_prefix + "".join(pre) + tail] if (first_prefix or pre or tail) else []
     lines = []
@@ -2518,6 +2661,25 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
     width = _terminal_width()
     has_ties = any(len(g) > 1 for g in groups)
     w = len(str(len(topn)))
+    box_col = w + 2  # 0-based column of the tie box/gutter glyph
+    start_col = w + 4 if has_ties else w + 2  # template body column
+
+    fmt = getattr(cfg, "topvoted_format", DEFAULT_TOPVOTED_FORMAT)
+    custom = fmt != DEFAULT_TOPVOTED_FORMAT
+    tokens = _parse_topvoted_format(fmt) if custom else None
+    if tokens is None:
+        custom = False
+    fmt_lines: list[list[tuple[str, str]]] = []
+    if custom:
+        fmt_lines = _split_format_lines(tokens)
+        while fmt_lines and not fmt_lines[-1]:  # a trailing newline adds no row
+            fmt_lines.pop()
+
+    def gutter_prefix(col: int) -> str:
+        """Spaces (with ┃ for a continuing tie group) up to absolute column `col`."""
+        if has_ties and not is_last:
+            return " " * box_col + "┃ " + " " * max(0, col - box_col - 2)
+        return " " * col
 
     idx = 1
     for group in groups:
@@ -2527,7 +2689,6 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
             grey = not is_first
 
             idx_str = typer.style(f"{idx:>{w}}.", fg=typer.colors.BRIGHT_BLACK) if grey else f"{idx:>{w}}."
-            id_str = _format_clickable_id(p["id"])
             if has_ties:
                 if len(group) == 1:
                     box = " "
@@ -2538,28 +2699,54 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
                 else:
                     box = "┣"
                 abs_prefix = f"{' ' * (w + 2)}┃ " if not is_last else f"{' ' * (w + 4)}"
-                first_prefix = f"{idx_str} {box} {id_str}  "
-                if not is_last:
-                    # Keep the tie gutter unbroken under wrapped title/author lines.
-                    cont_prefix = " " * (w + 2) + "┃ " + " " * (_visible_width(id_str) + 2)
-                else:
-                    cont_prefix = " " * _visible_width(first_prefix)
+                head_prefix = f"{idx_str} {box} "
             else:
                 box = ""
                 abs_prefix = f"{' ' * (w + 2)}"
-                first_prefix = f"{idx_str} {id_str}  "
-                cont_prefix = " " * _visible_width(first_prefix)
+                head_prefix = f"{idx_str} "
 
-            n = p["votes"]
-            vote_label = f"{n} vote" + ("s" if n != 1 else "")
-            days = p.get("expires_in_days")
-            if days is not None:
-                vote_label = f"{vote_label} · {days}d"
-            voters_str = typer.style(f"[{p['voters']}] ⇒ {vote_label}", fg=typer.colors.CYAN)
-            title = " ".join(str(p.get("title", "")).split())
-            body = f"{title}  {voters_str}"
-            for line in _wrap_ansi_row(first_prefix, body, cont_prefix, width):
-                print(line)
+            if custom:
+                values = _topvoted_field_values(p)
+                first_line = True
+                for line_tokens in fmt_lines:
+                    if not line_tokens:
+                        continue
+                    body, title_col = _plain_topvoted_line(line_tokens, values, start_col)
+                    if not body:
+                        continue
+                    first_prefix = head_prefix if first_line else gutter_prefix(start_col)
+                    cont_prefix = gutter_prefix(
+                        title_col if title_col is not None else start_col)
+                    for line in _wrap_ansi_row(first_prefix, body, cont_prefix, width):
+                        print(line)
+                    first_line = False
+                if first_line:  # all template lines empty: keep the index visible
+                    print(head_prefix.rstrip())
+            else:
+                id_str = _format_clickable_id(p["id"])
+                if has_ties:
+                    first_prefix = f"{idx_str} {box} {id_str}  "
+                    if not is_last:
+                        # Keep the tie gutter unbroken under wrapped title/author lines.
+                        cont_prefix = (
+                            " " * (w + 2) + "┃ " + " " * (_visible_width(id_str) + 2))
+                    else:
+                        cont_prefix = " " * _visible_width(first_prefix)
+                else:
+                    first_prefix = f"{idx_str} {id_str}  "
+                    cont_prefix = " " * _visible_width(first_prefix)
+
+                n = p["votes"]
+                vote_label = f"{n} vote" + ("s" if n != 1 else "")
+                days = p.get("expires_in_days")
+                if days is not None:
+                    vote_label = f"{vote_label} · {days}d"
+                voters_str = typer.style(
+                    f"[{p['voters']}] ⇒ {vote_label}", fg=typer.colors.CYAN)
+                title = " ".join(str(p.get("title", "")).split())
+                body = f"{title}  {voters_str}"
+                for line in _wrap_ansi_row(first_prefix, body, cont_prefix, width):
+                    print(line)
 
             for line in _wrap_abstract(
                 p.get("abstract", ""), abstract_lines, cfg.abstract_wrap, abs_prefix, width,
@@ -3696,6 +3883,10 @@ def init_config(
         '# 0 = none (default), -1 = full abstract, N = first N wrapped lines.\n'
         'abstract_lines = 0\n'
         'abstract_wrap = 80      # maximum abstract width (the terminal width caps it)\n'
+        '# Format of topvoted rows after the index/tie gutter.\n'
+        '# Fields: {arxiv}, {title}, {voters}, {nb_votes}, {days_left}.\n'
+        '# Use \\t for a tab and \\n for a new line.\n'
+        'topvoted_format = "{arxiv}  {title}  {voters} ⇒ {nb_votes} · {days_left}"\n'
         '\n'
         '[vote]\n'
         '# Show a confirmation prompt when voting by list index (e.g. cuhkvoting vote 3).\n'

@@ -187,6 +187,10 @@ page_down = "c-f"        # control keys use prompt_toolkit names
 Invalid overrides are reported as a warning at startup and fall back to the
 defaults. The help screen (`:h`) always reflects the effective keymap.
 
+The plain `topvoted` command's row layout is controlled by
+`[display] topvoted_format` (see the README); interactive rows keep the layout
+described above.
+
 ## Current limitations
 
 - `--category`, `--limit`, and `--max-age` are not yet accepted by
