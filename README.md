@@ -197,6 +197,10 @@ cuhkvoting today --abstract 3     # first 3 wrapped lines
 cuhkvoting today --abstract 0     # no abstract (default)
 ```
 
+Titles wrap to the terminal width, with continuation lines aligned under the
+title (and the `topvoted` tie gutter kept unbroken). `abstract_wrap` caps only
+the abstract text; the terminal width caps it further on narrow windows.
+
 ### Configuration file
 
 Config location by platform:
@@ -228,7 +232,7 @@ lastweek_max_age = 360  # minutes
 # Number of abstract lines to show per entry.
 # 0 = none (default), -1 = full abstract, N = first N wrapped lines.
 abstract_lines = 0
-abstract_wrap = 80      # line wrap width in characters
+abstract_wrap = 80      # maximum abstract width (the terminal width caps it)
 
 [vote]
 # Show a confirmation prompt when voting by list index (e.g. cuhkvoting vote 3).

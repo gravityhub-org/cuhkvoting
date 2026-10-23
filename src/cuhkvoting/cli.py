@@ -1044,13 +1044,194 @@ def _format_author_lastnames(authors: list[str], max_authors: int = 3) -> str:
     return ", ".join(chosen)
 
 
-def _format_abstract(abstract: str, lines: int, wrap: int) -> str:
+_ANSI_SEQ_RE = re.compile(
+    r"""
+    \x1b
+    (?:
+        \[ [0-?]* [ -/]* [@-~]              # CSI: colors, cursor movement, ...
+      | \] [^\x07\x1b]* (?:\x07|\x1b\\)    # OSC: e.g. OSC 8 hyperlinks
+      | [@-_]                              # other two-byte escapes
+    )
+    """,
+    re.VERBOSE,
+)
+
+
+def _strip_ansi(text: str) -> str:
+    """Visible text without terminal escape sequences."""
+    return _ANSI_SEQ_RE.sub("", text)
+
+
+def _visible_width(text: str) -> int:
+    """Display width of `text`, ignoring terminal escape sequences."""
+    return len(_strip_ansi(text))
+
+
+def _terminal_width() -> int:
+    """Columns to wrap normal-mode output at (80 when there is no terminal)."""
+    return max(20, shutil.get_terminal_size(fallback=(80, 24)).columns)
+
+
+def _wrap_plain_spans(text: str, width: int) -> list[tuple[int, int]]:
+    """Greedy word wrap for plain text: [start, end) spans per line.
+
+    Mirrors interactive mode: spaces at a break are dropped, space runs inside
+    a line are preserved, and words longer than a line are hard-broken.
+    """
+    width = max(1, width)
+    spans: list[tuple[int, int]] = []
+    n = len(text)
+    i = 0
+    line_start = -1
+    used = 0
+    pending = 0
+    prev_end = 0
+    while i < n:
+        if text[i].isspace():
+            j = i
+            while j < n and text[j].isspace():
+                j += 1
+            pending = j - i
+            i = j
+            continue
+        j = i
+        while j < n and not text[j].isspace():
+            j += 1
+        wlen = j - i
+        if line_start < 0:
+            line_start = i
+        elif used + pending + wlen <= width:
+            used += pending  # keep the gap; the word itself is counted below
+        else:
+            spans.append((line_start, prev_end))
+            line_start = i
+            used = 0
+        pos, remaining = i, wlen
+        while remaining:
+            cap = width - used
+            if cap <= 0:
+                spans.append((line_start, pos))
+                line_start = pos
+                used = 0
+                cap = width
+            take = min(remaining, cap)
+            used += take
+            pos += take
+            remaining -= take
+            if remaining:  # hard-break an overlong word
+                spans.append((line_start, pos))
+                line_start = pos
+                used = 0
+        prev_end = pos
+        pending = 0
+        i = j
+    if line_start >= 0 and prev_end > line_start:
+        spans.append((line_start, prev_end))
+    return spans
+
+
+def _ansi_atoms(text: str) -> tuple[list[str], list[str], str]:
+    """Split styled text into visible chars, pre-char escapes, and trailing escapes."""
+    chars: list[str] = []
+    pre: list[str] = []
+    pending: list[str] = []
+    pos = 0
+    for match in _ANSI_SEQ_RE.finditer(text):
+        for ch in text[pos:match.start()]:
+            chars.append(ch)
+            pre.append("".join(pending))
+            pending.clear()
+        pending.append(match.group(0))
+        pos = match.end()
+    for ch in text[pos:]:
+        chars.append(ch)
+        pre.append("".join(pending))
+        pending.clear()
+    return chars, pre, "".join(pending)
+
+
+def _is_reset_ansi(seq: str) -> bool:
+    """True for a sequence that ends the current style (SGR reset or OSC 8 close)."""
+    if seq.startswith("\x1b["):
+        params = seq[2:-1]
+        if not params or params == "0":
+            return True
+        try:
+            return all(
+                int(part or "0") in {0, 22, 23, 24, 25, 27, 28, 29, 39, 49}
+                for part in params.split(";")
+            )
+        except ValueError:
+            return False
+    return seq in ("\x1b]8;;\x1b\\", "\x1b]8;;\x07")
+
+
+def _split_gap_escapes(gap: str) -> tuple[str, str]:
+    """Split escapes in a dropped word gap into (close before break, open after)."""
+    closes: list[str] = []
+    opens: list[str] = []
+    for seq in _ANSI_SEQ_RE.findall(gap):
+        (closes if _is_reset_ansi(seq) else opens).append(seq)
+    return "".join(closes), "".join(opens)
+
+
+def _wrap_ansi_row(
+    first_prefix: str, body: str, cont_prefix: str, width: int,
+) -> list[str]:
+    """Wrap one terminal-styled row, aligning continuations under the title.
+
+    `first_prefix` starts the row (index, ID, tie box, ...); `cont_prefix`
+    starts wrapped lines (plain spaces, or spaces with a `┃` gutter). Escape
+    sequences are preserved and ignored for width, so author/keyword highlights
+    and OSC 8 hyperlinks survive the reflow. Resets land before a break and
+    opening codes after it, so the gutter never inherits a neighbour's color.
+    """
+    chars, pre, tail = _ansi_atoms(body)
+    prefix_w = max(_visible_width(first_prefix), _visible_width(cont_prefix))
+    spans = _wrap_plain_spans("".join(chars), max(1, width - prefix_w))
+    if not spans:
+        return [first_prefix + "".join(pre) + tail] if (first_prefix or pre or tail) else []
+    lines = []
+    # Escapes before the first kept character (leading spaces may be dropped).
+    carry = "".join(pre[:spans[0][0] + 1])
+    for i, (start, end) in enumerate(spans):
+        parts = [carry]
+        for j in range(start, end):
+            if j > start:
+                parts.append(pre[j])
+            parts.append(chars[j])
+        if i + 1 < len(spans):
+            gap = "".join(pre[end:spans[i + 1][0] + 1])
+            close, carry = _split_gap_escapes(gap)
+            parts.append(close)
+        else:
+            parts.append("".join(pre[end:]) + tail)
+            carry = ""
+        lines.append((first_prefix if i == 0 else cont_prefix) + "".join(parts))
+    return lines
+
+
+def _wrap_abstract(
+    abstract: str, lines: int, wrap: int, prefix: str, width: int | None = None,
+) -> list[str]:
+    """Wrap an abstract to min(`wrap`, available width), prefixing every line.
+
+    `wrap` (`[display] abstract_wrap`) is a maximum for the abstract text; the
+    terminal width minus `prefix` can make the column narrower. `lines` < 0
+    keeps the whole abstract.
+    """
     if lines == 0 or not abstract:
-        return ""
-    wrapped = textwrap.wrap(abstract, width=wrap)
+        return []
+    available = max(1, int(wrap))
+    if width is not None:
+        available = min(available, max(1, width - _visible_width(prefix)))
+    wrapped = textwrap.wrap(abstract, width=available)
     chosen = wrapped if lines < 0 else wrapped[:lines]
-    indent = "      "
-    return "\n".join(indent + line for line in chosen)
+    return [prefix + line for line in chosen]
+
+
+def _format_abstract(abstract: str, lines: int, wrap: int, width: int | None = None) -> str:
+    return "\n".join(_wrap_abstract(abstract, lines, wrap, "      ", width))
 
 
 def _author_matches_highlight(author: str, highlight: str) -> bool:
@@ -2092,17 +2273,22 @@ def _print_entry_list(
     abstract_lines: int,
     highlight_kw_count: int,
 ) -> None:
+    width = _terminal_width()
     for idx, p in enumerate(entries, 1):
         authors = p.get("authors", [])
         lastnames = _format_author_lastnames_highlighted(authors, 3, cfg.highlight_authors)
-        title = p.get("title", "")
+        title = " ".join(str(p.get("title", "")).split())
         abstract_text = p.get("abstract", "")
         kw_suffix = ""
         if cfg.highlight_keywords:
             matches = _find_keyword_matches([title, abstract_text], cfg.highlight_keywords)
             kw_suffix = _format_kw_suffix(matches, highlight_kw_count, cfg.highlight_glyph)
-        print(f"{idx:>2}. {_format_clickable_id(p['id'])}  {title}  [{lastnames}]{kw_suffix}")
-        abstract = _format_abstract(abstract_text, abstract_lines, cfg.abstract_wrap)
+        first_prefix = f"{idx:>2}. {_format_clickable_id(p['id'])}  "
+        cont_prefix = " " * _visible_width(first_prefix)
+        body = f"{title}  [{lastnames}]{kw_suffix}"
+        for line in _wrap_ansi_row(first_prefix, body, cont_prefix, width):
+            print(line)
+        abstract = _format_abstract(abstract_text, abstract_lines, cfg.abstract_wrap, width)
         if abstract and cfg.highlight_keywords:
             abstract = _apply_keyword_highlights(abstract, cfg.highlight_keywords)
         if abstract:
@@ -2190,9 +2376,14 @@ def cmd_search(args: SimpleNamespace) -> int:
         print(data.empty_msg)
         return 0
     _save_last_list(data.entries)
+    width = _terminal_width()
     for idx, p in enumerate(data.entries, 1):
         pid = str(p.get("id", ""))
-        print(f"{idx:>2}. {_format_clickable_id(pid)}  {p['title']}")
+        first_prefix = f"{idx:>2}. {_format_clickable_id(pid)}  "
+        cont_prefix = " " * _visible_width(first_prefix)
+        title = " ".join(str(p.get("title", "")).split())
+        for line in _wrap_ansi_row(first_prefix, title, cont_prefix, width):
+            print(line)
     return 0
 
 
@@ -2324,6 +2515,7 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
         else:
             groups.append([p])
 
+    width = _terminal_width()
     has_ties = any(len(g) > 1 for g in groups)
     w = len(str(len(topn)))
 
@@ -2334,6 +2526,8 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
             is_last = k == len(group) - 1
             grey = not is_first
 
+            idx_str = typer.style(f"{idx:>{w}}.", fg=typer.colors.BRIGHT_BLACK) if grey else f"{idx:>{w}}."
+            id_str = _format_clickable_id(p["id"])
             if has_ties:
                 if len(group) == 1:
                     box = " "
@@ -2344,27 +2538,33 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
                 else:
                     box = "┣"
                 abs_prefix = f"{' ' * (w + 2)}┃ " if not is_last else f"{' ' * (w + 4)}"
+                first_prefix = f"{idx_str} {box} {id_str}  "
+                if not is_last:
+                    # Keep the tie gutter unbroken under wrapped title/author lines.
+                    cont_prefix = " " * (w + 2) + "┃ " + " " * (_visible_width(id_str) + 2)
+                else:
+                    cont_prefix = " " * _visible_width(first_prefix)
             else:
                 box = ""
                 abs_prefix = f"{' ' * (w + 2)}"
+                first_prefix = f"{idx_str} {id_str}  "
+                cont_prefix = " " * _visible_width(first_prefix)
 
-            idx_str = typer.style(f"{idx:>{w}}.", fg=typer.colors.BRIGHT_BLACK) if grey else f"{idx:>{w}}."
             n = p["votes"]
             vote_label = f"{n} vote" + ("s" if n != 1 else "")
             days = p.get("expires_in_days")
             if days is not None:
                 vote_label = f"{vote_label} · {days}d"
             voters_str = typer.style(f"[{p['voters']}] ⇒ {vote_label}", fg=typer.colors.CYAN)
-            if has_ties:
-                print(f"{idx_str} {box} {_format_clickable_id(p['id'])}  {p['title']}  {voters_str}")
-            else:
-                print(f"{idx_str} {_format_clickable_id(p['id'])}  {p['title']}  {voters_str}")
+            title = " ".join(str(p.get("title", "")).split())
+            body = f"{title}  {voters_str}"
+            for line in _wrap_ansi_row(first_prefix, body, cont_prefix, width):
+                print(line)
 
-            if abstract_lines:
-                wrapped = textwrap.wrap(p.get("abstract", ""), width=cfg.abstract_wrap)
-                shown = wrapped if abstract_lines < 0 else wrapped[:abstract_lines]
-                for al in shown:
-                    print(abs_prefix + al)
+            for line in _wrap_abstract(
+                p.get("abstract", ""), abstract_lines, cfg.abstract_wrap, abs_prefix, width,
+            ):
+                print(line)
 
             idx += 1
     return 0
@@ -2373,13 +2573,14 @@ def cmd_topvoted(args: SimpleNamespace) -> int:
 def cmd_show(args: SimpleNamespace) -> int:
     cfg = _load_config()
     resolved = _resolve_paper_ids(args.paper_ids)
+    width = _terminal_width()
     for i, (arxiv_id, _title, _idx) in enumerate(resolved):
         entry = _lookup_local_cache(arxiv_id)
         if entry is None:
             entry = _validate_arxiv_entry(arxiv_id)
         authors = entry.get("authors", [])
         lastnames = _format_author_lastnames_highlighted(authors, 3, cfg.highlight_authors)
-        title = entry.get("title", "")
+        title = " ".join(str(entry.get("title", "")).split())
         abstract_text = entry.get("abstract", "")
         kw_suffix = ""
         if cfg.highlight_keywords:
@@ -2387,8 +2588,12 @@ def cmd_show(args: SimpleNamespace) -> int:
             kw_suffix = _format_kw_suffix(matches, cfg.highlight_keyword_count, cfg.highlight_glyph)
         if i > 0:
             print()
-        print(f"{_format_clickable_id(arxiv_id)}  {title}  [{lastnames}]{kw_suffix}")
-        abstract = _format_abstract(abstract_text, -1, cfg.abstract_wrap)
+        first_prefix = f"{_format_clickable_id(arxiv_id)}  "
+        cont_prefix = " " * _visible_width(first_prefix)
+        body = f"{title}  [{lastnames}]{kw_suffix}"
+        for line in _wrap_ansi_row(first_prefix, body, cont_prefix, width):
+            print(line)
+        abstract = _format_abstract(abstract_text, -1, cfg.abstract_wrap, width)
         if abstract and cfg.highlight_keywords:
             abstract = _apply_keyword_highlights(abstract, cfg.highlight_keywords)
         if abstract:
@@ -3113,13 +3318,20 @@ def cmd_record(args: SimpleNamespace) -> int:
         return 0
     name_table = {**dn_table, **app_cfg.display_name_overrides}
     rows = sorted(records, key=lambda r: str(r.get("selected_at", "")), reverse=True)
+    width = _terminal_width()
     for i, r in enumerate(rows, 1):
         week = str(r.get("week", "?"))
         arxiv_id = str(r.get("arxiv_id", "?"))
-        title = str(r.get("title", "(no title)"))
+        title = " ".join(str(r.get("title", "(no title)")).split())
         hist = int(r.get("historical_vote", 0))
         selected_by = _resolve_display_name(str(r.get("selected_by", "?")), name_table)
-        print(f"{i:>2}. {week}  {_format_clickable_id(arxiv_id)}  votes:{hist}  by:{selected_by}  {title}")
+        first_prefix = (
+            f"{i:>2}. {week}  {_format_clickable_id(arxiv_id)}  "
+            f"votes:{hist}  by:{selected_by}  "
+        )
+        cont_prefix = " " * _visible_width(first_prefix)
+        for line in _wrap_ansi_row(first_prefix, title, cont_prefix, width):
+            print(line)
     return 0
 
 
@@ -3366,12 +3578,17 @@ def vote_command(
     if has_index and cfg.confirm_by_number:
         max_idx = max(idx for _, _, idx in resolved if idx is not None)
         w = len(str(max_idx))
+        width = _terminal_width()
         typer.echo("You are about to vote for:")
         for arxiv_id, title, idx in resolved:
             if idx is not None:
-                typer.echo(f"  {idx:>{w}}. {arxiv_id}  {title or ''}")
+                first_prefix = f"  {idx:>{w}}. {arxiv_id}  "
             else:
-                typer.echo(f"  {' ' * (w + 2)}{arxiv_id}  {title or ''}")
+                first_prefix = f"  {' ' * (w + 2)}{arxiv_id}  "
+            cont_prefix = " " * _visible_width(first_prefix)
+            body = " ".join(str(title or "").split())
+            for line in _wrap_ansi_row(first_prefix, body, cont_prefix, width):
+                typer.echo(line)
         typer.confirm("Proceed?", abort=True)
     user = _resolve_user(token)
     display_name = cfg.display_name
@@ -3478,7 +3695,7 @@ def init_config(
         '# Number of abstract lines to show per entry.\n'
         '# 0 = none (default), -1 = full abstract, N = first N wrapped lines.\n'
         'abstract_lines = 0\n'
-        'abstract_wrap = 80      # line wrap width in characters\n'
+        'abstract_wrap = 80      # maximum abstract width (the terminal width caps it)\n'
         '\n'
         '[vote]\n'
         '# Show a confirmation prompt when voting by list index (e.g. cuhkvoting vote 3).\n'

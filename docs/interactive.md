@@ -186,6 +186,6 @@ defaults. The help screen (`:h`) always reflects the effective keymap.
 - The mouse wheel scrolls the list; once the selection reaches the window edge
   it is dragged along, so the viewport never scrolls past the selection.
 - Titles and abstracts reflow to the terminal width and re-wrap when the
-  window is resized; the `[display] abstract_wrap` setting only applies to the
-  plain commands.
+  window is resized; the `[display] abstract_wrap` setting only caps the plain
+  commands' abstract width (it does not apply here).
 - A pending `g`/`z` prefix is not echoed in the input line (counts are).
