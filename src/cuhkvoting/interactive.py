@@ -210,6 +210,9 @@ class Session:
         self.exit_after_write = False
         self.theme = theme
         self.outdated_msg: str | None = None
+        # Set by actions that move the selection or change an abstract fold;
+        # the TUI consumes it on the next render to keep the block in view.
+        self.reveal_pending = False
 
     # -- view helpers ------------------------------------------------------
 
@@ -231,22 +234,33 @@ class Session:
 
     # -- movement ----------------------------------------------------------
 
-    def move(self, n: int) -> None:
+    def move(self, n: int, *, reveal: bool = True) -> None:
         vis = self.visible()
         if vis:
-            self.cursor = max(0, min(len(vis) - 1, self.cursor + n))
+            new = max(0, min(len(vis) - 1, self.cursor + n))
+            if new != self.cursor:
+                self.cursor = new
+                if reveal:
+                    self.reveal_pending = True
 
     def jump_first(self) -> None:
-        self.cursor = 0
+        if self.cursor != 0:
+            self.cursor = 0
+            self.reveal_pending = True
 
     def jump_last(self) -> None:
-        self.cursor = max(0, len(self.visible()) - 1)
+        new = max(0, len(self.visible()) - 1)
+        if new != self.cursor:
+            self.cursor = new
+            self.reveal_pending = True
 
     def jump_index(self, index: int) -> None:
         """Jump to the paper whose full-list index is `index` (1-based)."""
         for pos, paper in enumerate(self.visible()):
             if paper.index == index:
-                self.cursor = pos
+                if pos != self.cursor:
+                    self.cursor = pos
+                    self.reveal_pending = True
                 return
         self.feedback = f"No paper {index} in the current list"
 
@@ -264,6 +278,7 @@ class Session:
             return
         if self.voting or self.unvoting:
             self.move(0)  # re-clamp: the row under the cursor vanished
+            self.reveal_pending = True
         else:
             self.exit_ls()
             self.feedback = f"{message} — nothing staged"
@@ -313,6 +328,7 @@ class Session:
         staged = set(self.voting) | set(self.unvoting)
         if cur is not None and str(cur.entry.get("id", "")) in staged:
             self.jump_index(cur.index)
+        self.reveal_pending = True
 
     def exit_ls(self) -> None:
         if not self.ls_only:
@@ -323,34 +339,47 @@ class Session:
             self.jump_index(cur.index)
         else:
             self.cursor = 0
+        self.reveal_pending = True
 
     # -- abstract folds ----------------------------------------------------
 
     def toggle_abstract(self) -> None:
         p = self.current()
         if p is not None:
+            was_open = self.abstract_open(p)
             p.open = not p.open
+            if self.abstract_open(p) != was_open:
+                self.reveal_pending = True
 
     def open_abstract(self) -> None:
         p = self.current()
-        if p is not None:
+        if p is not None and not self.abstract_open(p):
             p.open = True  # spec: does nothing if already open
+            self.reveal_pending = True
 
     def close_abstract(self) -> None:
         p = self.current()
-        if p is not None:
+        if p is not None and self.abstract_open(p):
             p.open = False
+            self.reveal_pending = True
 
     def open_all(self) -> None:
+        changed = any(not self.abstract_open(p) for p in self.papers)
         for p in self.papers:
             p.open = True
+        if changed:
+            self.reveal_pending = True
 
     def close_all(self) -> None:
+        changed = any(self.abstract_open(p) for p in self.papers)
         for p in self.papers:
             p.open = False
+        if changed:
+            self.reveal_pending = True
 
     def toggle_follow(self) -> None:
         self.follow = not self.follow
+        self.reveal_pending = True
         self.feedback = (
             "Follow mode: the selected abstract stays open"
             if self.follow else "Follow mode off"
@@ -398,7 +427,9 @@ class Session:
         for k in range(1, n + 1):  # wraps; lands back on the cursor if unique
             i = (self.cursor + step * k) % n
             if pat in self._haystack(vis[i]):
-                self.cursor = i
+                if i != self.cursor:
+                    self.cursor = i
+                    self.reveal_pending = True
                 self.feedback = f"match {matches.index(i) + 1}/{len(matches)}"
                 return
 
@@ -1413,7 +1444,11 @@ class Tui:
         self._line_owner: list[tuple[str, object]] = []   # content line -> ("day", d) | ("paper", index)
         self._paper_spans: dict[int, tuple[int, int]] = {}  # paper index -> (start, end) lines
         self._paper_days: dict[int, str] = {}               # paper index -> section day
+        self._content_lines = 0                             # rows in the latest list render
         self._last_point = Point(x=0, y=0)
+        # Lines scrolled below the selected title while reading a long abstract;
+        # only non-zero during the explicit scroll-through of a clipped block.
+        self._scroll_anchor = 0
         self.buffer = Buffer(
             multiline=False,
             completer=_ThemeCompleter(self),
@@ -1567,8 +1602,126 @@ class Tui:
             for _ in range(count):
                 self._line_owner.append(("paper", paper.index))
             line += count
-        self._last_point = Point(x=0, y=cursor_line)
+
+        self._content_lines = line
+        if s.reveal_pending:
+            self._scroll_anchor = 0
+            self._reveal_current()
+            s.reveal_pending = False
+        anchor_y = cursor_line
+        if self._scroll_anchor > 0:
+            cur = s.current()
+            span = self._paper_spans.get(cur.index) if cur else None
+            if span is not None and s.abstract_open(cur):
+                anchor_y = min(span[1] - 1, cursor_line + self._scroll_anchor)
+            else:
+                self._scroll_anchor = 0
+        self._last_point = Point(x=0, y=anchor_y)
         return frags
+
+    def _reveal_current(self) -> None:
+        """Show the selected paper's open abstract as fully as the window allows.
+
+        prompt_toolkit only guarantees the cursor (title) line is visible, so an
+        expanded block below it can run past the bottom — worst for the last
+        entry. Bottom-align a block that fits; when it does not, pin its title at
+        the top (prompt_toolkit's own clamp never lets the title leave).
+        """
+        s = self.session
+        p = s.current()
+        info = getattr(self.body_window, "render_info", None)
+        span = self._paper_spans.get(p.index) if p else None
+        if p is None or info is None or span is None or info.window_height <= 0:
+            return
+        if not s.abstract_open(p):
+            return
+        start, end = span
+        height = info.window_height
+        scroll = self.body_window.vertical_scroll
+        # Clipped at the bottom (push lines up), or the block is above the
+        # viewport after a jump (bring it back).
+        if end > scroll + height or start < scroll:
+            target = min(start, end - height)
+        else:
+            return
+        if s.group_by_day and target == start and target > 0:
+            # The pinned day header overlays the top row; leave one row so the
+            # title is never hidden behind it.
+            target -= 1
+        self.body_window.vertical_scroll = max(0, target)
+
+    def scroll_through_abstract(self, delta: int) -> bool:
+        """Spend a movement key on a clipped open abstract, if one is in the way.
+
+        Down first reads the rest of a block that extends below the viewport;
+        up rewinds through it until its title is visible again. Once the next
+        selectable entry (or the end of the last block) is on screen, the key
+        falls through to normal selection movement. Returns True when consumed.
+        """
+        s = self.session
+        if s.reveal_pending:
+            # The previous action has not been rendered yet (fast key sequences,
+            # pasted input); refresh the spans/reveal before deciding.
+            self.render_body()
+        p = s.current()
+        info = getattr(self.body_window, "render_info", None)
+        span = self._paper_spans.get(p.index) if p else None
+        if (p is None or delta == 0 or info is None or span is None
+                or info.window_height <= 0 or not s.abstract_open(p)):
+            self._scroll_anchor = 0
+            return False
+        start, end = span
+        height = info.window_height
+        scroll = self.body_window.vertical_scroll
+
+        if delta < 0:
+            if scroll <= start:
+                self._scroll_anchor = 0
+                return False
+            target = max(start, scroll + delta)
+            if target == scroll:
+                return False
+            self.body_window.vertical_scroll = target
+            self._scroll_anchor = max(0, target - start)
+            return True
+
+        # Only a block taller than the window needs to be read in place; once
+        # that has started, keep going for the rest of the same block.
+        if self._scroll_anchor <= 0 and end - start <= height:
+            return False
+
+        vis = s.visible()
+        try:
+            pos = next(i for i, paper in enumerate(vis) if paper is p)
+        except StopIteration:
+            return False
+        has_next = pos + 1 < len(vis)
+        next_start = (
+            self._paper_spans.get(vis[pos + 1].index, (end, end))[0]
+            if has_next else end
+        )
+
+        def finished(at: int) -> bool:
+            # The next title must be on screen; for the last paper, the whole
+            # abstract end must be.
+            return next_start < at + height if has_next else end <= at + height
+
+        if finished(scroll):
+            return False  # the readable target is already on screen
+
+        max_top = max(0, self._content_lines - height)
+        target = scroll
+        for _ in range(delta):
+            if target >= max_top:
+                break
+            target += 1
+            if finished(target):
+                break
+        if target == scroll:
+            return False
+        self.body_window.vertical_scroll = target
+        self._scroll_anchor = max(0, min(target - start, end - start - 1))
+        return True
 
     def render_sticky(self) -> list:
         """Pinned day header, shown once a section's inline row scrolled off."""
@@ -1614,7 +1767,7 @@ class Tui:
             if top_row > 0 or s.cursor >= len(vis) - 1:
                 self._scroll_body(delta, info)
                 return
-            s.move(1)  # selection reached the top edge: drag it along
+            s.move(1, reveal=False)  # selection reached the top edge: drag it along
             span = self._paper_spans.get(s.current().index) if s.current() else None
             # Follow mode opens/closes folds with the move, so the last render's
             # spans are stale; let prompt_toolkit clamp the scroll there.
@@ -1625,7 +1778,7 @@ class Tui:
             if bottom_row < info.window_height - 1 or s.cursor <= 0:
                 self._scroll_body(delta, info)
                 return
-            s.move(-1)
+            s.move(-1, reveal=False)
             span = self._paper_spans.get(s.current().index) if s.current() else None
             if span and not s.follow:  # pin the dragged block's last line
                 self.body_window.vertical_scroll = max(0, span[1] - info.window_height)
@@ -1751,10 +1904,17 @@ def _build_key_bindings(tui: Tui) -> "KeyBindings":
     def page_size(event) -> int:
         return max(1, event.app.output.get_size().rows - 4)
 
-    bind("move_down", lambda e: s.move(s.take_count()))
-    bind("move_up", lambda e: s.move(-s.take_count()))
-    bind("page_down", lambda e: s.move(page_size(e)))
-    bind("page_up", lambda e: s.move(-page_size(e)))
+    def mover(direction: int, page: bool = False):
+        def handler(event) -> None:
+            n = page_size(event) if page else s.take_count()
+            if not tui.scroll_through_abstract(direction * n):
+                s.move(direction * n)
+        return handler
+
+    bind("move_down", mover(1))
+    bind("move_up", mover(-1))
+    bind("page_down", mover(1, page=True))
+    bind("page_up", mover(-1, page=True))
     bind("add", lambda e: s.add_current())
     bind("remove", lambda e: s.remove_current())
     bind("open_url", lambda e: _open_current_url(s))

@@ -91,6 +91,14 @@ quitting, `cuhkvoting vote 3` still refers to paper 3 of what you just browsed.
 | `n` / `N` | next / previous search match |
 | `escape` | clear count / leave `:ls` filter / cancel input, help, confirm |
 
+Opening an abstract scrolls it fully into view (the selected block is
+bottom-aligned). If the abstract is taller than the window, the paper's title
+stays pinned at the top and `j`/`k` (or the page keys) first read through the
+clipped abstract while keeping the selection; the selection only moves on once
+the next paper's title (or, for the last paper, the end of its abstract) is on
+screen. With a date-sorted list, one row is kept free for the pinned day
+header.
+
 ## `:` commands
 
 Commands need `<enter>` to run; while typing, a hint is shown right-aligned.
