@@ -571,7 +571,9 @@ THEMES: dict[str, dict[str, str]] = {
         "body":      "",
         "status":    "reverse",
         "warning":   "bg:ansiyellow ansiblack",
-        "cursor":    "reverse",
+        # Uniform inverted bar: terminal background on terminal foreground.
+        # The explicit defaults cancel the per-fragment colors under `reverse`.
+        "cursor":    "reverse fg:ansidefault bg:ansidefault",
         "index":     "",
         "index.dim": "ansibrightblack",
         "id":        "ansibrightblue",
@@ -593,7 +595,7 @@ THEMES: dict[str, dict[str, str]] = {
         "body":      "bg:#282c34 #abb2bf",
         "status":    "bg:#3e4451 #abb2bf",
         "warning":   "bg:#e5c07b #282c34",
-        "cursor":    "bg:#3e4451 bold",
+        "cursor":    "#282c34 bg:#abb2bf",
         "index":     "#5c6370",
         "index.dim": "#4b5263",
         "id":        "#61afef",
@@ -615,7 +617,7 @@ THEMES: dict[str, dict[str, str]] = {
         "body":      "bg:#282828 #ebdbb2",
         "status":    "bg:#504945 #ebdbb2",
         "warning":   "bg:#fabd2f #282828",
-        "cursor":    "bg:#504945 bold",
+        "cursor":    "#282828 bg:#ebdbb2",
         "index":     "#928374",
         "index.dim": "#665c54",
         "id":        "#83a598",
@@ -637,7 +639,7 @@ THEMES: dict[str, dict[str, str]] = {
         "body":      "bg:#1e1e2e #cdd6f4",
         "status":    "bg:#313244 #cdd6f4",
         "warning":   "bg:#f9e2af #1e1e2e",
-        "cursor":    "bg:#45475a bold",
+        "cursor":    "#1e1e2e bg:#cdd6f4",
         "index":     "#6c7086",
         "index.dim": "#585b70",
         "id":        "#89b4fa",
@@ -659,7 +661,7 @@ THEMES: dict[str, dict[str, str]] = {
         "body":      "bg:#002b36 #839496",
         "status":    "bg:#073642 #93a1a1",
         "warning":   "bg:#b58900 #002b36",
-        "cursor":    "bg:#073642 bold",
+        "cursor":    "#002b36 bg:#839496",
         "index":     "#586e75",
         "index.dim": "#465a61",
         "id":        "#268bd2",
@@ -681,7 +683,7 @@ THEMES: dict[str, dict[str, str]] = {
         "body":      "bg:#2e3440 #d8dee9",
         "status":    "bg:#3b4252 #d8dee9",
         "warning":   "bg:#ebcb8b #2e3440",
-        "cursor":    "bg:#434c5e bold",
+        "cursor":    "#2e3440 bg:#d8dee9",
         "index":     "#4c566a",
         "index.dim": "#434c5e",
         "id":        "#88c0d0",
@@ -947,6 +949,30 @@ def _day_rule(day: str, width: int) -> str:
     return label + "─" * max(0, width - len(label) - 1) + "\n"
 
 
+def _cursor_fragments(frags: list, width: int) -> list:
+    """Turn a wrapped row into one uniform inverted bar, padded to `width`.
+
+    `class:cursor` is appended last so its foreground/background override every
+    fragment's own colors; otherwise `reverse` gives each colored run (index,
+    id, tick, ...) its own background. Padding extends the bar past the text,
+    like a cursorline, to the full row width.
+    """
+    out: list = []
+    used = 0
+    for style, text in frags:
+        parts = text.split("\n")
+        for i, part in enumerate(parts):
+            if part:
+                out.append((f"{style} class:cursor".strip(), part))
+                used += len(part)
+            if i < len(parts) - 1:  # a line ended here
+                if used < width:
+                    out.append(("class:cursor", " " * (width - used)))
+                out.append(("class:cursor", "\n"))
+                used = 0
+    return out
+
+
 def _entry_fragments(paper: Paper, session: Session, cfg, width: int,
                      role: str | None = None) -> list:
     """Fragments for one paper, reflowed to `width`; every line ends with '\\n'.
@@ -957,52 +983,51 @@ def _entry_fragments(paper: Paper, session: Session, cfg, width: int,
     e = paper.entry
     is_cur = paper is session.current()
     pid = str(e.get("id", ""))
-    sel = " class:cursor" if is_cur else ""
     vtd = " class:voted" if pid in session.voted else ""
     keywords = cfg.highlight_keywords or []
     title = " ".join(str(e.get("title", "")).split())
 
     dim = role in ("mid", "bottom")
-    idx_cls = f"class:index.dim{sel}" if dim else f"class:index{sel}"
+    idx_cls = "class:index.dim" if dim else "class:index"
     row: list = [(idx_cls, f"{paper.index:>3}. ")]
     if role is not None:
         box = {"single": " ", "top": "┳", "mid": "┣", "bottom": "┗"}[role]
-        row.append((sel, f"{box} "))
-    row.append((f"class:id{sel}", pid))
-    row.append((sel, "  "))
+        row.append(("", f"{box} "))
+    row.append(("class:id", pid))
+    row.append(("", "  "))
     # Only the title is tinted for voted papers; the rest of the row keeps its
     # normal colors (the green tick at the end stays as the marker).
-    row.extend(_styled_text(title, f"class:title{sel}{vtd}", [], session.search_pat))
+    row.extend(_styled_text(title, f"class:title{vtd}", [], session.search_pat))
 
     authors = e.get("authors", []) or []
     if authors:
-        row.append((f"class:authors{sel}", "  ["))
+        row.append(("class:authors", "  ["))
         shown = authors[:3]
         for i, author in enumerate(shown):
             lastname = cli._last_name(author)
             highlighted = any(cli._author_matches_highlight(author, h)
                               for h in cfg.highlight_authors)
-            cls = f"class:author.hl{sel}" if highlighted else f"class:authors{sel}"
+            cls = "class:author.hl" if highlighted else "class:authors"
             row.append((cls, lastname))
             if i < len(shown) - 1:
-                row.append((f"class:authors{sel}", ", "))
-        row.append((f"class:authors{sel}", "]"))
+                row.append(("class:authors", ", "))
+        row.append(("class:authors", "]"))
 
     if keywords:
         matches = cli._find_keyword_matches([title, str(e.get("abstract", ""))], keywords)
         if matches:
-            row.append((f"class:kw{sel}", f"  {cfg.highlight_glyph} {', '.join(matches)}"))
+            row.append(("class:kw", f"  {cfg.highlight_glyph} {', '.join(matches)}"))
 
     if "voters" in e:  # topvoted rows carry votes/voters instead of authors
         n = int(e.get("votes", 0))
-        row.append((f"class:voters{sel}", f"  [{e['voters']}] ⇒ {n} vote{'s' if n != 1 else ''}"))
+        row.append(("class:voters", f"  [{e['voters']}] ⇒ {n} vote{'s' if n != 1 else ''}"))
 
     if pid in session.voting:
-        row.append((f"class:mark{sel}", f"  {VOTE_MARK}"))
+        row.append(("class:mark", f"  {VOTE_MARK}"))
     if pid in session.voted:
-        row.append((f"class:voted{sel}", f"  {VOTED_MARK}"))
+        row.append(("class:voted", f"  {VOTED_MARK}"))
     if pid in session.unvoting:
-        row.append((f"class:removal{sel}", f"  {REMOVAL_MARK}"))
+        row.append(("class:removal", f"  {REMOVAL_MARK}"))
 
     # Wrapped rows re-align under the title; tie members that still have a row
     # below keep the ┃ continuation in the box column so the gutter stays
@@ -1012,7 +1037,9 @@ def _entry_fragments(paper: Paper, session: Session, cfg, width: int,
         indent = "     ┃ " + " " * max(0, hang - 7)
     else:
         indent = " " * hang
-    frags = _wrap_styled(row, width, indent=indent, indent_style=sel)
+    frags = _wrap_styled(row, width, indent=indent)
+    if is_cur:
+        frags = _cursor_fragments(frags, width)
 
     if session.abstract_open(paper):
         abstract = " ".join(str(e.get("abstract", "")).split())

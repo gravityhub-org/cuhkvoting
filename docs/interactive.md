@@ -56,6 +56,9 @@ quitting, `cuhkvoting vote 3` still refers to paper 3 of what you just browsed.
   `topvoted` earlier votes are recognised on load when your GitHub login is
   available (`CUHKVOTING_USER`/`GITHUB_USER`, or the normal token/credential
   helper chain); otherwise they appear after your first `:w`.
+- The current row is one solid inverted bar spanning the full width: the theme's
+  foreground becomes the background and vice versa (the `default` theme swaps the
+  terminal's own colors), so the same rule works on dark and light themes.
 - `13:34` is the cursor position over the list length.
 - The mode is `NOR` (normal) or `CMD` while typing a `:`, `/` or `?` command.
 - Warnings stay sticky at the top on a yellow background.

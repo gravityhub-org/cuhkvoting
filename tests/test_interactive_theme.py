@@ -107,6 +107,16 @@ class ThemeCompileTests(unittest.TestCase):
             Style.from_dict(theme)  # raises on malformed style strings
         self.assertIn("default", THEMES)
 
+    def test_cursor_inverts_the_body_colors(self) -> None:
+        for name, theme in THEMES.items():
+            if name == "default":
+                # Terminal-native: reverse the terminal's own default colors.
+                self.assertEqual(theme["cursor"], "reverse fg:ansidefault bg:ansidefault")
+                continue
+            body_bg, body_fg = theme["body"].split()
+            self.assertEqual(
+                theme["cursor"], f"{body_bg.removeprefix('bg:')} bg:{body_fg}", name)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -198,7 +198,30 @@ class VotedFragmentsTest(unittest.TestCase):
 
     def test_cursor_and_voted_compose_on_the_title(self) -> None:
         styles = [style for style, _text in self._frags(voted=True, cursor=True)]
-        self.assertIn("class:title class:cursor class:voted", styles)
+        # class:cursor goes last so it overrides the green tint on the bar.
+        self.assertIn("class:title class:voted class:cursor", styles)
+
+    def test_selected_row_is_one_uniform_bar(self) -> None:
+        session = interactive.Session([_entry(1)])
+        frags = interactive._entry_fragments(session.papers[0], session, _cfg(), 80)
+        for theme, expected in (
+            ("onedark", ("282c34", "abb2bf")),
+            ("default", ("ansidefault", "ansidefault")),
+        ):
+            style = interactive._theme_style(theme)
+            pairs = {
+                (style.get_attrs_for_style_str(st).color,
+                 style.get_attrs_for_style_str(st).bgcolor)
+                for st, _text in frags
+            }
+            self.assertEqual(pairs, {expected}, theme)
+
+    def test_selected_row_is_padded_to_the_full_width(self) -> None:
+        session = interactive.Session([_entry(1)])
+        frags = interactive._entry_fragments(session.papers[0], session, _cfg(), 80)
+        lines = "".join(text for _style, text in frags).split("\n")[:-1]
+        self.assertTrue(lines)
+        self.assertEqual({len(line) for line in lines}, {80})
 
     def test_plain_rows_have_no_tick_or_tint(self) -> None:
         frags = self._frags(voted=False)
