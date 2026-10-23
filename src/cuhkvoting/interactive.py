@@ -1081,6 +1081,39 @@ def _warning_fragments(session: Session) -> list:
 # Vote casting (runs with the terminal restored, via run_in_terminal)
 # ---------------------------------------------------------------------------
 
+def _viewer_login() -> str | None:
+    """Best-effort GitHub login, used to tick pre-existing `topvoted` votes.
+
+    Env overrides win; otherwise use the normal token chain (`_get_token` covers
+    env, the `gh` CLI and the git credential helper) and ask GitHub who it is.
+    Never raises or blocks: any failure yields None, and sessions that
+    authenticate only through SSH catch up after their first `:w`.
+    """
+    user = os.getenv("CUHKVOTING_USER") or os.getenv("GITHUB_USER")
+    if user and user.strip():
+        return user.strip()
+    try:
+        token = cli._get_token()
+        return cli._get_user_from_token(token) if token else None
+    except Exception:
+        return None
+
+
+def _mark_known_votes(session: Session, user: str | None) -> None:
+    """Tick rows whose `voter_users` already contains `user` (topvoted lists).
+
+    `voter_users` is filled by `_topvoted_rows_from_papers` from the records
+    already fetched for the list, so this costs no extra network calls. Other
+    list rows carry no voter identities, making this a no-op for them.
+    """
+    needle = (user or "").strip().lower()
+    if not needle:
+        return
+    for paper in session.papers:
+        if needle in (paper.entry.get("voter_users") or ()):
+            session.voted.add(str(paper.entry.get("id", "")))
+
+
 def _cast_votes(session: Session, cfg) -> bool:
     """Cast the staged votes, mirroring `vote_command`. True when the batch went through."""
     staged = list(session.voting)
@@ -1159,8 +1192,11 @@ def _cast_votes(session: Session, cfg) -> bool:
         return True
 
     # Session-local "already voted" marks: newly cast votes and duplicates (the
-    # batch reports papers the user had voted for before this session).
+    # batch reports papers the user had voted for before this session). The
+    # fallback also lights up the user's other `topvoted` rows: SSH-only
+    # sessions only learn their login here, when the first write happens.
     session.voted.update(result.voted)
+    _mark_known_votes(session, user)
     duplicates = 0
     for pid in result.voted:
         status = "new" if pid in result.new else "duplicate"
@@ -1757,6 +1793,9 @@ def run(tokens: list[str]) -> int:
     session.group_by_day = loader in (
         cli._today_list, cli._lastweek_list, cli._lastdays_list, cli._show_date_list,
     )
+    if loader is cli._topvoted_list:
+        # The list rows already carry voter usernames; no extra fetch needed.
+        _mark_known_votes(session, _viewer_login())
     session.warnings.extend(data.notes + captured + key_problems)
 
     tui = Tui(session, cfg, icfg, keymap)

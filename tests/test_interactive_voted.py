@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import unittest
 from unittest import mock
 
@@ -98,6 +99,71 @@ class CastVotesMarksSessionTest(unittest.TestCase):
         session.voting = ["2601.00001"]
         _ok, calls = self._cast(session, cli.VoteResult(["2601.00001"], ["2601.00001"], None))
         self.assertEqual(calls[0][0]["abstract"], "first line second line")
+
+    def test_cast_also_marks_existing_topvoted_votes(self) -> None:
+        # SSH-only sessions learn their login during :w; their other topvoted
+        # rows should light up at that point too.
+        entries = [
+            dict(_entry(1), voter_users=frozenset({"tester"})),  # not staged
+            dict(_entry(2), voter_users=frozenset({"ann"})),
+        ]
+        session = interactive.Session(entries)
+        session.voting = ["2601.00002"]
+        ok, _calls = self._cast(session, cli.VoteResult(["2601.00002"], ["2601.00002"], None))
+        self.assertTrue(ok)
+        self.assertEqual(session.voted, {"2601.00001", "2601.00002"})
+
+
+class KnownVotesTests(unittest.TestCase):
+    def _session(self) -> interactive.Session:
+        return interactive.Session([
+            dict(_entry(1), voter_users=frozenset({"paul", "ann"})),
+            dict(_entry(2), voter_users=frozenset({"ann"})),
+            _entry(3),
+        ])
+
+    def test_marks_rows_where_the_user_voted(self) -> None:
+        session = self._session()
+        interactive._mark_known_votes(session, "Paul")  # case-insensitive
+        self.assertEqual(session.voted, {"2601.00001"})
+
+    def test_empty_login_marks_nothing(self) -> None:
+        session = self._session()
+        interactive._mark_known_votes(session, None)
+        interactive._mark_known_votes(session, "   ")
+        self.assertEqual(session.voted, set())
+
+    def test_rows_without_voter_data_are_untouched(self) -> None:
+        session = interactive.Session([_entry(1)])
+        interactive._mark_known_votes(session, "paul")
+        self.assertEqual(session.voted, set())
+
+
+class ViewerLoginTests(unittest.TestCase):
+    _EMPTY_ENV = {"CUHKVOTING_USER": "", "GITHUB_USER": ""}
+
+    def test_prefers_the_configured_user(self) -> None:
+        env = {"CUHKVOTING_USER": "Paul", "GITHUB_USER": "other"}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch("cuhkvoting.cli._get_token") as get_token:
+            self.assertEqual(interactive._viewer_login(), "Paul")
+        get_token.assert_not_called()
+
+    def test_falls_back_to_the_token_chain(self) -> None:
+        with mock.patch.dict(os.environ, self._EMPTY_ENV), \
+             mock.patch("cuhkvoting.cli._get_token", return_value="tok"), \
+             mock.patch("cuhkvoting.cli._get_user_from_token", return_value="cosmoquark"):
+            self.assertEqual(interactive._viewer_login(), "cosmoquark")
+
+    def test_none_without_credentials(self) -> None:
+        with mock.patch.dict(os.environ, self._EMPTY_ENV), \
+             mock.patch("cuhkvoting.cli._get_token", return_value=None):
+            self.assertIsNone(interactive._viewer_login())
+
+    def test_fails_open_when_the_token_lookup_raises(self) -> None:
+        with mock.patch.dict(os.environ, self._EMPTY_ENV), \
+             mock.patch("cuhkvoting.cli._get_token", side_effect=RuntimeError("boom")):
+            self.assertIsNone(interactive._viewer_login())
 
 
 class VotedFragmentsTest(unittest.TestCase):
