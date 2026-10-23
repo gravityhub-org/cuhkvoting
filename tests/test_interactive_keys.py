@@ -32,6 +32,15 @@ class KeyTokenTests(unittest.TestCase):
         self.assertIsNone(_key_tokens("notakey"))
 
 
+class DefaultKeyTests(unittest.TestCase):
+    def test_arrows_open_and_close_the_abstract(self) -> None:
+        self.assertIn("right", DEFAULT_KEYS["open_abstract"])
+        self.assertIn("left", DEFAULT_KEYS["close_abstract"])
+        # The arrows must not have been repurposed for list movement.
+        self.assertNotIn("right", DEFAULT_KEYS["move_down"])
+        self.assertNotIn("left", DEFAULT_KEYS["move_up"])
+
+
 class EffectiveKeymapTests(unittest.TestCase):
     def test_defaults_pass_through(self) -> None:
         keymap, problems = _effective_keymap({})

@@ -51,7 +51,7 @@ quitting, `cuhkvoting vote 3` still refers to paper 3 of what you just browsed.
 ```
 
 - `●` marks papers staged in the voting list; `2 sel` counts them.
-- `✓` marks papers you voted for (green). The marks are session-local, but in
+- `✓` marks papers you voted for (green tick and title). The marks are session-local, but in
   `topvoted` earlier votes are recognised on load when your GitHub login is
   available (`CUHKVOTING_USER`/`GITHUB_USER`, or the normal token/credential
   helper chain); otherwise they appear after your first `:w`.
@@ -80,6 +80,7 @@ quitting, `cuhkvoting vote 3` still refers to paper 3 of what you just browsed.
 | `d` / `delete` | remove it from the voting list |
 | `o` | open the paper's webpage in the browser |
 | `za` / `zo` / `zc` | toggle / open / close the abstract |
+| `→` / `←` | open / close the current paper's abstract |
 | `zR` / `zM` | open / close all abstracts |
 | `zi` | follow mode: the selected paper's abstract is always shown open; moving on, papers return to their own fold state |
 | `/pat` / `?pat` | search forward / backward (titles, authors, abstracts; wraps) |
@@ -112,8 +113,8 @@ journal club are skipped with a warning. On failure the voting list is kept, so
 `:w` can simply be retried.
 
 Papers whose vote is recorded — including ones `:w` reports as duplicates from
-earlier votes — get a green `✓` and tinted row for the rest of the session, so
-you can keep browsing without losing track of what you already voted for. In
+earlier votes — get a green `✓` and a green title for the rest of the session,
+so you can keep browsing without losing track of what you already voted for. In
 `topvoted`, the rows already carry the voter usernames, so votes you cast in
 earlier sessions are ticked on load as well when your login is known.
 

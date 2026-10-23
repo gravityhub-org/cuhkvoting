@@ -462,8 +462,8 @@ DEFAULT_KEYS: dict[str, list[str]] = {
     "remove":          ["d", "delete"],
     "open_url":        ["o"],
     "toggle_abstract": ["z a"],
-    "open_abstract":   ["z o"],
-    "close_abstract":  ["z c"],
+    "open_abstract":   ["z o", "right"],
+    "close_abstract":  ["z c", "left"],
     "open_all":        ["z R"],
     "close_all":       ["z M"],
     "toggle_follow":   ["z i"],
@@ -930,45 +930,46 @@ def _entry_fragments(paper: Paper, session: Session, cfg, width: int,
     pid = str(e.get("id", ""))
     sel = " class:cursor" if is_cur else ""
     vtd = " class:voted" if pid in session.voted else ""
-    sfx = sel + vtd
     keywords = cfg.highlight_keywords or []
     title = " ".join(str(e.get("title", "")).split())
 
     dim = role in ("mid", "bottom")
-    idx_cls = f"class:index.dim{sfx}" if dim else f"class:index{sfx}"
+    idx_cls = f"class:index.dim{sel}" if dim else f"class:index{sel}"
     row: list = [(idx_cls, f"{paper.index:>3}. ")]
     if role is not None:
         box = {"single": " ", "top": "┳", "mid": "┣", "bottom": "┗"}[role]
-        row.append((sfx, f"{box} "))
-    row.append((f"class:id{sfx}", pid))
-    row.append((sfx, "  "))
-    row.extend(_styled_text(title, f"class:title{sfx}", [], session.search_pat))
+        row.append((sel, f"{box} "))
+    row.append((f"class:id{sel}", pid))
+    row.append((sel, "  "))
+    # Only the title is tinted for voted papers; the rest of the row keeps its
+    # normal colors (the green tick at the end stays as the marker).
+    row.extend(_styled_text(title, f"class:title{sel}{vtd}", [], session.search_pat))
 
     authors = e.get("authors", []) or []
     if authors:
-        row.append((f"class:authors{sfx}", "  ["))
+        row.append((f"class:authors{sel}", "  ["))
         shown = authors[:3]
         for i, author in enumerate(shown):
             lastname = cli._last_name(author)
             highlighted = any(cli._author_matches_highlight(author, h)
                               for h in cfg.highlight_authors)
-            cls = f"class:author.hl{sfx}" if highlighted else f"class:authors{sfx}"
+            cls = f"class:author.hl{sel}" if highlighted else f"class:authors{sel}"
             row.append((cls, lastname))
             if i < len(shown) - 1:
-                row.append((f"class:authors{sfx}", ", "))
-        row.append((f"class:authors{sfx}", "]"))
+                row.append((f"class:authors{sel}", ", "))
+        row.append((f"class:authors{sel}", "]"))
 
     if keywords:
         matches = cli._find_keyword_matches([title, str(e.get("abstract", ""))], keywords)
         if matches:
-            row.append((f"class:kw{sfx}", f"  {cfg.highlight_glyph} {', '.join(matches)}"))
+            row.append((f"class:kw{sel}", f"  {cfg.highlight_glyph} {', '.join(matches)}"))
 
     if "voters" in e:  # topvoted rows carry votes/voters instead of authors
         n = int(e.get("votes", 0))
-        row.append((f"class:voters{sfx}", f"  [{e['voters']}] ⇒ {n} vote{'s' if n != 1 else ''}"))
+        row.append((f"class:voters{sel}", f"  [{e['voters']}] ⇒ {n} vote{'s' if n != 1 else ''}"))
 
     if pid in session.voting:
-        row.append((f"class:mark{sfx}", f"  {VOTE_MARK}"))
+        row.append((f"class:mark{sel}", f"  {VOTE_MARK}"))
     if pid in session.voted:
         row.append((f"class:voted{sel}", f"  {VOTED_MARK}"))
 
@@ -980,7 +981,7 @@ def _entry_fragments(paper: Paper, session: Session, cfg, width: int,
         indent = "     ┃ " + " " * max(0, hang - 7)
     else:
         indent = " " * hang
-    frags = _wrap_styled(row, width, indent=indent, indent_style=sfx)
+    frags = _wrap_styled(row, width, indent=indent, indent_style=sel)
 
     if session.abstract_open(paper):
         abstract = " ".join(str(e.get("abstract", "")).split())
@@ -991,13 +992,13 @@ def _entry_fragments(paper: Paper, session: Session, cfg, width: int,
                 indent = "       "
             else:
                 indent = "      "
-            body = _styled_text(abstract, f"class:abstract{vtd}", keywords, session.search_pat)
+            body = _styled_text(abstract, "class:abstract", keywords, session.search_pat)
             frags.extend(_wrap_styled(
                 body, width, indent=indent,
-                indent_style=f"class:abstract{vtd}", indent_first=True,
+                indent_style="class:abstract", indent_first=True,
             ))
         else:
-            frags.append((f"class:abstract{vtd}", "(no abstract available)\n"))
+            frags.append(("class:abstract", "(no abstract available)\n"))
     return frags
 
 
@@ -1095,7 +1096,7 @@ def _viewer_login() -> str | None:
     try:
         token = cli._get_token()
         return cli._get_user_from_token(token) if token else None
-    except Exception:
+    except Exception:  # noqa: BLE001 - highlighting must never block startup
         return None
 
 

@@ -73,6 +73,16 @@ class SmokeTests(unittest.TestCase):
         self.assertIn("class:kw", styles)            # kilonova keyword suffix
         self.assertIn("2607.00002", text)
 
+    def test_right_expands_the_abstract(self) -> None:
+        session, _tui = self._run_keys("\x1b[C:q!\r")
+        self.assertTrue(session.papers[0].open)
+        self.assertEqual(session.cursor, 0)
+
+    def test_left_closes_the_abstract(self) -> None:
+        session, _tui = self._run_keys("\x1b[C\x1b[D:q!\r")
+        self.assertFalse(session.papers[0].open)
+        self.assertEqual(session.cursor, 0)
+
     def test_follow_mode_tracks_cursor(self) -> None:
         session, _tui = self._run_keys("zij:q!\r")
         self.assertTrue(session.follow)

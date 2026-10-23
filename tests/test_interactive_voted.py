@@ -28,6 +28,9 @@ def _entry(index: int) -> dict:
     }
 
 
+_EMPTY_IDENTITY_ENV = {"CUHKVOTING_USER": "", "GITHUB_USER": ""}
+
+
 class CastVotesMarksSessionTest(unittest.TestCase):
     def _cast(self, session: interactive.Session, result) -> tuple[bool, list[list[dict]]]:
         metas_calls: list[list[dict]] = []
@@ -140,8 +143,6 @@ class KnownVotesTests(unittest.TestCase):
 
 
 class ViewerLoginTests(unittest.TestCase):
-    _EMPTY_ENV = {"CUHKVOTING_USER": "", "GITHUB_USER": ""}
-
     def test_prefers_the_configured_user(self) -> None:
         env = {"CUHKVOTING_USER": "Paul", "GITHUB_USER": "other"}
         with mock.patch.dict(os.environ, env), \
@@ -150,18 +151,18 @@ class ViewerLoginTests(unittest.TestCase):
         get_token.assert_not_called()
 
     def test_falls_back_to_the_token_chain(self) -> None:
-        with mock.patch.dict(os.environ, self._EMPTY_ENV), \
+        with mock.patch.dict(os.environ, _EMPTY_IDENTITY_ENV), \
              mock.patch("cuhkvoting.cli._get_token", return_value="tok"), \
              mock.patch("cuhkvoting.cli._get_user_from_token", return_value="cosmoquark"):
             self.assertEqual(interactive._viewer_login(), "cosmoquark")
 
     def test_none_without_credentials(self) -> None:
-        with mock.patch.dict(os.environ, self._EMPTY_ENV), \
+        with mock.patch.dict(os.environ, _EMPTY_IDENTITY_ENV), \
              mock.patch("cuhkvoting.cli._get_token", return_value=None):
             self.assertIsNone(interactive._viewer_login())
 
     def test_fails_open_when_the_token_lookup_raises(self) -> None:
-        with mock.patch.dict(os.environ, self._EMPTY_ENV), \
+        with mock.patch.dict(os.environ, _EMPTY_IDENTITY_ENV), \
              mock.patch("cuhkvoting.cli._get_token", side_effect=RuntimeError("boom")):
             self.assertIsNone(interactive._viewer_login())
 
@@ -182,20 +183,22 @@ class VotedFragmentsTest(unittest.TestCase):
     def _styles(self, frags: list) -> str:
         return " ".join(style for style, _text in frags)
 
-    def test_tick_and_green_tint(self) -> None:
+    def test_tick_and_title_tint_only(self) -> None:
         frags = self._frags(voted=True)
         self.assertIn("✓", self._text(frags))
-        styles = self._styles(frags)
-        self.assertIn("class:title class:voted", styles)
-        self.assertIn("class:id class:voted", styles)
+        # Only the title and the tick carry the green class; index, id, authors,
+        # voters and the abstract keep their normal styles.
+        tinted = {style for style, _text in frags if "class:voted" in style}
+        self.assertEqual(tinted, {"class:title class:voted", "class:voted"})
 
-    def test_abstract_is_tinted_too(self) -> None:
-        styles = self._styles(self._frags(voted=True, open_abstract=True))
-        self.assertIn("class:abstract class:voted", styles)
+    def test_abstract_keeps_its_normal_style(self) -> None:
+        styles = [style for style, _text in self._frags(voted=True, open_abstract=True)]
+        self.assertIn("class:abstract", styles)
+        self.assertFalse(any("abstract" in style for style in styles if "class:voted" in style))
 
-    def test_cursor_and_voted_compose(self) -> None:
-        styles = self._styles(self._frags(voted=True, cursor=True))
-        self.assertIn("class:cursor class:voted", styles)
+    def test_cursor_and_voted_compose_on_the_title(self) -> None:
+        styles = [style for style, _text in self._frags(voted=True, cursor=True)]
+        self.assertIn("class:title class:cursor class:voted", styles)
 
     def test_plain_rows_have_no_tick_or_tint(self) -> None:
         frags = self._frags(voted=False)
