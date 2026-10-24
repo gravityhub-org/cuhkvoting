@@ -3594,6 +3594,7 @@ def today(
     abstract: int | None = typer.Option(None, "--abstract", help="Abstract lines to show (0=none, -1=full, N=first N lines). Defaults to config value."),
     highlight_keywords: int | None = typer.Option(None, "--highlight-keywords", help="Keyword matches to show per entry (0=glyph, -1=all, N=first N). Defaults to config value."),
 ) -> None:
+    """List papers announced today (UTC), optionally filtered by keywords."""
     _run_cmd(cmd_today, limit=limit, keywords=keywords, max_age=max_age, category=category, abstract=abstract, highlight_keywords=highlight_keywords)
 
 
@@ -3602,6 +3603,7 @@ def search(
     query: list[str] | None = typer.Argument(None, help="Search terms."),
     limit: int = typer.Option(20, "--limit", help="Max number of entries."),
 ) -> None:
+    """Search INSPIRE-HEP for arXiv papers matching the given terms."""
     _run_cmd(cmd_search, query=query, limit=limit)
 
 
@@ -3617,6 +3619,7 @@ def lastweek(
     abstract: int | None = typer.Option(None, "--abstract", help="Abstract lines to show (0=none, -1=full, N=first N lines). Defaults to config value."),
     highlight_keywords: int | None = typer.Option(None, "--highlight-keywords", help="Keyword matches to show per entry (0=glyph, -1=all, N=first N). Defaults to config value."),
 ) -> None:
+    """List papers from the last week (UTC), optionally filtered by keywords."""
     _run_cmd(cmd_lastweek, limit=limit, keywords=keywords, max_age=max_age, category=category, abstract=abstract, highlight_keywords=highlight_keywords)
 
 
@@ -3657,6 +3660,7 @@ def topvoted(
         help="Abstract lines to show (0=none, -1=full, N=first N). Defaults to config value.",
     ),
 ) -> None:
+    """List the most-voted papers that are still active in the records repo."""
     _run_cmd(cmd_topvoted, N=n, repo=repo, branch=branch, abstract=abstract)
 
 
@@ -3673,6 +3677,7 @@ def record(
         help="Git branch to read/write.",
     ),
 ) -> None:
+    """List journal-club selection records, newest first."""
     _run_cmd(cmd_record, repo=repo, branch=branch)
 
 
@@ -3692,6 +3697,7 @@ def select(
         help="Git branch to read/write.",
     ),
 ) -> None:
+    """Select a paper for the journal club, or `select remove <id>` to undo."""
     if action_or_paper[0].strip().lower() == "remove":
         if len(action_or_paper) != 2:
             raise typer.BadParameter("Usage: cuhkvoting select remove <id>")
@@ -3719,6 +3725,7 @@ def vote_command(
         help="Git branch to read/write.",
     ),
 ) -> None:
+    """Vote for papers by arXiv id/url or list index; `vote remove <id|#>` undoes your vote."""
     if not action_or_paper:
         _run_cmd(cmd_topvoted, N=10, repo=repo, branch=branch)
         return
@@ -3940,6 +3947,7 @@ def admin_trash(
         help="Git branch to read/write.",
     ),
 ) -> None:
+    """Delete a paper's vote record, or list the topvoted papers when no id is given."""
     if not vote_id:
         _run_cmd(cmd_topvoted, N=10, repo=repo, branch=branch)
         return
